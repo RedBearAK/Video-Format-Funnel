@@ -468,8 +468,13 @@ class FixtureProbeTests(unittest.TestCase):
         self.assertEqual((video["codec"], video["pix_fmt"]), ("msrle", "pal8"))
 
     def test_audio_offset(self):
+        # ffprobe 7 reports the first packet (0.279 s, before the 1024-sample AAC
+        # priming); ffprobe 8 applies the codec delay and reports the audible
+        # start (0.300 s). Both describe the same file; analyze measures from
+        # packets and is tested in test_analyze.
         audio = self.probe("h264_mkv_aac_offset_300ms.mkv")["audio"][0]
-        self.assertAlmostEqual(audio["start_time"], 0.28, delta=0.005)
+        distance = min(abs(audio["start_time"] - 0.279), abs(audio["start_time"] - 0.300))
+        self.assertLessEqual(distance, 0.002, audio["start_time"])
 
     def test_five_point_one(self):
         audio = self.probe("h264_mkv_ac3_5point1.mkv")["audio"][0]

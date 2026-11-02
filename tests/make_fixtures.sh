@@ -416,8 +416,13 @@ fixture_audio_ac3_surround() {
 }
 
 fixture_audio_vorbis() {
+    if "$FFMPEG" -hide_banner -encoders 2>/dev/null | grep -q ' libvorbis '; then
+        vorbis_encoder="-c:a libvorbis -q:a 4"
+    else
+        vorbis_encoder="-c:a vorbis -strict experimental -b:a 128k"
+    fi
     ff -f lavfi -i "$(video_source 320x240 25 5)" -f lavfi -i "$(audio_source 48000 5)" \
-        $x264_small -c:a libvorbis -q:a 4 -ac 2 -f matroska "$1"
+        $x264_small $vorbis_encoder -ac 2 -f matroska "$1"
 }
 
 fixture_audio_opus() {
