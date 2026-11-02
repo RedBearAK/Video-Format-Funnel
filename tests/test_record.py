@@ -351,6 +351,19 @@ class FolderLockTests(TempDirCase):
         self.assertFalse(self.lock_file().exists())
 
 
+
+class BandTests(unittest.TestCase):
+    def test_band_edges(self):
+        from vidfunnel.record import band
+        self.assertEqual(band(100), "ok")
+        self.assertEqual(band(90), "ok")
+        self.assertEqual(band(89), "review")
+        self.assertEqual(band(60), "review")
+        self.assertEqual(band(59), "hold")
+        self.assertEqual(band(0), "hold")
+        self.assertIsNone(band(None))
+        self.assertIsNone(band(True))
+
 if __name__ == "__main__":
     unittest.main()
 

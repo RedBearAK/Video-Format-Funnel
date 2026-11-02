@@ -27,6 +27,21 @@ RECORD_SUFFIX = ".json"
 STATUSES = ("planned", "converted", "verified", "quarantined", "failed", "retired", "source-changed")
 STAGES = ("probe", "analyze", "plan", "convert", "verify", "retire")
 
+# HANDOFF section 5 bands; shared by verify, report and retire.
+BAND_OK = 90
+BAND_REVIEW = 60
+
+
+def band(score):
+    """'ok' at >= 90, 'review' at 60-89, 'hold' below 60; None when there is no score."""
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        return None
+    if score >= BAND_OK:
+        return "ok"
+    if score >= BAND_REVIEW:
+        return "review"
+    return "hold"
+
 MIB = 1024 * 1024
 FINGERPRINT_CHUNK = MIB              # first and last MiB
 HASH_BLOCK = MIB                     # read size for full hashes

@@ -37,7 +37,7 @@ from pathlib import Path
 
 import vidfunnel
 from vidfunnel.progress import format_bytes, say
-from vidfunnel.record import STATUSES, STAGES, RecordError, iter_records, load_record, now_iso
+from vidfunnel.record import STATUSES, STAGES, RecordError, band, iter_records, load_record, now_iso
 from vidfunnel.redact import ROOT_MARK, Redactor, redact_path
 
 FORMATS = ("md", "json", "csv")
@@ -63,8 +63,6 @@ ROW_FIELDS = (
 LOG_KEYS = ("stderr", "log", "run_log")
 MD_COLUMNS = ("ID", "score", "band", "status", "action", "flags", "source -> output", "path")
 
-BAND_OK = 90
-BAND_REVIEW = 60
 
 
 class ReportError(Exception):
@@ -194,15 +192,6 @@ def filter_items(items, min_score=None, max_score=None, statuses=None):
 # ---------------------------------------------------------------- rows
 
 
-def band(score):
-    """HANDOFF section 5: >= 90 'ok', 60-89 'review', < 60 'hold'; None for no score."""
-    if not isinstance(score, (int, float)) or isinstance(score, bool):
-        return None
-    if score >= BAND_OK:
-        return "ok"
-    if score >= BAND_REVIEW:
-        return "review"
-    return "hold"
 
 
 def _logs(record):
