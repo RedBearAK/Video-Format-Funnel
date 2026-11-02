@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+.venv/
+venv/
+.python-version
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.*.sw?
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Linux and KDE
+.directory
+.Trash-*
+*.kate-swp
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Project: generated fixtures, local state and media
+tests/fixtures/
+*.vidfunnel.json
+.vidfunnel/
+.vidfunnel-retired/
+*.part
+*.par2
+*.log
+
+# Project: media files must never be committed
+*.mp4
+*.m4v
+*.mkv
+*.avi
+*.flv
+*.swf
+*.wmv
+*.asf
+*.mov
+*.mpg
+*.mpeg
+*.vob
+*.fli
+*.flc
+!tests/data/*.fli
+*.rm
+*.rmvb
+*.3gp
+*.ts
+*.m2ts
+
+# End of File #
