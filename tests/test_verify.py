@@ -34,12 +34,15 @@ from vidfunnel.verify import (
     compare_durations,
     compare_frames,
     compare_streams,
+    duration_tolerance,
     expected_frames,
     expected_streams,
     output_path_of,
+    output_video_duration,
     record_key,
     run,
     score_record,
+    source_video_duration,
     verify_record,
 )
 
@@ -89,6 +92,26 @@ class CompareTest(unittest.TestCase):
         outside = compare_durations(10.0, 10.15)
         self.assertFalse(outside["ok"])
         self.assertFalse(compare_durations(None, 10.0)["ok"])
+        one_frame = duration_tolerance(25.0)
+        self.assertAlmostEqual(one_frame, 0.14)
+        self.assertTrue(compare_durations(10.0, 10.14, one_frame)["ok"])
+        self.assertFalse(compare_durations(10.0, 10.15, one_frame)["ok"])
+        self.assertEqual(duration_tolerance(None), 0.1)
+
+    def test_source_duration_preference(self):
+        record = hand_record(duration=5.0)
+        record["stages"]["probe"]["format"]["duration"] = 5.2
+        self.assertEqual(source_video_duration(record), (5.2, "format"))
+        record["stages"]["probe"]["video"]["duration_source"] = "stream"
+        self.assertEqual(source_video_duration(record), (5.0, "stream"))
+        record["stages"]["analyze"]["sync"] = {"durations": {"video": {"duration": 4.96}}}
+        self.assertEqual(source_video_duration(record), (4.96, "packets"))
+        self.assertEqual(source_video_duration({"stages": {}}), (None, None))
+
+    def test_output_duration_prefers_video_stream(self):
+        probe = {"format": {"duration": 5.2}, "video": {"duration": 5.04}}
+        self.assertEqual(output_video_duration(probe), (5.04, "stream"))
+        self.assertEqual(output_video_duration({"format": {"duration": 5.2}, "video": {}}), (5.2, "format"))
 
     def test_frames(self):
         self.assertTrue(compare_frames(150, 150)["ok"])
@@ -237,7 +260,8 @@ REMUX_FIXTURE = "h264_high_mkv_aac.mkv"
 SUBTITLE_FIXTURE = "h264_mkv_srt_subtitles.mkv"
 MP4_FIXTURE = "h264_mp4_aac.mp4"
 INTERLACED_FIXTURE = "mpeg2_ps_interlaced_tff_ac3.mpg"
-INTEGRATION_FIXTURES = (REMUX_FIXTURE, SUBTITLE_FIXTURE, MP4_FIXTURE, INTERLACED_FIXTURE)
+XVID_FIXTURE = "xvid_avi_mp3.avi"
+INTEGRATION_FIXTURES = (REMUX_FIXTURE, SUBTITLE_FIXTURE, MP4_FIXTURE, INTERLACED_FIXTURE, XVID_FIXTURE)
 
 
 def _missing_fixtures():
@@ -256,7 +280,7 @@ def convert_folder(folder, names, renames=None):
     for record_folder, record in iter_records(folder):
         if record.get("status") != "planned":
             raise AssertionError("'{}' planned as '{}'".format(record["source"]["name"], record.get("status")))
-        # Ultrafast instead of slower for the MPEG-2 re-encode: speed only, verify's checks do not depend on it.
+        # Ultrafast instead of slower for the re-encodes (MPEG-2, Xvid): speed only, verify's checks do not depend on it.
         argv = ["ultrafast" if part == "slower" else part for part in record["stages"]["plan"]["argv"]]
         run_tool(argv)
         set_status(record, "converted")
@@ -333,6 +357,16 @@ class VerifyRunTest(unittest.TestCase):
         self.assertEqual(stage["penalties"], [])
         self.assertEqual(record["score"], 95)
 
+    def test_avi_reencode_duration(self):
+        record = self.verified[XVID_FIXTURE]
+        stage = record["stages"]["verify"]
+        self.assertEqual(record["action"], "reencode")
+        self.assertTrue(stage["duration"]["ok"], stage["duration"])
+        self.assertEqual(stage["duration"]["source_kind"], "packets")
+        self.assertEqual(stage["duration"]["output_kind"], "stream")
+        self.assertNotIn("duration-mismatch", [entry["code"] for entry in stage["penalties"]])
+        self.assertEqual(record["score"], 100)
+
     def test_ssim_check(self):
         key = self.converted[INTERLACED_FIXTURE][0]
         options = types.SimpleNamespace(ssim_check=True, ssim_threshold=0.97, samples=None)
@@ -349,7 +383,7 @@ class VerifyRunTest(unittest.TestCase):
                                   yes=False, ssim_check=False, ssim_threshold=0.97, samples=None,
                                   stream=io.StringIO())
         self.assertEqual(run(args), EXIT_OK)
-        self.assertIn("4 ok", args.stream.getvalue())
+        self.assertIn("5 ok", args.stream.getvalue())
 
 
 @unittest.skipIf(TOOLS is None, "ffmpeg not found on PATH; verify integration tests skipped")

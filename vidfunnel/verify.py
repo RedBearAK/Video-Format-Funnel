@@ -16,7 +16,9 @@ else output.name, and checked:
   expected_frames(): the source frame count times the cadence fps_multiplier
   (2.0 for field-rate deinterlacing), or duration x 24000/1001 for an inverse
   telecine; outside 2 % plus 2 frames either way costs 30 points;
-- the durations of source and output (more than 0.1 s apart costs 20 points);
+- the video durations of source and output (source: analyze's packet
+  measurement, else the probed stream, else the container; output: the
+  video stream): more than 0.1 s plus one output frame apart costs 20 points;
 - the stream counts against expected_streams() (no points in HANDOFF 5; a
   mismatch is flagged 'stream-count-mismatch' so the report shows it);
 - with --ssim-check, sampled SSIM on luma against the source put through the
@@ -167,8 +169,10 @@ def expected_frames(record, measured_source_frames=None):
     (fieldmatch,decimate keeps 4 frames of 5). Otherwise the source frame
     count times the cadence fps_multiplier (2.0 for field-rate deinterlacing,
     1.0 otherwise). The source frame count is, in order: measured_source_frames
-    (an exact count the caller made with probe.count_frames), the probed
-    video nb_frames, else duration x fps. The last is the fallback for a VFR
+    (an exact count the caller made with probe.count_frames), the packet count
+    analyze measured (stages.analyze.sync.durations.video.packets), the probed
+    video nb_frames (container headers can be off by a frame: an AVI with a
+    skipped frame says 126 while 125 packets exist), else duration x fps. The last is the fallback for a VFR
     source whose container gives no frame count and which is no longer there to
     count: for VFR, fps is ffprobe's r_frame_rate, so the estimate may be off,
     and a frame-count penalty on such a record deserves a look before it is
@@ -182,8 +186,11 @@ def expected_frames(record, measured_source_frames=None):
             return None
         return int(round(float(duration) * float(rate)))
     video = _source_probe(record).get("video") or {}
+    analysed_packets = (((_analysis(record).get("sync") or {}).get("durations") or {}).get("video") or {}).get("packets")
     if measured_source_frames is not None:
         frames = float(measured_source_frames)
+    elif analysed_packets:
+        frames = float(analysed_packets)
     elif video.get("nb_frames"):
         frames = float(video["nb_frames"])
     elif duration is not None and video.get("fps"):
@@ -214,13 +221,55 @@ def expected_streams(record):
 # --- comparisons -----------------------------------------------------------------------
 
 
-def compare_durations(source_duration, output_duration):
-    """{'source', 'output', 'delta', 'ok'}: ok when both are known and differ by at most 0.1 s."""
+def compare_durations(source_duration, output_duration, tolerance=DURATION_TOLERANCE_S):
+    """{'source', 'output', 'delta', 'tolerance', 'ok'}: ok when both are known and differ by at most tolerance."""
     if source_duration is None or output_duration is None:
-        return {"source": source_duration, "output": output_duration, "delta": None, "ok": False}
+        return {"source": source_duration, "output": output_duration, "delta": None, "tolerance": tolerance,
+                "ok": False}
     delta = float(output_duration) - float(source_duration)
     return {"source": float(source_duration), "output": float(output_duration), "delta": round(delta, 6),
-            "ok": abs(delta) <= DURATION_TOLERANCE_S + 1e-9}
+            "tolerance": tolerance, "ok": abs(delta) <= tolerance + 1e-9}
+
+
+def source_video_duration(record):
+    """(seconds, kind) of the source's video for the duration check; (None, None) when nothing is known.
+
+    In order: the video duration analyze measured from the packet list
+    (stages.analyze.sync.durations.video.duration, kind 'packets'); the
+    probed video stream's duration when ffprobe gave it for the stream
+    (duration_source 'stream', kind 'stream'); the container duration (kind
+    'format'). Container durations include AVI padding and audio that runs
+    past the video, which are not conversion defects.
+    """
+    measured = ((((_analysis(record).get("sync") or {}).get("durations") or {}).get("video")) or {}).get("duration")
+    if measured is not None:
+        return float(measured), "packets"
+    probe = _source_probe(record)
+    video = probe.get("video") or {}
+    if video.get("duration") is not None and video.get("duration_source") == "stream":
+        return float(video["duration"]), "stream"
+    duration = (probe.get("format") or {}).get("duration")
+    if duration is not None:
+        return float(duration), "format"
+    return None, None
+
+
+def output_video_duration(probe):
+    """(seconds, kind) of the output's video stream ('stream'), else the container's ('format')."""
+    video = probe.get("video") or {}
+    if video.get("duration") is not None:
+        return float(video["duration"]), "stream"
+    duration = (probe.get("format") or {}).get("duration")
+    if duration is not None:
+        return float(duration), "format"
+    return None, None
+
+
+def duration_tolerance(output_fps):
+    """DURATION_TOLERANCE_S plus one output frame interval, so a one-frame difference never costs points."""
+    if output_fps:
+        return DURATION_TOLERANCE_S + 1.0 / float(output_fps)
+    return DURATION_TOLERANCE_S
 
 
 def frame_range(expected):
@@ -378,8 +427,9 @@ def post_conversion_penalties(checks):
     duration = checks.get("duration")
     if duration is not None and not duration.get("ok"):
         entries.append({"code": "duration-mismatch", "points": PENALTY_DURATION,
-                        "reason": "output duration {} differs from the source's {} by more than {} s".format(
-                            duration.get("output"), duration.get("source"), DURATION_TOLERANCE_S)})
+                        "reason": "output video duration {} differs from the source's {} by more than {} s".format(
+                            duration.get("output"), duration.get("source"),
+                            round(duration.get("tolerance") or DURATION_TOLERANCE_S, 4))})
     frames = checks.get("frames")
     if frames is not None and not frames.get("ok"):
         entries.append({"code": "frame-count", "points": PENALTY_FRAMES,
@@ -530,8 +580,10 @@ def verify_record(tools, source, record, options, progress=None):
     frames.update(source_frames=measured, source_frames_from=how,
                   fps_multiplier=_cadence(record).get("fps_multiplier"), cadence=_cadence(record).get("kind"))
     stage["frames"] = frames
-    stage["duration"] = compare_durations((_source_probe(record).get("format") or {}).get("duration"),
-                                          output_duration)
+    source_seconds, source_kind = source_video_duration(record)
+    output_seconds, output_kind = output_video_duration(probe)
+    stage["duration"] = compare_durations(source_seconds, output_seconds, duration_tolerance(video.get("fps")))
+    stage["duration"].update(source_kind=source_kind, output_kind=output_kind)
     stage["streams"] = compare_streams(expected_streams(record), probe)
 
     threshold = float(_option(options, "ssim_threshold", DEFAULT_SSIM_THRESHOLD))
