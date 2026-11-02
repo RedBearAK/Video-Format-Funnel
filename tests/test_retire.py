@@ -16,6 +16,7 @@ from vidfunnel import retire
 from vidfunnel.record import (
     FolderLock,
     add_flag,
+    cheap_fingerprint,
     load_record,
     new_record,
     record_path,
@@ -243,7 +244,8 @@ class GuardTests(RetireCase):
         result = check_eligible(self.meeting_source, self.meeting_record)
         self.assertEqual(result, {"output_path": self.meeting_interim,
                                   "final_output_path": self.meeting_source,
-                                  "band": "ok", "sha256_verified": True})
+                                  "band": "ok", "sha256_verified": True,
+                                  "members": [self.meeting_source]})
 
     def test_large_output_hash_shows_progress(self):
         large = b"\0" * (33 * 1024 * 1024)
@@ -389,6 +391,144 @@ class RetireOneTests(RetireCase):
     def test_second_retire_is_refused(self):
         retire_one(self.beach_source, self.beach_record, self.root)
         self.assert_refused("status-not-verified", self.beach_source, load_record(self.beach_source))
+
+
+class Par2RedundancyTests(unittest.TestCase):
+    def test_convert_value_overrides_plan_value(self):
+        record = {"stages": {"plan": {"par2": 5}, "convert": {"par2_redundancy": 20}}}
+        self.assertEqual(retire._par2_redundancy(record), 20)
+
+    def test_plan_value_when_convert_has_none(self):
+        record = {"stages": {"plan": {"par2": 5}, "convert": {"par2_redundancy": None}}}
+        self.assertEqual(retire._par2_redundancy(record), 5)
+
+    def test_default_without_either(self):
+        self.assertEqual(retire._par2_redundancy({"stages": {}}), retire.PAR2_DEFAULT_REDUNDANCY)
+
+
+class Par2RecreateRedundancyTests(RetireCase):
+    def test_recreated_par2_uses_and_records_convert_redundancy(self):
+        for name in ("client_meeting.vidfunnel.mp4.par2", "client_meeting.vidfunnel.mp4.vol000+200.par2"):
+            write_bytes(self.meetings / name, b"fake par2 for the interim name")
+        self.meeting_record["stages"]["plan"] = {"par2": 5}
+        self.meeting_record["stages"]["convert"] = {"par2_redundancy": 20}
+        used = []
+
+        def fake_write_par2(output_path, redundancy, options):
+            used.append(redundancy)
+            return [write_bytes(Path(str(output_path) + ".par2"), b"new par2")]
+
+        from vidfunnel import encode
+        with mock.patch.object(retire.shutil, "which", return_value="/usr/bin/par2"), \
+                mock.patch.object(encode, "write_par2", side_effect=fake_write_par2):
+            stage = retire_one(self.meeting_source, self.meeting_record, self.root)
+        self.assertEqual(used, [20])
+        self.assertEqual(stage["par2_redundancy"], 20)
+        self.assertEqual(load_record(self.meeting_source)["stages"]["retire"]["par2_redundancy"], 20)
+
+
+class VobGroupTests(RetireCase):
+    """A 'vob-group' record (plan's shape): every member is checked and retired, not only the first."""
+
+    def setUp(self):
+        RetireCase.setUp(self)
+        self.dvd = self.root / "dvd_rip"
+        self.first_member = write_bytes(self.dvd / "VTS_01_1.VOB", b"first vob payload " * 300)
+        self.second_member = write_bytes(self.dvd / "VTS_01_2.VOB", b"second vob payload " * 300)
+        self.group_output = write_bytes(self.dvd / "VTS_01.mp4", OUTPUT_BYTES)
+        record = new_record(self.first_member)
+        record["source"].update(
+            kind="vob-group",
+            members=[{"name": path.name, "fingerprint": cheap_fingerprint(path)}
+                     for path in (self.first_member, self.second_member)],
+            size=self.first_member.stat().st_size + self.second_member.stat().st_size)
+        set_status(record, "planned")
+        record["action"] = "reencode"
+        record["output"]["name"] = "VTS_01.mp4"
+        record["output"]["sha256"] = sha256_file(self.group_output)
+        record["output"]["size"] = self.group_output.stat().st_size
+        record["score"] = 95
+        set_status(record, "verified")
+        save_record(self.first_member, record)
+        self.group_record = record
+
+    def test_every_member_is_quarantined(self):
+        stage = retire_one(self.first_member, self.group_record, self.root)
+        first_target = self.quarantine / "dvd_rip" / "VTS_01_1.VOB"
+        second_target = self.quarantine / "dvd_rip" / "VTS_01_2.VOB"
+        self.assertFalse(self.first_member.exists())
+        self.assertFalse(self.second_member.exists())
+        self.assertEqual(first_target.read_bytes(), b"first vob payload " * 300)
+        self.assertEqual(second_target.read_bytes(), b"second vob payload " * 300)
+        self.assertEqual(stage["destinations"], [str(first_target), str(second_target)])
+        self.assertEqual(stage["destination"], str(first_target))
+        saved = load_record(self.first_member)
+        self.assertEqual(saved["status"], "retired")
+        self.assertEqual(saved["stages"]["retire"]["destinations"], [str(first_target), str(second_target)])
+        self.assertEqual(self.group_output.read_bytes(), OUTPUT_BYTES)
+
+    def test_every_member_is_destroyed(self):
+        stage = retire_one(self.first_member, self.group_record, self.root, destroy=True)
+        self.assertFalse(self.first_member.exists())
+        self.assertFalse(self.second_member.exists())
+        self.assertEqual(stage["destinations"], [None, None])
+
+    def test_changed_second_member_is_refused(self):
+        write_bytes(self.second_member, b"edited second vob " * 300)
+        refusal = self.assert_refused("source-changed", self.first_member, self.group_record)
+        self.assertIn("VTS_01_2.VOB", refusal.detail)
+
+    def test_missing_second_member_is_refused(self):
+        os.unlink(str(self.second_member))
+        refusal = self.assert_refused("source-changed", self.first_member, self.group_record)
+        self.assertIn("VTS_01_2.VOB", refusal.detail)
+
+    def test_output_larger_compares_with_the_group_size(self):
+        larger_than_first = b"x" * (self.first_member.stat().st_size + 100)
+        write_bytes(self.group_output, larger_than_first)
+        self.group_record["output"]["sha256"] = sha256_file(self.group_output)
+        self.group_record["output"]["size"] = len(larger_than_first)
+        stage = retire_one(self.first_member, self.group_record, self.root)
+        self.assertEqual(len(stage["destinations"]), 2)
+
+    def test_second_member_in_quarantine_moves_nothing(self):
+        write_bytes(self.quarantine / "dvd_rip" / "VTS_01_2.VOB", b"already here")
+        self.assert_refused("quarantine-exists", self.first_member, self.group_record)
+
+    def test_failure_after_first_member_is_recorded_as_partial(self):
+        real_replace = os.replace
+        calls = []
+
+        def failing_replace(source, destination):
+            calls.append(source)
+            if len(calls) == 2:
+                raise OSError("simulated failure on the second member")
+            return real_replace(source, destination)
+
+        with mock.patch.object(retire.os, "replace", side_effect=failing_replace):
+            with self.assertRaises(OSError) as caught:
+                retire_one(self.first_member, self.group_record, self.root)
+        self.assertIn("1 of 2", str(caught.exception))
+        self.assertFalse(self.first_member.exists())
+        self.assertTrue(self.second_member.is_file())
+        saved = load_record(self.first_member)
+        self.assertEqual(saved["status"], "verified")
+        self.assertEqual([entry["name"] for entry in saved["stages"]["retire"]["partial"]], ["VTS_01_1.VOB"])
+        self.assertEqual(saved["stages"]["retire"]["failed"], "VTS_01_2.VOB")
+        self.assert_refused("status-not-verified", self.first_member, saved)
+
+    def test_destroy_confirmation_lists_every_member(self):
+        self.beach_record["score"] = 40
+        save_record(self.beach_source, self.beach_record)
+        self.meeting_record["score"] = 40
+        save_record(self.meeting_source, self.meeting_record)
+        self.quietly()
+        with mock.patch.object(retire, "confirm_destroy", return_value=False) as confirm:
+            run(RunTests.namespace(self, "--destroy-originals-now", str(self.root), yes=True))
+        listed = confirm.call_args[0][0]
+        self.assertEqual(listed, [str(self.first_member), str(self.second_member)])
+        self.assertTrue(self.first_member.is_file())
+        self.assertTrue(self.second_member.is_file())
 
 
 class ConfirmDestroyTests(unittest.TestCase):

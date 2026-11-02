@@ -2,7 +2,8 @@
 # vidfunnel-podman: run vidfunnel inside its container image. Every argument that
 # is an existing path on the host is bind-mounted read-write at the same absolute
 # path inside the container, as is the current directory (the container's working
-# directory), and the container runs as the invoking uid/gid. See HANDOFF.md section 8.
+# directory), and the container runs as the invoking uid/gid. --quarantine and --db
+# targets are created on the host first and mounted. See HANDOFF.md section 8.
 
 VERSION="20261102"
 
@@ -34,6 +35,16 @@ What the wrapper does:
   resolved to an absolute path and bind-mounted read-write at the same path inside
   the container. The current directory is mounted too and used as the working
   directory. A path inside another mounted folder is not mounted separately.
+  Paths that vidfunnel will create are prepared on the host first, so they are
+  not written into the container's own filesystem (removed with the container):
+    --quarantine DIR, --quarantine=DIR   DIR is created on the host (mkdir -p)
+                                         and mounted; after 'retire', the
+                                         abbreviations argparse accepts
+                                         (--quar DIR) are treated alike
+    --db PATH, --db=PATH                 the folder holding PATH is created on
+                                         the host (mkdir -p) and mounted
+  A --quarantine directory that cannot be created or is still not under a
+  mounted path stops the wrapper before the container starts.
   The container runs with --rm, --userns=keep-id (podman) or --user uid:gid
   (docker) so files are owned by you, and --security-opt label=disable for SELinux
   hosts. It gets a terminal (-it) only when stdin is one.
@@ -153,17 +164,82 @@ add_mount() {
 CWD=$(pwd)
 add_mount "${CWD}"
 
+QUARANTINES=""
+
+SEEN_RETIRE=0
+
+is_quarantine_option() {
+    [ "$1" = "--quarantine" ] && return 0
+    [ "${SEEN_RETIRE}" -eq 1 ] || return 1
+    case "$1" in
+        --q*) case "--quarantine" in "$1"*) return 0 ;; esac ;;
+    esac
+    return 1
+}
+
+prepare_quarantine() {
+    [ -n "$1" ] || die "--quarantine needs a directory"
+    mkdir -p -- "$1" || die "cannot create the quarantine directory '$1' on the host"
+    q=$(abs_path "$1") || die "cannot resolve the quarantine directory '$1'"
+    add_mount "${q}"
+    QUARANTINES="${QUARANTINES}${q}
+"
+}
+
+prepare_db() {
+    [ -n "$1" ] || die "--db needs a path"
+    db_parent=$(dirname -- "$1")
+    mkdir -p -- "${db_parent}" || die "cannot create the folder '${db_parent}' for the index database on the host"
+    add_mount "$(abs_path "${db_parent}")"
+}
+
 count=$#
 i=0
+pending=""
 while [ "${i}" -lt "${count}" ]; do
     arg="$1"
     shift
+    if [ "${pending}" = "quarantine" ]; then
+        prepare_quarantine "${arg}"
+        pending=""
+    elif [ "${pending}" = "db" ]; then
+        prepare_db "${arg}"
+        pending=""
+    else
+        case "${arg}" in
+            --db) pending="db" ;;
+            --db=*) prepare_db "${arg#--db=}" ;;
+            --*=*)
+                if is_quarantine_option "${arg%%=*}"; then
+                    prepare_quarantine "${arg#*=}"
+                fi
+                ;;
+            retire) SEEN_RETIRE=1 ;;
+            *)
+                if is_quarantine_option "${arg}"; then
+                    pending="quarantine"
+                fi
+                ;;
+        esac
+    fi
     if [ -e "${arg}" ]; then
         add_mount "$(abs_path "${arg}")"
     fi
     set -- "$@" "${arg}"
     i=$((i + 1))
 done
+
+oldifs="$IFS"
+IFS='
+'
+for q in ${QUARANTINES}; do
+    covered=0
+    for m in ${MOUNTS}; do
+        case "${q}/" in "${m}/"*) covered=1 ;; esac
+    done
+    [ "${covered}" -eq 1 ] || die "the quarantine directory '${q}' is not under any mounted path; refusing to run, because retire would write the originals into the container's filesystem"
+done
+IFS="$oldifs"
 
 set -- "${RUN_IMAGE}" "$@"
 

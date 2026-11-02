@@ -13,7 +13,9 @@ failed guard raises RetireRefused and nothing is moved.
 
 Only then the original is moved into the quarantine directory (default
 '<root>/.vidfunnel-retired/', relative path below the root preserved), or,
-with --destroy-originals-now after typing 'destroy' (or --yes), unlinked. An
+with --destroy-originals-now after typing 'destroy' (or --yes), unlinked. For
+a VOB-group record (source.kind 'vob-group') every member in source.members
+is checked against its own fingerprint and moved or unlinked, in order. An
 interim-named output is then renamed to its final name, and PAR2 files
 written for the interim name are replaced by PAR2 for the final name (PAR2
 stores the protected file's name); when that cannot be done the old ones are
@@ -126,7 +128,11 @@ def check_eligible(source, record, allow_review=False, progress=None, quiet=Fals
     'quarantine-exists' depends on the destination and is checked by retire_one.
     progress: None (a Progress line is shown for outputs over 32 MiB unless
     quiet) or a Progress-like object handed to sha256_file. Returns
-    {'output_path', 'final_output_path', 'band', 'sha256_verified': True}.
+    {'output_path', 'final_output_path', 'band', 'sha256_verified': True,
+    'members': [paths]}; 'members' is [source] for a single file and every
+    member of source.members, in order, for a 'vob-group' record, each of
+    which must still match its own fingerprint ('source-changed' names the
+    member) and whose sizes add up to the size 'output-larger' compares with.
     """
     source = Path(source)
 
@@ -149,6 +155,20 @@ def check_eligible(source, record, allow_review=False, progress=None, quiet=Fals
     if interim_name is not None and not _plain_name(interim_name):
         raise RetireRefused("no-record", "the record of '{}' has an unusable interim name ({!r})".format(
             source.name, interim_name))
+    members = None
+    if source_section.get("kind") == "vob-group":
+        members = source_section.get("members")
+        if not isinstance(members, list) or not members or not all(
+                isinstance(member, dict) and _plain_name(member.get("name")) for member in members):
+            raise RetireRefused("no-record", "the VOB-group record of '{}' has no usable member list".format(
+                source.name))
+        member_names = [member["name"] for member in members]
+        if len(set(member_names)) != len(member_names):
+            raise RetireRefused("no-record", "the VOB-group record of '{}' lists a member twice".format(
+                source.name))
+        if members[0].get("name") != source.name:
+            raise RetireRefused("no-record", "the VOB-group record of '{}' lists '{}' as its first member".format(
+                source.name, members[0].get("name")))
 
     # status-not-verified
     status = record.get("status")
@@ -167,16 +187,35 @@ def check_eligible(source, record, allow_review=False, progress=None, quiet=Fals
         raise RetireRefused("source-changed",
                             "source '{}' no longer matches the fingerprint taken at plan time".format(
                                 source.name))
+    folder = source.parent
+    member_paths = [source]
+    source_size = current["size"]
+    if members is not None:
+        member_paths = []
+        source_size = 0
+        for member in members:
+            member_path = folder / member["name"]
+            if not member_path.is_file():
+                raise RetireRefused("source-changed", "VOB-group member '{}' is missing or not a regular file".format(
+                    member_path))
+            member_print = cheap_fingerprint(member_path)
+            if not fingerprint_matches(member_print, member.get("fingerprint")):
+                raise RetireRefused("source-changed",
+                                    "VOB-group member '{}' no longer matches the fingerprint taken at plan time".format(
+                                        member["name"]))
+            member_paths.append(member_path)
+            source_size += member_print["size"]
 
     # output-missing
-    folder = source.parent
     final_output_path = folder / output_name
     output_path = folder / (interim_name if interim_name is not None else output_name)
     if not output_path.is_file():
         raise RetireRefused("output-missing", "output '{}' does not exist".format(output_path.name))
-    if _same_file(output_path, source):
-        raise RetireRefused("output-missing",
-                            "output '{}' is the source file itself".format(output_path.name))
+    for member_path in member_paths:
+        if _same_file(output_path, member_path):
+            raise RetireRefused("output-missing",
+                                "output '{}' is the source file '{}' itself".format(output_path.name,
+                                                                                     member_path.name))
 
     actual_size = output_path.stat().st_size
 
@@ -198,9 +237,9 @@ def check_eligible(source, record, allow_review=False, progress=None, quiet=Fals
         raise RetireRefused("output-larger",
                             "the output was kept although larger than the source (--keep-larger); "
                             "such a conversion is not eligible for retirement")
-    if record.get("action") == "reencode" and actual_size > current["size"]:
+    if record.get("action") == "reencode" and actual_size > source_size:
         raise RetireRefused("output-larger", "output '{}' ({}) is larger than the source ({})".format(
-            output_path.name, format_bytes(actual_size), format_bytes(current["size"])))
+            output_path.name, format_bytes(actual_size), format_bytes(source_size)))
 
     # output-hash-mismatch (size first: a different size cannot have the same hash)
     expected_hash = output_section.get("sha256")
@@ -218,7 +257,8 @@ def check_eligible(source, record, allow_review=False, progress=None, quiet=Fals
 
     # interim-rename-blocked
     if interim_name is not None and interim_name != output_name:
-        if os.path.lexists(str(final_output_path)) and not _same_file(final_output_path, source):
+        if os.path.lexists(str(final_output_path)) and not any(
+                _same_file(final_output_path, member_path) for member_path in member_paths):
             raise RetireRefused("interim-rename-blocked",
                                 "'{}' cannot be renamed to '{}': a different file has that name".format(
                                     interim_name, output_name))
@@ -228,6 +268,7 @@ def check_eligible(source, record, allow_review=False, progress=None, quiet=Fals
         "final_output_path": final_output_path,
         "band": score_band,
         "sha256_verified": True,
+        "members": member_paths,
     }
 
 
@@ -317,11 +358,11 @@ def _par2_files_of(output_path):
 
 
 def _par2_redundancy(record):
-    """Redundancy for recreated PAR2: plan's 'par2', else convert's 'par2_redundancy', else 10."""
+    """Redundancy for recreated PAR2: convert's 'par2_redundancy' (convert --par2 overrides plan), else plan's 'par2', else 10."""
     stages = record.get("stages") or {}
-    redundancy = (stages.get("plan") or {}).get("par2")
+    redundancy = (stages.get("convert") or {}).get("par2_redundancy")
     if redundancy is None:
-        redundancy = (stages.get("convert") or {}).get("par2_redundancy")
+        redundancy = (stages.get("plan") or {}).get("par2")
     if redundancy is None:
         redundancy = PAR2_DEFAULT_REDUNDANCY
     return redundancy
@@ -336,7 +377,7 @@ def _redo_par2(record, interim_path, final_path, quiet):
     exist (they are not ours to overwrite), the old files are kept, the record
     gets the flag 'par2-stale' and the reason is printed and returned.
     Returns None when there were no interim PAR2 files, else a dict for the
-    retire stage: {'par2_recreated': [names]} or {'par2_recreated': [],
+    retire stage: {'par2_recreated': [names], 'par2_redundancy': N} or {'par2_recreated': [],
     'par2_stale': [old names], 'par2_error': reason}.
     """
     old_files = _par2_files_of(interim_path)
@@ -353,18 +394,39 @@ def _redo_par2(record, interim_path, final_path, quiet):
     else:
         from vidfunnel.encode import write_par2
         options = types.SimpleNamespace(stream=None, quiet=quiet, verbose=False)
+        redundancy = _par2_redundancy(record)
         try:
-            written = write_par2(final_path, _par2_redundancy(record), options)
+            written = write_par2(final_path, redundancy, options)
         except OSError as failure:
             error = str(failure)
         else:
             for path in old_files:
                 os.unlink(str(path))
-            return {"par2_recreated": [path.name for path in written]}
+            return {"par2_recreated": [path.name for path in written], "par2_redundancy": redundancy}
     add_flag(record, PAR2_STALE_FLAG)
     say("  PAR2 for '{}' not recreated ({}); the old files {} keep the interim name and are stale".format(
         final_path.name, error, ", ".join("'{}'".format(name) for name in old_names)))
     return {"par2_recreated": [], "par2_stale": old_names, "par2_error": error}
+
+
+def _retire_member(source, destination, quiet):
+    """Unlink source (destination None) or move it to destination; return 'unlink', 'rename' or 'copy'."""
+    if destination is None:
+        os.unlink(str(source))
+        return "unlink"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if _same_filesystem(source, destination.parent):
+        if os.path.lexists(str(destination)):
+            raise RetireRefused("quarantine-exists",
+                                "'{}' already exists in quarantine".format(destination))
+        os.replace(str(source), str(destination))
+        return "rename"
+    if not quiet:
+        say("  '{}' is on another filesystem than '{}'; copying, verifying, then removing the original".format(
+            source.name, destination.parent))
+    _copy_across(source, destination, quiet)
+    os.unlink(str(source))
+    return "copy"
 
 
 def retire_one(source, record, root, quarantine_dir=None, destroy=False, allow_review=False,
@@ -372,49 +434,62 @@ def retire_one(source, record, root, quarantine_dir=None, destroy=False, allow_r
     """Check the guards, then quarantine (or, destroy=True, unlink) one source; return the retire stage.
 
     destroy=True unlinks without asking: the caller (run) has already obtained
-    the confirmation. After the source is gone an interim-named output is
-    renamed to its final name and its PAR2 files redone (_redo_par2). The
-    record gets a 'retire' stage {mode, destination, method, renamed_output,
-    score, band}, plus par2_recreated (and par2_stale, par2_error when the
-    PAR2 could not be redone) when interim PAR2 files existed, and status
-    'retired' and is saved; a failed rename is recorded as 'rename_error' and
-    raised as OSError after the record is saved, because the source is gone.
+    the confirmation. A 'vob-group' record moves (or unlinks) every member,
+    in order, each to its own quarantine_destination. After the source is
+    gone an interim-named output is renamed to its final name and its PAR2
+    files redone (_redo_par2). The record gets a 'retire' stage {mode,
+    destination (the first member's), destinations (one per member), method,
+    renamed_output, score, band}, plus par2_recreated and par2_redundancy (and
+    par2_stale, par2_error when the PAR2 could not be redone) when interim
+    PAR2 files existed, and status 'retired' and is saved; a failed rename is
+    recorded as 'rename_error' and raised as OSError after the record is
+    saved, because the source is gone. When a member fails after earlier
+    members were moved or unlinked, the stage holds {mode, partial: [{name,
+    destination}], failed, error}, the status stays 'verified', the record is
+    saved and OSError is raised, so a person sees it.
     """
     source = Path(source)
     eligibility = check_eligible(source, record, allow_review=allow_review, progress=progress, quiet=quiet)
 
-    destination = None
+    member_paths = eligibility["members"]
+    destinations = [None] * len(member_paths)
     if destroy:
         mode = "destroy"
     else:
         mode = "quarantine"
-        try:
-            destination = quarantine_destination(source, root, quarantine_dir)
-        except ValueError as error:
-            raise RetireRefused("quarantine-exists", str(error))
-        if os.path.lexists(str(destination)):
-            raise RetireRefused("quarantine-exists",
-                                "'{}' already exists in quarantine".format(destination))
-
-    # The guards have passed: from here on the original is touched.
-    if destroy:
-        os.unlink(str(source))
-        method = "unlink"
-    else:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if _same_filesystem(source, destination.parent):
-            if os.path.lexists(str(destination)):
+        for index, member_path in enumerate(member_paths):
+            try:
+                destinations[index] = quarantine_destination(member_path, root, quarantine_dir)
+            except ValueError as error:
+                raise RetireRefused("quarantine-exists", str(error))
+            if os.path.lexists(str(destinations[index])):
                 raise RetireRefused("quarantine-exists",
-                                    "'{}' already exists in quarantine".format(destination))
-            os.replace(str(source), str(destination))
-            method = "rename"
-        else:
-            if not quiet:
-                say("  '{}' is on another filesystem than '{}'; copying, verifying, then removing the original".format(
-                    source.name, destination.parent))
-            _copy_across(source, destination, quiet)
-            os.unlink(str(source))
-            method = "copy"
+                                    "'{}' already exists in quarantine".format(destinations[index]))
+
+    # The guards have passed: from here on the originals are touched, in member order.
+    methods = []
+    moved = []
+    for member_path, destination in zip(member_paths, destinations):
+        try:
+            methods.append(_retire_member(member_path, destination, quiet))
+        except (OSError, RetireRefused) as failure:
+            if not moved:
+                raise
+            partial = {
+                "mode": mode,
+                "partial": [{"name": path.name, "destination": str(target) if target is not None else None}
+                            for path, target in moved],
+                "failed": member_path.name,
+                "error": str(failure),
+            }
+            add_stage(record, "retire", partial)
+            save_record(source, record)
+            raise OSError("retire of '{}' stopped after {} of {} VOB-group members ({}); "
+                          "the record lists what was {} under stages.retire.partial".format(
+                              source.name, len(moved), len(member_paths), failure,
+                              "deleted" if destroy else "moved"))
+        moved.append((member_path, destination))
+    method = methods[0]
 
     renamed_output = False
     rename_error = None
@@ -436,7 +511,8 @@ def retire_one(source, record, root, quarantine_dir=None, destroy=False, allow_r
 
     stage = {
         "mode": mode,
-        "destination": str(destination) if destination is not None else None,
+        "destination": str(destinations[0]) if destinations[0] is not None else None,
+        "destinations": [str(target) if target is not None else None for target in destinations],
         "method": method,
         "renamed_output": renamed_output,
         "score": record.get("score"),
@@ -651,7 +727,7 @@ def run(args):
                 say("{} '{}' checking before destroy".format(prefix, candidate.display))
                 try:
                     record = _fresh_record(candidate)
-                    check_eligible(candidate.source, record, allow_review=allow_review, quiet=quiet)
+                    eligibility = check_eligible(candidate.source, record, allow_review=allow_review, quiet=quiet)
                 except RetireRefused as refusal:
                     _refused(prefix, candidate, refusal, summary)
                     continue
@@ -660,10 +736,10 @@ def run(args):
                     summary.add("failed")
                     problems.append(str(error))
                     continue
-                eligible.append((prefix, candidate))
-            if eligible and confirm_destroy([str(candidate.source) for _prefix, candidate in eligible],
-                                            yes=yes):
-                for prefix, candidate in eligible:
+                eligible.append((prefix, candidate, eligibility["members"]))
+            if eligible and confirm_destroy([str(path) for _prefix, _candidate, paths in eligible
+                                             for path in paths], yes=yes):
+                for prefix, candidate, _paths in eligible:
                     say("{} '{}' -> destroy".format(prefix, candidate.display))
                     _retire_candidate(candidate, prefix, quarantine_dir, True, allow_review, quiet,
                                       summary, problems)
@@ -691,7 +767,8 @@ def _retire_candidate(candidate, prefix, quarantine_dir, destroy, allow_review, 
         problems.append(str(error))
         return
     if stage["mode"] == "quarantine":
-        detail = "moved to '{}' ({})".format(stage["destination"], stage["method"])
+        detail = "moved to {} ({})".format(", ".join("'{}'".format(target) for target in stage["destinations"]),
+                                           stage["method"])
     else:
         detail = "deleted"
     if stage["renamed_output"]:
