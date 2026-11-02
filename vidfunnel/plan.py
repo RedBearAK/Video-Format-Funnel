@@ -23,6 +23,14 @@ What the record carries for the later stages:
 - output.name and output.interim_name ('<stem>.vidfunnel.mp4' when the
   source is itself '<stem>.mp4'), output.sidecars (file names).
 
+Two sources whose outputs would share a name are both quarantined with
+'output-collision' (HANDOFF 2.4), whether they are planned in the same run
+or not: the folder's existing records are checked too. A record of another
+source that is still 'planned' for that name is quarantined as well (its
+stages.plan gains 'collision' and 'collision_reason'); one that is already
+'converted' or 'verified' is left as it is and only the new source is
+quarantined, with a reason naming the existing output.
+
 Inputs that analyze() cannot open by path (a VOB group through the concat
 protocol, a DVD title through the dvdvideo demuxer) are analysed by
 analyze_input(), which runs the same passes with an input-argument list and
@@ -78,7 +86,9 @@ from vidfunnel.probe import (
 )
 from vidfunnel.progress import Progress, StageSummary, ffmpeg_progress_callback, format_bytes, say
 from vidfunnel.record import (
+    FOLDER_FILE,
     RECORD_DIR,
+    RECORD_SUFFIX,
     FolderLock,
     LockHeld,
     RecordError,
@@ -91,6 +101,7 @@ from vidfunnel.record import (
     load_record,
     new_record,
     now_iso,
+    record_dir,
     save_folder,
     save_record,
     set_status,
@@ -107,6 +118,8 @@ OUTPUT_EXTENSIONS = ("mp4", "m4v")
 INTERIM_INFIX = ".vidfunnel"
 RETIRED_DIR = ".vidfunnel-retired"
 PART_SUFFIX = ".part"
+SUBS_SIDECAR_SUFFIX = ".subs.mkv"
+CLAIMING_STATUSES = ("planned", "converted", "verified")
 
 FMP4_MOVFLAGS = "+frag_keyframe+empty_moov+default_base_moof+use_metadata_tags"
 PLAIN_MOVFLAGS = "+faststart+use_metadata_tags"
@@ -215,6 +228,8 @@ def _skipped_name(name):
 
 def _source_candidate(path, tools, seen_groups):
     """The source to yield for one file found by the walk (or given), or None to skip it."""
+    if path.name.lower().endswith(SUBS_SIDECAR_SUFFIX):
+        return None
     kind = is_dvd_structure(path)
     if kind == "vob_menu":
         return None
@@ -235,14 +250,16 @@ def iter_sources(paths, tools=None):
 
     A directory is walked: files with a SOURCE_EXTENSIONS extension
     (case-insensitive), skipping hidden files and folders (so '.vidfunnel/'
-    and '.vidfunnel-retired/'), '.part' files, menu VOBs and any .mp4/.m4v
-    that carries our identity tag (read with ffprobe when `tools` is given).
+    and '.vidfunnel-retired/'), '.part' files, our own 'NAME.subs.mkv'
+    subtitle sidecars, menu VOBs and any .mp4/.m4v that carries our
+    identity tag (read with ffprobe when `tools` is given).
     A title-set VOB stands for its group (VTS_xx_1.VOB is yielded once for
     all VTS_xx_N.VOB of the folder). A DVD tree (a VIDEO_TS folder, or one
     holding VIDEO_TS.IFO) is yielded as the folder itself and not entered;
     plan expands it into titles or title sets. A file PATH is taken as is,
     whatever its extension, except that a VOB stands for its group, an IFO
-    for its DVD folder, and one of our own outputs is skipped.
+    for its DVD folder, and one of our own outputs or '.subs.mkv' sidecars
+    is skipped.
     """
     seen_groups = set()
     seen = set()
@@ -283,7 +300,10 @@ def iter_sources(paths, tools=None):
                 yield root.parent
         else:
             candidate = _source_candidate(root, tools, seen_groups)
-            if candidate is None and _extension(root) in OUTPUT_EXTENSIONS:
+            if candidate is None and root.name.lower().endswith(SUBS_SIDECAR_SUFFIX):
+                say("skipping '{}': a '{}' name is one of our subtitle sidecars".format(root.name,
+                                                                                       SUBS_SIDECAR_SUFFIX))
+            elif candidate is None and _extension(root) in OUTPUT_EXTENSIONS:
                 say("skipping '{}': it carries the vidfunnel identity tag (one of our outputs)".format(root.name))
             if emit(candidate):
                 yield candidate
@@ -327,6 +347,8 @@ def output_names(source, sibling_sources, tools=None, source_sha256=None, stem=N
     carry our identity tag with the source's 'src' (without `tools` or
     `source_sha256` the tag cannot be checked and any such file counts as
     foreign); else None. `stem` overrides the name's stem (DVD titles).
+    Sources planned in earlier runs are not among `sibling_sources`;
+    recorded_claims() finds their records.
     """
     source = Path(os.path.abspath(os.fspath(source)))
     stem = stem if stem is not None else output_stem(source)
@@ -350,6 +372,80 @@ def output_names(source, sibling_sources, tools=None, source_sha256=None, stem=N
             if not ours:
                 collision = "foreign-output"
     return {"name": name, "interim_name": interim_name, "collision": collision}
+
+
+def _record_key_name(record):
+    """The file name a record is keyed by (as encode.record_key builds it), or None."""
+    source = record.get("source") or {}
+    name = source.get("name")
+    if not isinstance(name, str):
+        return None
+    if source.get("kind") == "dvd-title":
+        try:
+            return "{}_title{:02d}".format(name, int(source.get("dvd_title") or 0))
+        except (TypeError, ValueError):
+            return None
+    return name
+
+
+def recorded_claims(folder, name, own_key_name, stream=None):
+    """[(key path, record)] of the folder's records of other sources that claim output `name`.
+
+    A record claims the name when its status is 'planned', 'converted' or
+    'verified' and its output.name equals `name` compared case-insensitively;
+    the record keyed by `own_key_name` (this source's own) is left out. Only
+    the folder's own '.vidfunnel/' is read. An unreadable record is reported
+    on `stream` and passed over.
+    """
+    location = record_dir(folder)
+    try:
+        entries = sorted(os.listdir(str(location)))
+    except FileNotFoundError:
+        return []
+    wanted = name.casefold()
+    claims = []
+    for entry in entries:
+        if entry.startswith(".") or entry == FOLDER_FILE or not entry.endswith(RECORD_SUFFIX):
+            continue
+        key = Path(folder) / entry[:-len(RECORD_SUFFIX)]
+        if key.name == own_key_name:
+            continue
+        try:
+            record = load_record(key)
+        except RecordError as error:
+            say("warning: cannot check '{}' for an output-name collision: {}".format(entry, error), stream)
+            continue
+        if record is None or record.get("status") not in CLAIMING_STATUSES:
+            continue
+        claimed = (record.get("output") or {}).get("name")
+        if isinstance(claimed, str) and claimed.casefold() == wanted and _record_key_name(record) != own_key_name:
+            claims.append((key, record))
+    return claims
+
+
+def _claims_reason(claims, name):
+    parts = ["'{}' ({})".format(_record_key_name(record) or key.name, record.get("status")) for key, record in claims]
+    done = [record for _key, record in claims if record.get("status") != "planned"]
+    if done:
+        return ("'{}' is already the output of {}; a person picks one".format(name, ", ".join(parts)))
+    return "another source in this folder, {}, would also be converted to '{}'; a person picks one".format(
+        ", ".join(parts), name)
+
+
+def _quarantine_claim(key, record, new_key_name, name, stream):
+    """Quarantine another source's 'planned' record that a new source collides with (HANDOFF 2.4: both hold)."""
+    reason = "'{}' would also be converted to '{}' (found when it was planned); a person picks one".format(
+        new_key_name, name)
+    record["action"] = "quarantine"
+    record["quarantine_reason"] = "output-collision"
+    add_flag(record, "output-collision")
+    plan = (record.get("stages") or {}).get("plan")
+    if isinstance(plan, dict):
+        plan["collision"] = "same-stem"
+        plan["collision_reason"] = reason
+    set_status(record, "quarantined")
+    save_record(key, record)
+    say("quarantined '{}' too: {}".format(_record_key_name(record) or key.name, reason), stream)
 
 
 def identity_tag(record_id, source_sha256, profile=PROFILE):
@@ -1022,12 +1118,22 @@ def _plan_one(tools, work, options, folder_sources, capabilities, progress, know
         sidecars = build_sidecar_argvs(tools, work.inputs, final_path, analysis, work.dvd_title)
         record["output"]["sidecars"] = [Path(entry["path"]).name for entry in sidecars]
         collision = names["collision"]
+        reason = None
+        claims = recorded_claims(work.folder, names["name"], work.key.name, stream)
+        if claims and collision != "same-stem":
+            collision = "same-stem"
+            reason = _claims_reason(claims, names["name"])
         taken = [entry["path"] for entry in sidecars if os.path.exists(entry["path"])]
         if collision is None and taken:
             collision = "sidecar-exists"
         if collision is not None:
-            plan.update(action="quarantine", collision=collision, reason=_collision_reason(collision, names, taken))
-            return _finish_quarantine(work, record, plan, "output-collision")
+            plan.update(action="quarantine", collision=collision,
+                        reason=reason or _collision_reason(collision, names, taken))
+            outcome = _finish_quarantine(work, record, plan, "output-collision")
+            for key, other in claims:
+                if other.get("status") == "planned":
+                    _quarantine_claim(key, other, work.key.name, names["name"], stream)
+            return outcome
 
         output_path = work.folder / (names["interim_name"] or names["name"])
         plan["argv"] = build_argv(tools, work.inputs, output_path, probe, analysis, action, options, record["id"],
@@ -1135,9 +1241,16 @@ def _table_row(outcome, record):
 
 
 def plan_paths(tools, paths, options, progress=None):
-    """Plan every source under `paths`; print per-file lines, a table and the summary; return the StageSummary."""
+    """Plan every source under `paths`; print per-file lines, a table and the summary; return the StageSummary.
+
+    A folder whose lock is held by another run, or whose lock cannot be
+    created (a read-only folder), is skipped and counted as 'skipped'; the
+    second kind is also listed in the summary's `lock_errors` (folder names),
+    which makes run() exit with EXIT_ERROR.
+    """
     stream, _quiet = _progress_options(progress)
     summary = StageSummary("plan", OUTCOMES)
+    summary.lock_errors = []
     capabilities = dict(ffmpeg_capabilities(tools))
     capabilities["decodable"] = decodable_codecs(tools)
     say("scanning {} path(s) for sources".format(len(paths)), stream)
@@ -1159,28 +1272,39 @@ def plan_paths(tools, paths, options, progress=None):
     rows = []
     for folder in folders:
         entries = by_folder[folder]
+        lock = FolderLock(folder, warn=lambda message: say(message, stream))
         try:
-            with FolderLock(folder, warn=lambda message: say(message, stream)):
-                for work, found in entries:
-                    position += 1
-                    say("[plan {}/{}] probing '{}'".format(position, total, work.label), stream)
-                    try:
-                        outcome, record = _plan_one(tools, work, options, siblings.get(folder, []), capabilities,
-                                                    progress, found)
-                    except RecordError as error:
-                        say("failed: '{}': {}".format(work.label, error), stream)
-                        summary.add("failed")
-                        continue
-                    summary.add(outcome)
-                    rows.append(_table_row(outcome, record))
-                    if outcome == "skipped":
-                        say("  skipped: record {} is '{}' and the source is unchanged (--replan to plan again)".format(
-                            record.get("id"), record.get("status")), stream)
-                _update_folder_file(folder, [work for work, _found in entries])
+            lock.acquire()
         except LockHeld as error:
             position += len(entries)
             say("skipping folder '{}': {}".format(folder, error), stream)
             summary.add("skipped", len(entries))
+            continue
+        except OSError as error:
+            position += len(entries)
+            say("skipping folder '{}': cannot take its lock: {}".format(folder, error), stream)
+            summary.add("skipped", len(entries))
+            summary.lock_errors.append(folder)
+            continue
+        try:
+            for work, found in entries:
+                position += 1
+                say("[plan {}/{}] probing '{}'".format(position, total, work.label), stream)
+                try:
+                    outcome, record = _plan_one(tools, work, options, siblings.get(folder, []), capabilities,
+                                                progress, found)
+                except RecordError as error:
+                    say("failed: '{}': {}".format(work.label, error), stream)
+                    summary.add("failed")
+                    continue
+                summary.add(outcome)
+                rows.append(_table_row(outcome, record))
+                if outcome == "skipped":
+                    say("  skipped: record {} is '{}' and the source is unchanged (--replan to plan again)".format(
+                        record.get("id"), record.get("status")), stream)
+            _update_folder_file(folder, [work for work, _found in entries])
+        finally:
+            lock.release()
     if rows:
         say("  {:<34} {:>5} {:>10}  {}  {}".format("action", "score", "size", "source", "flags"), stream)
         for row in rows:
@@ -1232,7 +1356,8 @@ def add_arguments(parser):
 
 
 def run(args):
-    """`vidfunnel plan`: EXIT_OK, EXIT_ERROR when any file failed, EXIT_USAGE, EXIT_DEPS."""
+    """`vidfunnel plan`: EXIT_OK, EXIT_ERROR when any file failed or a folder could not be locked, EXIT_USAGE,
+    EXIT_DEPS."""
     from vidfunnel.cli import EXIT_DEPS, EXIT_ERROR, EXIT_OK, EXIT_USAGE
     from vidfunnel.deps import DependencyError, require
     try:
@@ -1246,6 +1371,8 @@ def run(args):
             print("vidfunnel plan: '{}' does not exist".format(path), file=sys.stderr)
         return EXIT_USAGE
     summary = plan_paths(tools, args.paths, options_from_args(args), progress=args)
-    return EXIT_ERROR if summary.counts.get("failed") else EXIT_OK
+    if summary.counts.get("failed") or getattr(summary, "lock_errors", None):
+        return EXIT_ERROR
+    return EXIT_OK
 
 # End of File #

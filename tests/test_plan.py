@@ -9,6 +9,7 @@ ffmpeg or the fixtures are missing.
 
 VERSION = "20261102"
 
+import contextlib
 import copy
 import io
 import json
@@ -39,7 +40,7 @@ from vidfunnel.plan import (
     plan_paths,
     video_filters,
 )
-from vidfunnel.record import load_record, record_path
+from vidfunnel.record import load_record, record_path, save_record, set_status
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURE_DIR = os.path.join(REPO_ROOT, "tests", "fixtures")
@@ -435,6 +436,15 @@ class NamesTest(unittest.TestCase):
         self.assertEqual(found, [keep, first])
         self.assertEqual(list(iter_sources([self.root / "disc" / "VTS_01_2.VOB"])), [first])
 
+    def test_iter_sources_skips_subtitle_sidecars(self):
+        keep = touch(self.root / "movie.mkv")
+        touch(self.root / "movie.subs.mkv")
+        touch(self.root / "other.SUBS.MKV")
+        self.assertEqual(list(iter_sources([self.root])), [keep])
+        given = io.StringIO()
+        with contextlib.redirect_stdout(given):
+            self.assertEqual(list(iter_sources([self.root / "movie.subs.mkv"])), [])
+
     def test_iter_sources_with_fixture_vobs(self):
         source = os.path.join(FIXTURE_DIR, "vob_fragments_no_ifo")
         if not os.path.isdir(source):
@@ -466,11 +476,10 @@ class PlanRunTest(unittest.TestCase):
         if missing:
             self.skipTest("fixtures missing ({}); run tests/make_fixtures.sh".format(", ".join(missing)))
         self.temporary = tempfile.TemporaryDirectory()
+        # A cleanup, not tearDown, so cleanups added by a test (restoring permissions) run before it.
+        self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name) / "library"
         self.root.mkdir()
-
-    def tearDown(self):
-        self.temporary.cleanup()
 
     def copy_fixture(self, name, destination=None):
         source = os.path.join(FIXTURE_DIR, name)
@@ -529,6 +538,57 @@ class PlanRunTest(unittest.TestCase):
 
         again = self.plan()
         self.assertEqual(again.counts, {"remux": 0, "re-encode": 0, "quarantine": 0, "skipped": 6, "failed": 0})
+
+    def plan_one(self, name):
+        return plan_paths(TOOLS, [str(self.root / name)], make_options(), progress=quiet())
+
+    def copy_collision_pair(self):
+        self.copy_fixture(os.path.join("collision_pair", "movie.avi"), "movie.avi")
+        self.copy_fixture(os.path.join("collision_pair", "movie.mkv"), "movie.mkv")
+
+    def test_same_stem_planned_in_separate_runs_quarantines_both(self):
+        self.copy_collision_pair()
+        self.plan_one("movie.avi")
+        first = load_record(self.root / "movie.avi")
+        self.assertEqual(first["status"], "planned")
+        self.assertEqual(first["output"]["name"], "movie.mp4")
+        summary = self.plan_one("movie.mkv")
+        self.assertEqual(summary.counts["quarantine"], 1)
+        second = load_record(self.root / "movie.mkv")
+        self.assertEqual((second["status"], second["quarantine_reason"]), ("quarantined", "output-collision"))
+        self.assertEqual(second["stages"]["plan"]["collision"], "same-stem")
+        self.assertIn("'movie.avi'", second["stages"]["plan"]["reason"])
+        first = load_record(self.root / "movie.avi")
+        self.assertEqual((first["status"], first["quarantine_reason"]), ("quarantined", "output-collision"))
+        self.assertIn("output-collision", first["flags"])
+        self.assertEqual(first["stages"]["plan"]["collision"], "same-stem")
+        self.assertIn("'movie.mkv'", first["stages"]["plan"]["collision_reason"])
+
+    def test_same_stem_against_a_converted_record_quarantines_only_the_new_source(self):
+        self.copy_collision_pair()
+        self.plan_one("movie.avi")
+        first = load_record(self.root / "movie.avi")
+        set_status(first, "converted")
+        save_record(self.root / "movie.avi", first)
+        self.plan_one("movie.mkv")
+        second = load_record(self.root / "movie.mkv")
+        self.assertEqual((second["status"], second["quarantine_reason"]), ("quarantined", "output-collision"))
+        self.assertIn("'movie.mp4' is already the output of 'movie.avi'", second["stages"]["plan"]["reason"])
+        self.assertEqual(load_record(self.root / "movie.avi"), first)
+
+    def test_read_only_folder_is_skipped_without_a_traceback(self):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("running as root; a read-only folder is still writable")
+        self.copy_fixture("h264_high_mkv_aac.mkv")
+        self.plan()
+        for folder in (self.root / ".vidfunnel", self.root):
+            os.chmod(str(folder), 0o555)
+            self.addCleanup(os.chmod, str(folder), 0o755)
+        progress = quiet()
+        summary = plan_paths(TOOLS, [str(self.root)], make_options(), progress=progress)
+        self.assertEqual(summary.counts["skipped"], 1, progress.stream.getvalue())
+        self.assertEqual(summary.lock_errors, [str(self.root)])
+        self.assertIn("cannot take its lock", progress.stream.getvalue())
 
     def test_changed_source_and_replan(self):
         clip = self.copy_fixture("xvid_avi_mp3.avi")

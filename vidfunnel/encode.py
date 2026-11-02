@@ -2,8 +2,9 @@
 
 HANDOFF.md sections 2.4, 2.5, 5 (the size rule), 6.3, 6.7 and 6.10.
 `convert` runs exactly the argv that `plan` stored under stages.plan.argv,
-with its last element (the output path) replaced by a hidden '.NAME.part'
-file in the same folder. On success the part file is renamed into place
+with its last element (the output path) replaced by a hidden
+'.NAME.<first 8 hex digits of the record id>.part' file in the same folder,
+so two records can never write the same part file. On success the part file is renamed into place
 (the interim '<stem>.vidfunnel.mp4' name when the source is itself an MP4),
 the output gets the source's mtime, the subtitle sidecars are written the
 same way, the size rule is applied, PAR2 is written when asked, and verify
@@ -30,6 +31,13 @@ What convert writes into the record:
   run), status 'converted' (or 'verified' once verify has run);
 - flags 'keep-larger', 'sidecar-failed', 'par2-skipped', 'par2-failed',
   'source-changed' (status 'source-changed' too) as they apply.
+
+Before anything runs, planned records whose output names meet in one
+folder (output.name or output.interim_name, compared case-insensitively)
+are all refused: both source names are printed, neither record is
+touched, and they are counted as 'collision' in the summary. A folder
+whose lock is held, or cannot be created (a read-only folder), is skipped;
+the second kind and any collision make run() exit with EXIT_ERROR.
 
 The record is saved after every change of state, so an interrupted run
 leaves a record that says what happened. A record that is not 'planned' is
@@ -79,10 +87,17 @@ DONE_STATUSES = ("converted", "verified")
 # --- names ------------------------------------------------------------------------------
 
 
-def part_path(output_path):
-    """The temp file convert writes to: same directory, '.<name>.part' (hidden from Jellyfin and Finder)."""
+def part_path(output_path, record_id):
+    """The temp file convert writes to: same directory, '.<name>.<id8>.part' (hidden from Jellyfin and Finder).
+
+    <id8> is the first 8 hex digits of the record id, so the part names of
+    two records never meet even when their output names do.
+    """
+    digits = "".join(character for character in str(record_id or "") if character in "0123456789abcdefABCDEF")
+    if len(digits) < 8:
+        raise ValueError("record id '{}' has fewer than 8 hex digits".format(record_id))
     output_path = Path(output_path)
-    return output_path.parent / ("." + output_path.name + PART_SUFFIX)
+    return output_path.parent / ("." + output_path.name + "." + digits[:8].lower() + PART_SUFFIX)
 
 
 def output_path_for(record, folder):
@@ -287,7 +302,7 @@ def _par2_files(output_path):
     return found
 
 
-def _write_sidecars(plan, stream, verbose):
+def _write_sidecars(plan, record_id, stream, verbose):
     """Run each sidecar argv to its own part file and rename; (names written, [error dicts])."""
     written = []
     errors = []
@@ -300,7 +315,7 @@ def _write_sidecars(plan, stream, verbose):
         if final.exists():
             errors.append({"path": final.name, "error": "'{}' already exists; not overwritten".format(final.name)})
             continue
-        temp = part_path(final)
+        temp = part_path(final, record_id)
         argv[-1] = str(temp)
         say("  writing sidecar '{}' ({})".format(final.name, entry.get("kind")), stream)
         if verbose:
@@ -386,7 +401,7 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
 
     plan = record["stages"]["plan"]
     action_word = ACTION_WORDS[record["action"]]
-    temp = part_path(output_path)
+    temp = part_path(output_path, record.get("id"))
     argv = list(plan["argv"])
     argv[-1] = str(temp)
     counter = "[convert {}/{}]".format(position, total) if position is not None and total else "[convert]"
@@ -453,7 +468,7 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
     else:
         say("  source size unknown; the size rule could not be applied to '{}'".format(output_path.name), stream)
 
-    sidecars_written, sidecar_errors = _write_sidecars(plan, stream, verbose)
+    sidecars_written, sidecar_errors = _write_sidecars(plan, record.get("id"), stream, verbose)
     if sidecar_errors:
         add_flag(record, "sidecar-failed")
 
@@ -565,7 +580,7 @@ def _dry_run(entries, options, stream):
             continue
         plan = record["stages"]["plan"]
         argv = list(plan["argv"])
-        argv[-1] = str(part_path(output_path))
+        argv[-1] = str(part_path(output_path, record.get("id")))
         say("[convert {}/{}] would {} '{}' -> '{}'".format(position, total, ACTION_WORDS[record["action"]],
                                                           _label(record), output_path.name), stream)
         say(shlex.join(argv), stream)
@@ -579,13 +594,57 @@ def _dry_run(entries, options, stream):
             say("  then par2 create -r{} -n1 for '{}'".format(redundancy, output_path.name), stream)
 
 
+def _shared_outputs(runnable, stream):
+    """(kept, refused): runnable [(key, folder)] without the planned records whose output names meet.
+
+    Two planned records in one folder whose output.name or output.interim_name
+    are equal (case-insensitively) would write the same file; all of them are
+    refused, their source names printed, and their records left untouched.
+    refused is the number of records taken out. A record that cannot be read
+    here stays in `kept`, where the run reports it.
+    """
+    claims = {}
+    labels = {}
+    for key, folder in runnable:
+        try:
+            record = load_record(key)
+        except RecordError:
+            continue
+        if record is None or record.get("status") != "planned":
+            continue
+        labels[str(key)] = _label(record)
+        output = record.get("output") or {}
+        names = set()
+        for name in (output.get("name"), output.get("interim_name")):
+            if isinstance(name, str) and name:
+                names.add(name.casefold())
+        for name in sorted(names):
+            claims.setdefault((str(folder), name), []).append(key)
+    refused = set()
+    for (folder, name), keys in sorted(claims.items()):
+        if len(keys) < 2:
+            continue
+        say("refusing {} in '{}': they would all write '{}'; none of them is converted; plan again after "
+            "renaming or removing one".format(" and ".join("'{}'".format(labels[str(key)]) for key in keys),
+                                             folder, name), stream)
+        refused.update(str(key) for key in keys)
+    kept = [(key, folder) for key, folder in runnable if str(key) not in refused]
+    return kept, len(refused)
+
+
 def convert_paths(tools, paths, options, progress=None):
-    """Convert every planned record under the PATHs; print lines and the summary; return the StageSummary."""
+    """Convert every planned record under the PATHs; print lines and the summary; return the StageSummary.
+
+    The summary carries `lock_errors` (folders whose lock could not be
+    created) next to its counts; refused output collisions are counted as
+    'collision'.
+    """
     stream, quiet, verbose = _stream_of(progress)
     jobs = max(1, int(getattr(options, "jobs", 1) or 1))
     out = _LineStream(stream if stream is not None else sys.stdout) if jobs > 1 else stream
     shared = types.SimpleNamespace(stream=out, quiet=quiet, verbose=verbose)
     summary = StageSummary("convert", OUTCOMES)
+    summary.lock_errors = []
     problems = []
     say("scanning {} path(s) for records".format(len(paths)), out)
     entries = _collect(paths, out, problems)
@@ -623,10 +682,17 @@ def convert_paths(tools, paths, options, progress=None):
                 except LockHeld as error:
                     say("skipping folder '{}': {}".format(folder, error), out)
                     locked_folders[name] = False
+                except OSError as error:
+                    say("skipping folder '{}': cannot take its lock: {}".format(folder, error), out)
+                    locked_folders[name] = False
+                    summary.lock_errors.append(name)
             if locked_folders[name]:
                 runnable.append((key, folder))
             else:
                 summary.add("skipped")
+        runnable, collided = _shared_outputs(runnable, out)
+        if collided:
+            summary.add("collision", collided)
         total = len(runnable)
 
         def work(position, key):
@@ -693,7 +759,8 @@ def add_arguments(parser):
 
 
 def run(args):
-    """`vidfunnel convert`: EXIT_OK, EXIT_ERROR when anything failed, EXIT_USAGE, EXIT_DEPS."""
+    """`vidfunnel convert`: EXIT_OK, EXIT_ERROR when anything failed, collided or could not be locked, EXIT_USAGE,
+    EXIT_DEPS."""
     from vidfunnel.cli import EXIT_DEPS, EXIT_ERROR, EXIT_OK, EXIT_USAGE
     from vidfunnel.deps import DependencyError, require
     try:
@@ -713,7 +780,7 @@ def run(args):
     progress = types.SimpleNamespace(stream=None, quiet=bool(getattr(args, "quiet", False)),
                                      verbose=options.verbose)
     summary = convert_paths(tools, args.paths, options, progress)
-    failed = summary.counts.get("failed", 0) + summary.counts.get("larger", 0)
-    return EXIT_ERROR if failed else EXIT_OK
+    failed = summary.counts.get("failed", 0) + summary.counts.get("larger", 0) + summary.counts.get("collision", 0)
+    return EXIT_ERROR if failed or getattr(summary, "lock_errors", None) else EXIT_OK
 
 # End of File #

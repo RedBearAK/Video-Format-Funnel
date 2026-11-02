@@ -27,6 +27,7 @@ from pathlib import Path
 
 from vidfunnel.encode import (
     convert_one,
+    convert_paths,
     expected_duration,
     output_path_for,
     part_path,
@@ -42,6 +43,8 @@ from vidfunnel.record import cheap_fingerprint, load_record, record_path, save_r
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURE_DIR = os.path.join(REPO_ROOT, "tests", "fixtures")
 DONE = ("converted", "verified")
+FIRST_RECORD_ID = "0f2b6c1e-4d55-4a8e-9c1d-2f3e4a5b6c7d"
+SECOND_RECORD_ID = "a91c44d0-7e21-4b3f-8d6a-1c2b3d4e5f60"
 
 
 def quiet():
@@ -78,9 +81,21 @@ def listing(root):
 class NameTest(unittest.TestCase):
 
     def test_part_path_is_hidden_in_the_same_folder(self):
-        self.assertEqual(part_path("/library/clips/movie.mp4"), Path("/library/clips/.movie.mp4.part"))
-        self.assertEqual(part_path(Path("relative/movie.vidfunnel.mp4")),
-                         Path("relative/.movie.vidfunnel.mp4.part"))
+        self.assertEqual(part_path("/library/clips/movie.mp4", FIRST_RECORD_ID),
+                         Path("/library/clips/.movie.mp4.0f2b6c1e.part"))
+        self.assertEqual(part_path(Path("relative/movie.vidfunnel.mp4"), FIRST_RECORD_ID),
+                         Path("relative/.movie.vidfunnel.mp4.0f2b6c1e.part"))
+
+    def test_part_path_differs_per_record(self):
+        first = part_path("/library/movie.mp4", FIRST_RECORD_ID)
+        second = part_path("/library/movie.mp4", SECOND_RECORD_ID)
+        self.assertNotEqual(first, second)
+        self.assertEqual(second, Path("/library/.movie.mp4.a91c44d0.part"))
+
+    def test_part_path_needs_a_record_id(self):
+        for bad in (None, "", "xyz-12"):
+            with self.assertRaises(ValueError):
+                part_path("/library/movie.mp4", bad)
 
     def test_output_path_without_interim_name(self):
         record = {"output": {"name": "movie.mp4", "interim_name": None}}
@@ -168,11 +183,10 @@ class ConvertRunTest(unittest.TestCase):
         if missing:
             self.skipTest("fixtures missing ({}); run tests/make_fixtures.sh".format(", ".join(missing)))
         self.temporary = tempfile.TemporaryDirectory()
+        # A cleanup, not tearDown, so cleanups added by a test (restoring permissions) run before it.
+        self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name) / "library"
         self.root.mkdir()
-
-    def tearDown(self):
-        self.temporary.cleanup()
 
     def plan(self, *names):
         for name in names:
@@ -207,7 +221,8 @@ class ConvertRunTest(unittest.TestCase):
                       "output_size", "source_size", "size_ratio", "at"):
             self.assertIn(field, saved["stages"]["convert"], field)
         self.assertEqual(saved["stages"]["convert"]["output_path"], "h264_high_mkv_aac.mp4")
-        self.assertEqual(saved["stages"]["convert"]["part_path"], ".h264_high_mkv_aac.mp4.part")
+        self.assertEqual(saved["stages"]["convert"]["part_path"],
+                         ".h264_high_mkv_aac.mp4.{}.part".format(record["id"][:8]))
         self.assertEqual(saved["output"]["size"], output.stat().st_size)
         self.assertEqual(saved["output"]["fingerprint"]["size"], output.stat().st_size)
 
@@ -225,13 +240,17 @@ class ConvertRunTest(unittest.TestCase):
 
     def test_stale_part_file_is_replaced(self):
         record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
-        stale = self.root / ".h264_high_mkv_aac.mp4.part"
+        stale = self.root / ".h264_high_mkv_aac.mp4.{}.part".format(record["id"][:8])
         stale.write_bytes(b"left over from an interrupted run")
+        other_id = SECOND_RECORD_ID if not record["id"].startswith(SECOND_RECORD_ID[:8]) else FIRST_RECORD_ID
+        other = self.root / ".h264_high_mkv_aac.mp4.{}.part".format(other_id[:8])
+        other.write_bytes(b"another record's part file")
         progress = quiet()
         stage = convert_one(TOOLS, self.root / REMUX_SOURCE, record, convert_options(), progress=progress)
         self.assertEqual(stage["outcome"], "ok", stage)
         self.assertFalse(stale.exists())
         self.assertIn("removed a stale", progress.stream.getvalue())
+        self.assertEqual(other.read_bytes(), b"another record's part file")
 
     def test_reencode_output_decodes_as_h264(self):
         record = self.plan(REENCODE_SOURCE)[REENCODE_SOURCE]
@@ -380,7 +399,8 @@ class ConvertRunTest(unittest.TestCase):
         code, text = self.run_command(dry_run=True)
         self.assertEqual(code, 0, text)
         self.assertIn("-c:v copy", text)
-        self.assertIn(".h264_high_mkv_aac.mp4.part", text)
+        record = load_record(self.root / REMUX_SOURCE)
+        self.assertIn(".h264_high_mkv_aac.mp4.{}.part".format(record["id"][:8]), text)
         self.assertEqual(listing(self.root), before)
         self.assertEqual(record_path(self.root / REMUX_SOURCE).read_bytes(), record_bytes)
 
@@ -394,6 +414,44 @@ class ConvertRunTest(unittest.TestCase):
             self.assertIn(load_record(self.root / name)["status"], DONE, text)
         self.assertFalse((self.root / ".vidfunnel" / "lock").exists())
         self.assertEqual(self.leftover_parts(), [])
+
+    def test_planned_records_with_one_output_name_are_both_refused(self):
+        records = self.plan(REMUX_SOURCE, REENCODE_SOURCE)
+        clash = records[REENCODE_SOURCE]
+        clash["output"]["name"] = "h264_high_mkv_aac.mp4"
+        clash["stages"]["plan"]["argv"][-1] = str(self.root / "h264_high_mkv_aac.mp4")
+        save_record(self.root / REENCODE_SOURCE, clash)
+        before = listing(self.root)
+        record_bytes = {name: record_path(self.root / name).read_bytes() for name in (REMUX_SOURCE, REENCODE_SOURCE)}
+        progress = quiet()
+        summary = convert_paths(TOOLS, [str(self.root)], convert_options(jobs=2), progress)
+        text = progress.stream.getvalue()
+        self.assertEqual(summary.counts.get("collision"), 2, text)
+        self.assertEqual(summary.counts["converted"] + summary.counts["verified"], 0, text)
+        self.assertIn("'{}'".format(REMUX_SOURCE), text)
+        self.assertIn("'{}'".format(REENCODE_SOURCE), text)
+        self.assertEqual(listing(self.root), before)
+        for name, content in record_bytes.items():
+            self.assertEqual(record_path(self.root / name).read_bytes(), content, name)
+        code, _text = self.run_command()
+        self.assertEqual(code, 1)
+
+    def test_read_only_folder_is_skipped_without_a_traceback(self):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("running as root; a read-only folder is still writable")
+        self.plan(REMUX_SOURCE)
+        record_folder = self.root / ".vidfunnel"
+        for folder in (record_folder, self.root):
+            os.chmod(str(folder), 0o555)
+            self.addCleanup(os.chmod, str(folder), 0o755)
+        progress = quiet()
+        summary = convert_paths(TOOLS, [str(self.root)], convert_options(), progress)
+        self.assertEqual(summary.counts["skipped"], 1, progress.stream.getvalue())
+        self.assertEqual(summary.lock_errors, [str(self.root)])
+        self.assertIn("cannot take its lock", progress.stream.getvalue())
+        self.assertFalse((self.root / "h264_high_mkv_aac.mp4").exists())
+        code, _text = self.run_command()
+        self.assertEqual(code, 1)
 
     @unittest.skipIf(shutil.which("par2") is None, "par2 not on PATH; PAR2 test skipped")
     def test_par2_override_writes_verifiable_files(self):
