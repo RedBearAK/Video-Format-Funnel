@@ -42,6 +42,6 @@ jobs:
       - name: Run --version
         run: podman run --rm vidfunnel:ci --version
       - name: Run the tests inside the container
-        run: podman run --rm --entrypoint sh -v "$PWD:/src" -w /src vidfunnel:ci -c "python3 -m unittest discover -s tests -v"
+        run: podman run --rm --entrypoint sh -v "$PWD:/src" -w /src vidfunnel:ci -c "sh tests/make_fixtures.sh && python3 -m unittest discover -s tests -v"
 
 # End of File #

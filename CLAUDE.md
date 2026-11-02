@@ -1,6 +1,6 @@
 # Working notes for Claude Code
 
-Read `HANDOFF.md` first; it is the design document and is authoritative. Nothing in this repo is built yet beyond this skeleton. The name is decided: package, CLI and record directory are `vidfunnel`.
+Read `HANDOFF.md` first; it is the design document and is authoritative. The first build of every stage landed on 2026-11-02; the order of work below is kept as the map of the modules. The name is decided: package, CLI and record directory are `vidfunnel`.
 
 ## Conventions
 
@@ -14,7 +14,7 @@ Read `HANDOFF.md` first; it is the design document and is authoritative. Nothing
 - Report errors directly and specifically. Never claim success without the verification pass. Never fail silently.
 - Anything that may take more than one second of wall-clock time prints what it is doing and, when long, live progress (HANDOFF §6.10).
 
-## Order of work for the first sessions
+## Order of work (first build done 2026-11-02)
 
 1. Package skeleton, `cli.py`, `--version`.
 2. `deps.py` and `check` with per-platform install hints.

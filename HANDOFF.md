@@ -1,6 +1,6 @@
 # Handoff — Video-Format-Funnel (package and CLI `vidfunnel`)
 
-Version 20261102. Revision of the 20261101.5 draft after a consistency review (audio copy versus audio filters, level 4.1 versus field-rate HD, SAR and colour tags on remux, `-xerror`, output and record name collisions, which subcommands need ffmpeg, the redaction example, `dvdvideo` as optional); the points that could be tested were tested with ffmpeg 7.1.5 and the results are recorded in §9 and §10. Name decided: package, CLI and record directory are `vidfunnel`. Nothing built yet. Supersedes `handoffs/HANDOFF - Media archive conversion.md` (Oct 2026), which scoped a bash `media-convert` for the `photos` server. This is now a standalone Python project in its own public repo, run from a workstation (Linux or macOS) against any folder, including the `Media` share over the network. The earlier handoff's agreed points (remux first, verify before replace, Jellyfin layout) carry over.
+Version 20261102. Revision of the 20261101.5 draft after a consistency review (audio copy versus audio filters, level 4.1 versus field-rate HD, SAR and colour tags on remux, `-xerror`, output and record name collisions, which subcommands need ffmpeg, the redaction example, `dvdvideo` as optional); the points that could be tested were tested with ffmpeg 7.1.5 and the results are recorded in §9 and §10. Name decided: package, CLI and record directory are `vidfunnel`. Built on 2026-11-02 (every stage, tests, container files, README); the text below is the specification the code follows, with the deviations noted inline and in §10. Supersedes `handoffs/HANDOFF - Media archive conversion.md` (Oct 2026), which scoped a bash `media-convert` for the `photos` server. This is now a standalone Python project in its own public repo, run from a workstation (Linux or macOS) against any folder, including the `Media` share over the network. The earlier handoff's agreed points (remux first, verify before replace, Jellyfin layout) carry over.
 
 ## 1. Goal
 
@@ -49,7 +49,7 @@ Opus and Vorbis were considered and rejected: Vorbis-in-MP4 is nonstandard, Opus
 - Text subtitles (SRT, SSA/ASS, MKV `subrip`): converted to `mov_text` inside the MP4 and also written as a `.srt` sidecar when styling would be lost (ASS).
 - Bitmap subtitles (DVD `dvd_subtitle`, PGS): cannot live in MP4 and are never silently dropped. PGS goes to a `.sup` sidecar through ffmpeg's `sup` muxer. ffmpeg has no `.idx/.sub` muxer, so `dvd_subtitle` streams are written to a `NAME.subs.mkv` sidecar (Matroska carries VobSub natively; mpv and Jellyfin read it as an external track). Flag `subs-sidecar` and list the sidecars in the record.
 - Chapters: carried over (`-map_chapters 0`).
-- Attachments, fonts, cover art: dropped, listed in the report.
+- Attachments, fonts, cover art: dropped; they stay listed in the record's probe section.
 
 ### 2.4 Container
 
@@ -66,7 +66,7 @@ Metadata: `-map_metadata 0`, preserve `creation_time`, set output mtime to the s
 Output name: the source directory and stem with `.mp4`. Three collision cases, all decided at `plan` and recorded:
 
 - The output name already exists and the file is not ours (§6.7, no tag or a tag whose `src` does not match): flag `output-collision`, nothing is written, `convert` refuses.
-- The source is itself `.mp4` (or `.m4v`), so the output name equals the source name: `convert` writes `<stem>.vidfunnel.mp4` and `retire` renames it to `<stem>.mp4` after the original has been moved away (§6.5); the record carries both names. Until retirement the two files sit side by side and the tag says which is which.
+- The source is itself `.mp4`, so the output name equals the source name (a `.m4v` source does not collide): `convert` writes `<stem>.vidfunnel.mp4` and `retire` renames it to `<stem>.mp4` after the original has been moved away (§6.5); the record carries both names. Until retirement the two files sit side by side and the tag says which is which.
 - Two sources in one folder share a stem (`movie.avi` and `movie.mkv`): both get `output-collision` and `hold`, nothing is written. Two versions of the same content need a human to pick one; the tool does not guess with a suffix.
 
 ### 2.5 Integrity sidecars
@@ -156,7 +156,7 @@ Each converted file gets a score from 100 minus the penalties above, plus post-c
 | Check | Penalty |
 |---|---|
 | Any decoder warning during the probe pass | −10 per class |
-| Output duration differs from source by > 0.1 s | −20 |
+| Output video duration differs from the source's by more than 0.1 s plus one output frame interval (stream durations, not container durations) | −20 |
 | Frame count outside the expected range (after telecine/field-rate adjustment) | −30 |
 | Output of a re-encode larger than source (kept only with `--keep-larger`) | not eligible for retirement; a remux is exempt, since only the container changed and fragment headers can make a small file grow slightly (flag `remux-larger`, informational) |
 | Output stream count differs from the expected (a video, audio or text-subtitle stream of the source is missing) | −50 |
@@ -172,8 +172,8 @@ Every stage is a separate subcommand, idempotent, and resumable. State lives in 
 
 ```
 vidfunnel check
-vidfunnel plan   [--samples N] [--assume-dar R] [--reencode-video] PATH...
-vidfunnel convert [--par2 N] [--plain-mp4] [--jobs N] [--dry-run] PATH...
+vidfunnel plan   [--samples N] [--full-analysis] [--assume-dar R] [--audio-offset S] [--audio-strict-aac] [--reencode-video] [--max-level 4.1|4.2] [--plain-mp4] [--par2 N] [--replan] PATH...
+vidfunnel convert [--par2 N] [--jobs N] [--dry-run] [--keep-larger] PATH...
 vidfunnel verify PATH...
 vidfunnel report [--format md|json|csv] [--min-score N] [--reveal] [--with-logs] PATH...
 vidfunnel report --from REPORT [--reveal]
@@ -304,7 +304,7 @@ vidfunnel/
   bin/vidfunnel-setup-distrobox  creates/removes the Alpine distrobox and its tool wrappers (§8)
   tests/
     fixtures/       generated by tests/make_fixtures.sh, not committed
-    data/           the few small real files that cannot be synthesised (a `.fli`), committed; `.gitignore` excepts them
+    data/           reserved for the few small real files that cannot be synthesised (a `.fli`); `.gitignore` excepts them; empty so far
     test_*.py
   install.sh        wrapper around bin/vidfunnel --install-command
   Containerfile     Alpine + python3 + ffmpeg + par2 + ffsubsync, for hosts without Python (§8)
@@ -356,8 +356,8 @@ uCore / immutable hosts without Python (the `photos` server, Ryzen 5600, which i
 4. Denoise opt-in (`hqdn3d`) for VHS captures whose re-encode comes out larger than the source. Not in v1; the size guard covers the safety side.
 5. Resolved 2026-11-02: project name is repo `Video-Format-Funnel`, package, CLI and record directory `vidfunnel`.
 6. Partly resolved 2026-11-02: with `use_metadata_tags` the standard `title` still reads back through ffprobe next to the `vidfunnel` key (§9). Whether QuickTime Player and Jellyfin display `title` from an `mdta`-keyed file is still to be checked on a real player; if not, fall back to a `comment` tag with the same JSON payload.
-8. `--log FILE` (a redacted copy of the terminal output) is specified in §6.10 but not built; the CLI does not offer the option until it works. `--subsync` and `--embed-subs` (§4.4a) are likewise not built.
 7. Level 4.2 for field-rate deinterlaced HD (§4.3) is a judgement call made in this revision: it keeps the motion the field-rate rule exists for, at the cost of the single-level promise. `--max-level 4.1` is the escape hatch. Revisit if a target device turns out to reject 4.2.
+8. `--log FILE` (a redacted copy of the terminal output) is specified in §6.10 but not built; the CLI does not offer the option until it works. `--subsync` and `--embed-subs` (§4.4a) are likewise not built.
 
 ## 11. Conventions (the author's)
 
