@@ -88,6 +88,10 @@ class LauncherTests(unittest.TestCase):
     def test_launcher_follows_a_relative_symlink(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
+            # macOS keeps temp dirs under /var, a symlink to /private/var; the
+            # relative path must be computed from the resolved location or
+            # its '..' steps come out one short.
+            tmp = os.path.realpath(tmp)
             link = pathlib.Path(tmp) / "vidfunnel"
             link.symlink_to(os.path.relpath(LAUNCHER, tmp))
             result = subprocess.run([str(link), "--version"], capture_output=True, text=True, cwd="/")

@@ -29,7 +29,7 @@ from vidfunnel.ffmpeg import (
 )
 from vidfunnel.ffmpeg import _parse_bsfs, _parse_filters, _parse_table
 
-HOST_FFMPEG = "/usr/bin/ffmpeg"
+HOST_FFMPEG = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"  # Homebrew puts it under /opt/homebrew
 WRAPPER_FFMPEG = os.path.expanduser("~/.local/share/vidfunnel-tools/bin/ffmpeg")
 NO_HOST_FFMPEG = "'{}' is absent; integration test skipped".format(HOST_FFMPEG)
 NO_WRAPPER = "distrobox wrapper '{}' is absent; skipped".format(WRAPPER_FFMPEG)

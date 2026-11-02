@@ -767,7 +767,12 @@ class FixtureTests(unittest.TestCase):
         path = self.fixture("h264_mkv_aac_drift_long.mkv")
         durations = measure_durations(TOOLS, path, probe_file(TOOLS, path), quiet_progress())
         ratio = durations["audio"][0]["duration"] / durations["video"]["duration"]
-        self.assertAlmostEqual(ratio, 1.0125, delta=0.0005)
+        # The audio input is 5.1712 s. ffprobe 7 and 8 give the last AAC packet a full
+        # 1024-sample frame, so the measured audio is 5.184 s (ratio 1.0125); ffprobe 9
+        # reports the last packet's true length, 5.1712 s (ratio 1.0100). Both are drift
+        # of about 1 %, which decide_sync corrects with atempo.
+        distance = min(abs(ratio - 5.184 / 5.12), abs(ratio - 5.1712 / 5.12))
+        self.assertLessEqual(distance, 0.0005, ratio)
         self.assertAlmostEqual(durations["video"]["duration"], 5.12, places=3)
 
     def test_measure_offset(self):

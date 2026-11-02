@@ -1,6 +1,6 @@
 """Tests for vidfunnel.deps: platform detection, install hints, the table, and check end to end.
 
-The end-to-end test skips with a message when '/usr/bin/ffmpeg' is absent.
+The end-to-end tests skip with a message when no ffmpeg is on PATH.
 """
 
 VERSION = "20261102"
@@ -28,7 +28,7 @@ from vidfunnel.deps import (
     run,
 )
 
-HOST_FFMPEG = "/usr/bin/ffmpeg"
+HOST_FFMPEG = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"  # Homebrew puts it under /opt/homebrew
 NO_HOST_FFMPEG = "'{}' is absent; integration test skipped".format(HOST_FFMPEG)
 
 TUMBLEWEED = {"os": "linux", "id": "opensuse-tumbleweed", "like": ["opensuse", "suse"], "pretty": "openSUSE Tumbleweed"}
