@@ -32,7 +32,7 @@ CheckResult = namedtuple("CheckResult", "items ok platform tools")
 
 MINIMUM_FFMPEG_MAJOR = 6
 REQUIRED_ENCODERS = ("libx264", "aac")
-REQUIRED_FILTERS = ("idet", "bwdif", "fieldmatch", "cropdetect")
+REQUIRED_FILTERS = ("idet", "bwdif", "fieldmatch", "cropdetect", "setparams")
 REQUIRED_BSFS = ("h264_metadata",)
 OPTIONAL_PROGRAMS = ("par2", "mediainfo", "ffsubsync", "alass")
 FFMPEG_ITEM_NAMES = ("ffmpeg", "ffprobe") + REQUIRED_ENCODERS + REQUIRED_FILTERS + REQUIRED_BSFS

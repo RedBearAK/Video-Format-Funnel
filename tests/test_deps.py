@@ -204,7 +204,8 @@ class HostCheckTests(unittest.TestCase):
         required = {item.name for item in result.items if item.required}
         self.assertEqual(
             required,
-            {"ffmpeg", "ffprobe", "libx264", "aac", "idet", "bwdif", "fieldmatch", "cropdetect", "h264_metadata"},
+            {"ffmpeg", "ffprobe", "libx264", "aac", "idet", "bwdif", "fieldmatch", "cropdetect", "setparams",
+             "h264_metadata"},
         )
         self.assertTrue(result.ok, format_check(result))
         self.assertEqual(result.tools.ffmpeg, HOST_FFMPEG)
