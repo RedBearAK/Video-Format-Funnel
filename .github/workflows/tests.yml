@@ -1,0 +1,47 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  tests-ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg and par2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg par2
+      - name: Make fixtures
+        run: |
+          if [ -f tests/make_fixtures.sh ]; then sh tests/make_fixtures.sh; else echo "tests/make_fixtures.sh not present, skipping"; fi
+      - name: Run tests
+        run: python3 -m unittest discover -s tests -v
+
+  tests-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg and par2
+        run: brew install ffmpeg par2
+      - name: Make fixtures
+        run: |
+          if [ -f tests/make_fixtures.sh ]; then sh tests/make_fixtures.sh; else echo "tests/make_fixtures.sh not present, skipping"; fi
+      - name: Run tests
+        run: python3 -m unittest discover -s tests -v
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: podman build -t vidfunnel:ci -f Containerfile .
+      - name: Run --version
+        run: podman run --rm vidfunnel:ci --version
+      - name: Run the tests inside the container
+        run: podman run --rm --entrypoint sh -v "$PWD:/src" -w /src vidfunnel:ci -c "python3 -m unittest discover -s tests -v"
+
+# End of File #

@@ -1,0 +1,199 @@
+#!/bin/sh
+# vidfunnel-podman: run vidfunnel inside its container image. Every argument that
+# is an existing path on the host is bind-mounted read-write at the same absolute
+# path inside the container, as is the current directory (the container's working
+# directory), and the container runs as the invoking uid/gid. See HANDOFF.md section 8.
+
+VERSION="20261102"
+
+set -eu
+
+VIDFUNNEL_IMAGE_DIGEST=""
+
+IMAGE="${VIDFUNNEL_IMAGE:-localhost/vidfunnel:latest}"
+BUILD=0
+
+usage() {
+    cat <<EOF2
+Usage: vidfunnel-podman [wrapper options] [vidfunnel arguments]
+
+Runs vidfunnel in its container image with podman (or docker, if podman is not
+installed). Wrapper options are recognised only before the first other argument;
+everything from there on goes to vidfunnel unchanged.
+
+Wrapper options:
+  --image IMAGE      image to run (default: ${IMAGE}; environment: VIDFUNNEL_IMAGE)
+  --build            build the image from the Containerfile next to this script's
+                     repo, tag it as the image above, then run (or just build, when
+                     no vidfunnel arguments follow)
+  --wrapper-version  print the wrapper version
+  -h, --help         this text
+
+What the wrapper does:
+  Every vidfunnel argument that is an existing file or folder on the host is
+  resolved to an absolute path and bind-mounted read-write at the same path inside
+  the container. The current directory is mounted too and used as the working
+  directory. A path inside another mounted folder is not mounted separately.
+  The container runs with --rm, --userns=keep-id (podman) or --user uid:gid
+  (docker) so files are owned by you, and --security-opt label=disable for SELinux
+  hosts. It gets a terminal (-it) only when stdin is one.
+
+Environment:
+  VIDFUNNEL_IMAGE          image name, overridden by --image
+  VIDFUNNEL_NICE           if set, run the container command under nice -n VALUE
+  VIDFUNNEL_IONICE_CLASS   if set and ionice exists, run under ionice -c VALUE
+
+Pinning: the variable VIDFUNNEL_IMAGE_DIGEST near the top of this script is empty
+by default. When it holds a digest (sha256:...), the wrapper runs IMAGE@DIGEST, so
+the image changes only when the digest is edited on purpose.
+EOF2
+}
+
+say() { printf '%s\n' "$*"; }
+die() { printf 'vidfunnel-podman: %s\n' "$*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --image) [ $# -ge 2 ] || die "--image needs a value"; IMAGE="$2"; shift 2 ;;
+        --build) BUILD=1; shift ;;
+        --wrapper-version) say "vidfunnel-podman ${VERSION}"; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
+        *) break ;;
+    esac
+done
+
+self="$0"
+while [ -L "$self" ]; do
+    target=$(readlink "$self")
+    case "$target" in
+        /*) self="$target" ;;
+        *) self="$(dirname "$self")/$target" ;;
+    esac
+done
+bindir=$(cd "$(dirname "$self")" && pwd -P)
+root=$(dirname "$bindir")
+
+install_hint() {
+    if [ "$(uname -s)" = "Darwin" ]; then
+        say "  brew install podman"
+        return
+    fi
+    id=""
+    [ -r /etc/os-release ] && id=$(. /etc/os-release && echo "${ID:-} ${ID_LIKE:-}")
+    case " $id " in
+        *" opensuse"*|*" suse "*) say "  sudo zypper install podman" ;;
+        *" fedora "*|*" rhel "*) say "  sudo dnf install podman" ;;
+        *" debian "*|*" ubuntu "*) say "  sudo apt install podman" ;;
+        *" arch "*) say "  sudo pacman -S podman" ;;
+        *" alpine "*) say "  sudo apk add podman" ;;
+        *) say "  install podman with your package manager" ;;
+    esac
+}
+
+if command -v podman >/dev/null 2>&1; then
+    ENGINE="podman"
+elif command -v docker >/dev/null 2>&1; then
+    ENGINE="docker"
+    say "vidfunnel-podman: podman was not found, using 'docker' instead" >&2
+else
+    {
+        say "vidfunnel-podman: neither podman nor docker was found on PATH. Install podman with:"
+        install_hint
+    } >&2
+    exit 1
+fi
+
+if [ "${BUILD}" -eq 1 ]; then
+    [ -f "${root}/Containerfile" ] || die "no Containerfile in '${root}'"
+    say "Building image '${IMAGE}' from '${root}/Containerfile' with ${ENGINE}"
+    "${ENGINE}" build -t "${IMAGE}" -f "${root}/Containerfile" "${root}"
+    if [ $# -eq 0 ]; then
+        say "Built '${IMAGE}'"
+        exit 0
+    fi
+fi
+
+RUN_IMAGE="${IMAGE}"
+[ -n "${VIDFUNNEL_IMAGE_DIGEST}" ] && RUN_IMAGE="${IMAGE}@${VIDFUNNEL_IMAGE_DIGEST}"
+
+abs_path() {
+    p="$1"
+    if [ -d "$p" ]; then
+        (cd "$p" && pwd)
+    else
+        d=$(dirname "$p")
+        b=$(basename "$p")
+        d=$(cd "$d" && pwd)
+        if [ "$d" = "/" ]; then printf '/%s\n' "$b"; else printf '%s/%s\n' "$d" "$b"; fi
+    fi
+}
+
+MOUNTS=""
+
+add_mount() {
+    new="$1"
+    kept=""
+    old_list="${MOUNTS}"
+    MOUNTS=""
+    oldifs="$IFS"
+    IFS='
+'
+    for m in ${old_list}; do
+        case "${new}/" in "${m}/"*) MOUNTS="${old_list}"; IFS="$oldifs"; return 0 ;; esac
+    done
+    for m in ${old_list}; do
+        case "${m}/" in "${new}/"*) ;; *) kept="${kept}${m}
+" ;; esac
+    done
+    IFS="$oldifs"
+    MOUNTS="${kept}${new}
+"
+}
+
+CWD=$(pwd)
+add_mount "${CWD}"
+
+count=$#
+i=0
+while [ "${i}" -lt "${count}" ]; do
+    arg="$1"
+    shift
+    if [ -e "${arg}" ]; then
+        add_mount "$(abs_path "${arg}")"
+    fi
+    set -- "$@" "${arg}"
+    i=$((i + 1))
+done
+
+set -- "${RUN_IMAGE}" "$@"
+
+oldifs="$IFS"
+IFS='
+'
+for m in ${MOUNTS}; do
+    set -- -v "${m}:${m}" "$@"
+done
+IFS="$oldifs"
+
+set -- --workdir "${CWD}" "$@"
+set -- --security-opt label=disable "$@"
+if [ "${ENGINE}" = "podman" ]; then
+    set -- --userns=keep-id "$@"
+else
+    set -- --user "$(id -u):$(id -g)" "$@"
+fi
+if [ -t 0 ]; then
+    set -- -it "$@"
+fi
+set -- "${ENGINE}" run --rm "$@"
+
+if [ -n "${VIDFUNNEL_IONICE_CLASS:-}" ] && command -v ionice >/dev/null 2>&1; then
+    set -- ionice -c "${VIDFUNNEL_IONICE_CLASS}" "$@"
+fi
+if [ -n "${VIDFUNNEL_NICE:-}" ]; then
+    set -- nice -n "${VIDFUNNEL_NICE}" "$@"
+fi
+
+exec "$@"
+
+# End of File #
