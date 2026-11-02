@@ -27,7 +27,7 @@ Disk space is secondary to compatibility. AV1 and HEVC are not goals; H.264 is t
 | Resolution | source | Never scale, except the pixel-art rule in §4.7 |
 | Frame rate | source; VFR sources stay VFR | No padding to CFR |
 | Aspect | signalled as SAR in both the H.264 VUI and the container, never resampled. Re-encode: `setsar` filter (x264 writes it into the VUI) plus `-aspect` for the container. Remux: `-bsf:v h264_metadata=sample_aspect_ratio=W/H` rewrites the VUI losslessly, plus `-aspect` for the container. `-aspect` alone only changes the container and is not enough on a remux | Reversible, zero cost |
-| Colour tags | `-color_range tv` plus `smpte170m` (NTSC SD), `bt470bg` (PAL SD), `bt709` (HD) for colorspace/primaries/trc; on a remux the same values go through `h264_metadata` (`colour_primaries`, `transfer_characteristics`, `matrix_coefficients`, `video_full_range_flag`), which only sets the fields it is given | Old sources are unflagged; players guess from frame size |
+| Colour tags | `-color_range tv` plus `smpte170m` (NTSC SD), `bt470bg` (PAL SD), `bt709` (HD) for colorspace/primaries; the trc is `smpte170m`, `bt709` and `bt709` respectively (the PAL transfer curve has no `bt470bg` name in ffmpeg, only `gamma28`, and players treat it as bt709 anyway); on a re-encode the tags go through `setparams` in the filter chain, because ffmpeg 7.1 drops the `-color_primaries`/`-color_trc` output options (tested); on a remux the same values go through `h264_metadata` (`colour_primaries`, `transfer_characteristics`, `matrix_coefficients`, `video_full_range_flag`), which only sets the fields it is given | Old sources are unflagged; players guess from frame size |
 | Tune | none; `-tune animation` for cel/pixel content only | |
 
 Deinterlacing and telecine handling: §4.3.
@@ -268,7 +268,7 @@ Standing rule: nothing the tool does that may take more than one second of wall-
 - Before any operation that may take a second or more, print one line saying what is about to happen and to which file (`[plan 12/340] probing C_____ N___.avi`), redacted the same way as reports when the terminal output is being captured with `--log FILE`, revealed on the terminal.
 - Long operations show live progress. ffmpeg is run with `-nostats -progress pipe:1`, which emits `out_time`, `frame`, `fps` and `speed` every half second; these render as one updating line: `[re-encode] 00:12:34 / 01:32:10  13.6 %  212 fps  8.1x  eta 00:09:48`. Hashing and copying report bytes and MB/s the same way. Sampled analysis shows the window counter (`idet window 7/12`). Operations with no measurable length show an elapsed-time counter, not a spinner.
 - On a TTY the line updates in place (`\r`, no ANSI beyond that, `NO_COLOR` respected, plain ASCII). When stdout is not a TTY (log file, CI, `--jobs` with interleaved output) the same information is written as a new line at most every 30 seconds, so logs stay readable and nothing is lost.
-- `--quiet` keeps per-file start lines and errors only; `--verbose` adds the ffmpeg argv before each run. There is no mode that is silent while working.
+- `--quiet` keeps per-file start lines and errors only; `--verbose` adds the ffmpeg argv before each run. There is no mode that is silent while working. The `--log FILE` option described above is not implemented in the first build (open question 8).
 - Each stage ends with a one-line summary: counts per outcome, total time, and where the records went.
 - Implementation in one module, `progress.py`, used by every other stage; no third-party packages.
 
@@ -356,6 +356,7 @@ uCore / immutable hosts without Python (the `photos` server, Ryzen 5600, which i
 4. Denoise opt-in (`hqdn3d`) for VHS captures whose re-encode comes out larger than the source. Not in v1; the size guard covers the safety side.
 5. Resolved 2026-11-02: project name is repo `Video-Format-Funnel`, package, CLI and record directory `vidfunnel`.
 6. Partly resolved 2026-11-02: with `use_metadata_tags` the standard `title` still reads back through ffprobe next to the `vidfunnel` key (§9). Whether QuickTime Player and Jellyfin display `title` from an `mdta`-keyed file is still to be checked on a real player; if not, fall back to a `comment` tag with the same JSON payload.
+8. `--log FILE` (a redacted copy of the terminal output) is specified in §6.10 but not built; the CLI does not offer the option until it works. `--subsync` and `--embed-subs` (§4.4a) are likewise not built.
 7. Level 4.2 for field-rate deinterlaced HD (§4.3) is a judgement call made in this revision: it keeps the motion the field-rate rule exists for, at the cost of the single-level promise. `--max-level 4.1` is the escape hatch. Revisit if a target device turns out to reject 4.2.
 
 ## 11. Conventions (the author's)

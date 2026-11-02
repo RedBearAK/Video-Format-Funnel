@@ -19,8 +19,9 @@ else output.name, and checked:
 - the video durations of source and output (source: analyze's packet
   measurement, else the probed stream, else the container; output: the
   video stream): more than 0.1 s plus one output frame apart costs 20 points;
-- the stream counts against expected_streams() (no points in HANDOFF 5; a
-  mismatch is flagged 'stream-count-mismatch' so the report shows it);
+- the stream counts against expected_streams(): a missing video, audio or
+  text-subtitle stream costs 50 points (HANDOFF 5) and is flagged
+  'stream-count-mismatch' so the report shows it;
 - with --ssim-check, sampled SSIM on luma against the source put through the
   same video filters as the encode (below the threshold costs 25 points);
 - the output's SHA-256, size and cheap fingerprint, and its size relative to

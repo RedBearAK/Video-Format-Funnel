@@ -98,12 +98,6 @@ def add_global_arguments(parser):
         help="also print the ffmpeg command line before each run",
     )
     parser.add_argument(
-        "--log",
-        metavar="FILE",
-        default=None,
-        help="append a redacted copy of the terminal output to FILE",
-    )
-    parser.add_argument(
         "--yes",
         action="store_true",
         help="answer yes to confirmation prompts (scripted use)",

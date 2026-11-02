@@ -5,9 +5,9 @@ output. Names, paths, metadata and log text are redacted by default through
 vidfunnel.redact.Redactor; --reveal turns that off. Record IDs are always shown,
 so any row can be resolved locally with 'vidfunnel find ID'.
 
-Sort order (HANDOFF section 5, "worst at the top"): rows without a score come
-first (planned, failed or quarantined records that verify never scored), then
-scores ascending, then status in the order of record.STATUSES, then path, then ID.
+Sort order (HANDOFF section 5, "worst at the top"): scored rows first, score
+ascending, then the rows without a score (planned or failed records that verify
+never scored), then status in the order of record.STATUSES, then path, then ID.
 
 Every report starts with a header: report ID, generation time, tool version,
 the invocation, the redaction state and a hint line. Markdown carries the
