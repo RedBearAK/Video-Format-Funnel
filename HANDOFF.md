@@ -90,7 +90,7 @@ All analysis is sampled, not full-length, and every result is recorded with the 
 
 ### 4.1 Decode check
 
-`ffmpeg -v warning -i SRC -f null -` on the full file (this one is not sampled), stderr captured. Every distinct message class (the message with stream/frame numbers and timestamps normalised away) is recorded with its count. No `-xerror`: it aborts on the first hard error, which would hide every later class, and it does not fire at all on the concealed macroblock errors that make up most decode damage (tested: identical output with and without it on a file with three damaged regions). Streams ffmpeg cannot decode put the file in quarantine with reason `unsupported`, never in the conversion queue.
+`ffmpeg -v warning -i SRC -map 0:v? -map 0:a? -f null -` on the full file (this one is not sampled), stderr captured. The explicit maps decode every video and audio stream; without them ffmpeg decodes only one of each and damage in a second audio track goes unseen. Every distinct message class (the message with stream/frame numbers and timestamps normalised away) is recorded with its count. No `-xerror`: it aborts on the first hard error, which would hide every later class, and it does not fire at all on the concealed macroblock errors that make up most decode damage (tested: identical output with and without it on a file with three damaged regions). Streams ffmpeg cannot decode put the file in quarantine with reason `unsupported`, never in the conversion queue.
 
 ### 4.2 Aspect ratio
 

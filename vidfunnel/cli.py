@@ -17,6 +17,7 @@ import vidfunnel
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
+EXIT_DEPS = 3  # a required external tool is missing (see vidfunnel.deps)
 
 # (name, one-line help), in the order HANDOFF.md section 6 lists them.
 SUBCOMMANDS = (
