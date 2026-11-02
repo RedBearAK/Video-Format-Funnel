@@ -158,7 +158,9 @@ Each converted file gets a score from 100 minus the penalties above, plus post-c
 | Any decoder warning during the probe pass | −10 per class |
 | Output duration differs from source by > 0.1 s | −20 |
 | Frame count outside the expected range (after telecine/field-rate adjustment) | −30 |
-| Output larger than source (kept only with `--keep-larger`) | not eligible for retirement |
+| Output of a re-encode larger than source (kept only with `--keep-larger`) | not eligible for retirement; a remux is exempt, since only the container changed and fragment headers can make a small file grow slightly (flag `remux-larger`, informational) |
+| Output stream count differs from the expected (a video, audio or text-subtitle stream of the source is missing) | −50 |
+| Identity tag missing or naming another record or source | −100 |
 | Optional sampled SSIM against source below threshold (`--ssim-check`, default off, threshold 0.97 on luma) | −25 |
 | Quarantined for any reason | 0 |
 

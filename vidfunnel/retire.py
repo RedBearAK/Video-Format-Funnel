@@ -191,7 +191,7 @@ def check_eligible(source, record, allow_review=False, progress=None, quiet=Fals
         raise RetireRefused("output-larger",
                             "the output was kept although larger than the source (--keep-larger); "
                             "such a conversion is not eligible for retirement")
-    if actual_size > current["size"]:
+    if record.get("action") == "reencode" and actual_size > current["size"]:
         raise RetireRefused("output-larger", "output '{}' ({}) is larger than the source ({})".format(
             output_path.name, format_bytes(actual_size), format_bytes(current["size"])))
 

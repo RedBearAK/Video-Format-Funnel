@@ -214,7 +214,17 @@ class GuardTests(RetireCase):
         write_bytes(self.beach_output, bigger)
         self.beach_record["output"]["sha256"] = sha256_file(self.beach_output)
         self.beach_record["output"]["size"] = len(bigger)
+        self.beach_record["action"] = "reencode"
         self.assert_refused("output-larger", self.beach_source, self.beach_record)
+
+    def test_remux_larger_than_source_is_eligible(self):
+        bigger = SOURCE_BYTES + b"more"
+        write_bytes(self.beach_output, bigger)
+        self.beach_record["output"]["sha256"] = sha256_file(self.beach_output)
+        self.beach_record["output"]["size"] = len(bigger)
+        self.beach_record["action"] = "remux"
+        result = check_eligible(self.beach_source, self.beach_record)
+        self.assertEqual(result["band"], "ok")
 
     def test_interim_rename_blocked(self):
         footage_source = self.meetings / "client_footage.m4v"
