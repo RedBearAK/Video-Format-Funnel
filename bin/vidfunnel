@@ -1,0 +1,49 @@
+#!/bin/sh
+# vidfunnel launcher: finds its own real location (through symlinks), checks for a
+# python3 of 3.9 or newer, and runs the package. This is the only place that sets
+# PYTHONPATH; the package never edits sys.path. See HANDOFF.md section 6.9.
+
+VERSION="20261102"
+
+self="$0"
+while [ -L "$self" ]; do
+    target=$(readlink "$self")
+    case "$target" in
+        /*) self="$target" ;;
+        *) self="$(dirname "$self")/$target" ;;
+    esac
+done
+bindir=$(cd "$(dirname "$self")" && pwd -P)
+root=$(dirname "$bindir")
+
+python_hint() {
+    if [ "$(uname -s)" = "Darwin" ]; then
+        echo "  brew install python"
+        return
+    fi
+    id=""
+    [ -r /etc/os-release ] && id=$(. /etc/os-release && echo "${ID:-} ${ID_LIKE:-}")
+    case " $id " in
+        *" opensuse"*|*" suse "*) echo "  sudo zypper install python3" ;;
+        *" fedora "*|*" rhel "*) echo "  sudo dnf install python3" ;;
+        *" debian "*|*" ubuntu "*) echo "  sudo apt install python3" ;;
+        *" arch "*) echo "  sudo pacman -S python" ;;
+        *) echo "  install Python 3.9 or newer with your package manager" ;;
+    esac
+}
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "vidfunnel: python3 was not found on PATH. Install it with:" >&2
+    python_hint >&2
+    exit 1
+fi
+
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
+    echo "vidfunnel: $(python3 --version 2>&1) is too old; 3.9 or newer is needed. Install it with:" >&2
+    python_hint >&2
+    exit 1
+fi
+
+exec env PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" python3 -m vidfunnel "$@"
+
+# End of File #
