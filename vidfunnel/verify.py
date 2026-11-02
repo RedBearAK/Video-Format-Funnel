@@ -24,8 +24,17 @@ else output.name, and checked:
   'stream-count-mismatch' so the report shows it;
 - with --ssim-check, sampled SSIM on luma against the source put through the
   same video filters as the encode (below the threshold costs 25 points);
-- the output's SHA-256, size and cheap fingerprint, and its size relative to
-  the source (an output larger than the source is noted; retire refuses it).
+- the output's SHA-256, size and cheap fingerprint, taken before the checks
+  above read the file, and its size relative to the source (an output larger
+  than the source is noted; retire refuses it). The cheap fingerprint is taken
+  again after the last check; when it differs the stage records
+  'output_changed_during_verify': true, the record is 'failed' and carries no
+  score, since the hash and the checks may describe different bytes.
+
+`run` collects the records first and then, inside each folder's lock, reads
+each record again from disk and verifies that copy; a record whose status is
+no longer 'converted' or 'verified' (a retire finished in between) or that is
+gone is skipped, so verify never overwrites a later stage.
 
 The score is 100 minus the penalties the record carried before any verify
 (the analysis, and plan's own VOB/DVD penalties) minus this run's
@@ -34,8 +43,8 @@ post-conversion penalties, floored at 0. Penalties added by verify are marked
 instead of adding to them; the previous stages.verify is archived in
 stages.verify_history. Status 'verified' when the checks ran, penalties or not
 (the band of the score says what it means); 'failed' when the output is
-missing, cannot be probed, or does not decode at all (non-zero exit and no
-decoded frame).
+missing, cannot be probed, does not decode at all (non-zero exit and no
+decoded frame), or changed while it was verified.
 """
 
 VERSION = "20261102"
@@ -62,7 +71,9 @@ from vidfunnel.record import (
     add_stage,
     band,
     cheap_fingerprint,
+    fingerprint_matches,
     iter_records,
+    load_record,
     save_record,
     set_status,
     sha256_file,
@@ -543,7 +554,17 @@ def verify_record(tools, source, record, options, progress=None):
         say("  verify failed: output '{}' is missing".format(stage["output_name"]), stream)
         return record
 
-    say("verifying '{}' ({})".format(output_path.name, format_bytes(output_path.stat().st_size)), stream)
+    # Fingerprint and hash first, so the SHA-256 stored is of the bytes the checks below read; the
+    # fingerprint is taken again after the last check and a difference fails the record.
+    fingerprint = cheap_fingerprint(output_path)
+    size = fingerprint["size"]
+    say("verifying '{}' ({})".format(output_path.name, format_bytes(size)), stream)
+    if size > HASH_PROGRESS_BYTES:
+        say("  hashing '{}' ({})".format(output_path.name, format_bytes(size)), stream)
+        with Progress("sha256", total=size, unit="B", stream=stream, quiet=quiet) as live:
+            digest = sha256_file(output_path, progress=live)
+    else:
+        digest = sha256_file(output_path)
     try:
         probe = probe_file(tools, output_path)
     except FfmpegError as error:
@@ -601,13 +622,18 @@ def verify_record(tools, source, record, options, progress=None):
     else:
         stage["ssim"] = {"requested": False, "value": None, "threshold": threshold, "windows": [], "ok": None}
 
-    size = output_path.stat().st_size
-    if size > HASH_PROGRESS_BYTES:
-        say("  hashing '{}' ({})".format(output_path.name, format_bytes(size)), stream)
-        with Progress("sha256", total=size, unit="B", stream=stream, quiet=quiet) as live:
-            digest = sha256_file(output_path, progress=live)
-    else:
-        digest = sha256_file(output_path)
+    try:
+        after = cheap_fingerprint(output_path)
+    except OSError as error:
+        after = None
+        say("  cannot fingerprint '{}' again: {}".format(output_path.name, error), stream)
+    if not fingerprint_matches(fingerprint, after):
+        stage["output_changed_during_verify"] = True
+        stage["fingerprint_before"] = fingerprint
+        stage["fingerprint_after"] = after
+        record.pop("score", None)
+        return _fail(record, key, stage, "output '{}' changed while it was being verified; "
+                     "its checks and hash do not describe one file".format(output_path.name), stream)
     convert = _stages(record).get("convert") or {}
     source_size = convert.get("source_size") or (record.get("source") or {}).get("size")
     stage["size"] = {"output": size, "source": source_size,
@@ -615,7 +641,7 @@ def verify_record(tools, source, record, options, progress=None):
                      "larger": bool(source_size) and size > source_size}
 
     output = record.setdefault("output", {})
-    output.update(sha256=digest, size=size, fingerprint=cheap_fingerprint(output_path))
+    output.update(sha256=digest, size=size, fingerprint=fingerprint)
 
     checks = {"decode": decode, "duration": stage["duration"], "frames": frames, "ssim": stage["ssim"],
               "identity": identity, "streams": stage["streams"]}
@@ -735,8 +761,23 @@ def run(args):
             continue
         try:
             with FolderLock(folder, warn=lambda message: say(message, stream)):
-                for record in wanted:
-                    key = record_key(folder, record)
+                for collected in wanted:
+                    key = record_key(folder, collected)
+                    # Read again under the lock: a retire or convert that finished since the
+                    # collection above has changed the record on disk, and verifying the stale
+                    # copy would overwrite that change.
+                    try:
+                        record = load_record(key)
+                    except RecordError as error:
+                        say("failed: '{}': {}".format(key.name, error), stream)
+                        summary.add("failed")
+                        continue
+                    if record is None or record.get("status") not in VERIFIABLE_STATUSES:
+                        say("skipping '{}': its record {} since it was listed".format(
+                            key.name, "is gone" if record is None
+                            else "now has status '{}'".format(record.get("status"))), stream)
+                        summary.add("skipped")
+                        continue
                     try:
                         result = verify_record(tools, key, record, args, progress=args)
                     except (OSError, RecordError, FfmpegError) as error:

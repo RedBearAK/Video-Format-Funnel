@@ -22,6 +22,7 @@ import shutil
 import tempfile
 import types
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from vidfunnel.analyze import decide_subtitles
@@ -441,6 +442,65 @@ class VerifyAgainTest(unittest.TestCase):
         self.assertEqual(record["status"], "failed")
         self.assertEqual(record["stages"]["verify"]["error"], "output missing")
         self.assertEqual(load_record(self.key)["status"], "failed")
+
+    def test_output_changed_during_verify(self):
+        # The seam: probe_file appends bytes to the output before probing it, standing in for another
+        # process writing the file after verify hashed it.
+        import vidfunnel.verify as verify_module
+        real_probe = verify_module.probe_file
+
+        def probe_after_append(tools, path):
+            with open(str(path), "ab") as handle:
+                handle.write(b"\x00" * 4096)
+            return real_probe(tools, path)
+
+        with unittest.mock.patch.object(verify_module, "probe_file", probe_after_append):
+            record = verify_record(TOOLS, self.key, load_record(self.key), None, quiet())
+        stage = record["stages"]["verify"]
+        self.assertEqual(record["status"], "failed")
+        self.assertIs(stage["output_changed_during_verify"], True)
+        self.assertIn(self.output.name, stage["error"])
+        self.assertNotIn("score", record)
+        on_disk = load_record(self.key)
+        self.assertEqual(on_disk["status"], "failed")
+        self.assertNotIn("score", on_disk)
+        self.assertIs(on_disk["stages"]["verify"]["output_changed_during_verify"], True)
+
+    def test_unchanged_output_hash_matches_file(self):
+        record = verify_record(TOOLS, self.key, load_record(self.key), None, quiet())
+        self.assertEqual(record["status"], "verified")
+        self.assertNotIn("output_changed_during_verify", record["stages"]["verify"])
+        with open(str(self.output), "rb") as handle:
+            self.assertEqual(load_record(self.key)["output"]["sha256"], hashlib.sha256(handle.read()).hexdigest())
+
+    def test_run_does_not_overwrite_a_record_retired_after_collection(self):
+        # The seam: FolderLock is wrapped so that, after run() has collected the records and before it
+        # takes the folder's lock, the record on disk becomes 'retired' as a retire would leave it.
+        import vidfunnel.verify as verify_module
+        from vidfunnel.cli import EXIT_OK
+        from vidfunnel.record import FolderLock, add_stage
+        key = self.key
+
+        class RetireFirst(FolderLock):
+            def __enter__(self):
+                record = load_record(key)
+                add_stage(record, "retire", {"final_name": "retired-elsewhere.mp4"})
+                set_status(record, "retired")
+                save_record(key, record)
+                return super().__enter__()
+
+        args = argparse.Namespace(paths=[str(self.root)], ffmpeg=None, quiet=True, verbose=False, log=None,
+                                  yes=False, ssim_check=False, ssim_threshold=0.97, samples=None,
+                                  stream=io.StringIO())
+        with unittest.mock.patch.object(verify_module, "FolderLock", RetireFirst):
+            self.assertEqual(run(args), EXIT_OK)
+        on_disk = load_record(key)
+        self.assertEqual(on_disk["status"], "retired")
+        self.assertEqual(on_disk["stages"]["retire"]["final_name"], "retired-elsewhere.mp4")
+        self.assertNotIn("verify_history", on_disk["stages"])
+        self.assertEqual(on_disk["score"], 100)
+        self.assertIn("now has status 'retired'", args.stream.getvalue())
+        self.assertIn("1 skipped", args.stream.getvalue())
 
 
 if __name__ == "__main__":
