@@ -1,0 +1,299 @@
+{
+  "aspect": {
+    "crop": null,
+    "crop_windows": null,
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "320x240 is not a non-square frame size; SAR unknown means square pixels",
+    "result": {
+      "candidate": null,
+      "dar": "4:3",
+      "sar": "1:1",
+      "source": "square"
+    },
+    "samples": []
+  },
+  "audio": [
+    {
+      "flags": [],
+      "penalties": [],
+      "penalty": 0,
+      "reason": "MP3 copied",
+      "result": {
+        "action": "copy",
+        "bitrate": null,
+        "channel_layout": "stereo",
+        "channels": 2,
+        "filters": null,
+        "index": 0,
+        "language": null,
+        "sample_rate": 44100
+      },
+      "samples": []
+    }
+  ],
+  "cadence": {
+    "flags": [],
+    "idet": {
+      "determined_frames": 76,
+      "kind": "progressive",
+      "order": null,
+      "reason": "1 window(s): 1 progressive",
+      "totals": {
+        "bff": 0,
+        "progressive": 76,
+        "repeated_bottom": 0,
+        "repeated_neither": 125,
+        "repeated_top": 0,
+        "single_bff": 0,
+        "single_progressive": 1,
+        "single_tff": 0,
+        "single_undetermined": 124,
+        "tff": 0,
+        "undetermined": 49
+      },
+      "windows": [
+        {
+          "counters": {
+            "bff": 0,
+            "progressive": 76,
+            "repeated_bottom": 0,
+            "repeated_neither": 125,
+            "repeated_top": 0,
+            "single_bff": 0,
+            "single_progressive": 1,
+            "single_tff": 0,
+            "single_undetermined": 124,
+            "tff": 0,
+            "undetermined": 49
+          },
+          "kind": "progressive",
+          "order": null
+        }
+      ]
+    },
+    "penalties": [],
+    "penalty": 0,
+    "reason": "idet: 1 window(s): 1 progressive",
+    "result": {
+      "filter": null,
+      "fps_multiplier": 1.0,
+      "kind": "progressive",
+      "level": "4.1",
+      "order": null,
+      "output_fps": "25/1"
+    },
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "colour": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "untagged; SD PAL family (240 lines, 25 fps) -> bt470bg/bt470bg/bt709",
+    "result": {
+      "primaries": "bt470bg",
+      "range": "tv",
+      "source": "inferred",
+      "space": "bt470bg",
+      "trc": "bt709"
+    },
+    "samples": []
+  },
+  "decode": {
+    "flags": [
+      "decode-warnings"
+    ],
+    "penalties": [
+      {
+        "code": "decode-warnings",
+        "points": 10,
+        "reason": "decoder message x1: [aist##:#/mp3] [dec:mp3float] Error submitting packet to decoder: Invalid data found when processing input"
+      },
+      {
+        "code": "decode-warnings",
+        "points": 10,
+        "reason": "decoder message x2: [flv] Error at MB: #"
+      },
+      {
+        "code": "decode-warnings",
+        "points": 10,
+        "reason": "decoder message x1: [flv] run overflow at #x0 i:#"
+      },
+      {
+        "code": "decode-warnings",
+        "points": 10,
+        "reason": "decoder message x1: [flv] run overflow at #x11 i:#"
+      },
+      {
+        "code": "decode-warnings",
+        "points": 10,
+        "reason": "decoder message x1: [mp3float] Error while decoding MPEG audio frame."
+      },
+      {
+        "code": "decode-warnings",
+        "points": 10,
+        "reason": "decoder message x1: [mp3float] big_values too big"
+      },
+      {
+        "code": "decode-warnings",
+        "points": 10,
+        "reason": "decoder message x2: [vist##:#/flv1] [dec:flv] corrupt decoded frame"
+      }
+    ],
+    "penalty": 70,
+    "reason": "7 decoder message class(es), 9 message(s) in all",
+    "result": {
+      "classes": {
+        "[aist##:#/mp3] [dec:mp3float] Error submitting packet to decoder: Invalid data found when processing input": 1,
+        "[flv] Error at MB: #": 2,
+        "[flv] run overflow at #x0 i:#": 1,
+        "[flv] run overflow at #x11 i:#": 1,
+        "[mp3float] Error while decoding MPEG audio frame.": 1,
+        "[mp3float] big_values too big": 1,
+        "[vist##:#/flv1] [dec:flv] corrupt decoded frame": 2
+      },
+      "ignored": {},
+      "returncode": 0
+    },
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "flags": [
+    "decode-warnings"
+  ],
+  "keyframes": null,
+  "penalties": [
+    {
+      "code": "decode-warnings",
+      "points": 10,
+      "reason": "decoder message x1: [aist##:#/mp3] [dec:mp3float] Error submitting packet to decoder: Invalid data found when processing input"
+    },
+    {
+      "code": "decode-warnings",
+      "points": 10,
+      "reason": "decoder message x2: [flv] Error at MB: #"
+    },
+    {
+      "code": "decode-warnings",
+      "points": 10,
+      "reason": "decoder message x1: [flv] run overflow at #x0 i:#"
+    },
+    {
+      "code": "decode-warnings",
+      "points": 10,
+      "reason": "decoder message x1: [flv] run overflow at #x11 i:#"
+    },
+    {
+      "code": "decode-warnings",
+      "points": 10,
+      "reason": "decoder message x1: [mp3float] Error while decoding MPEG audio frame."
+    },
+    {
+      "code": "decode-warnings",
+      "points": 10,
+      "reason": "decoder message x1: [mp3float] big_values too big"
+    },
+    {
+      "code": "decode-warnings",
+      "points": 10,
+      "reason": "decoder message x2: [vist##:#/flv1] [dec:flv] corrupt decoded frame"
+    }
+  ],
+  "pixelart": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "codec 'flv1' (yuv420p) is not palette/RLE class",
+    "result": {
+      "factor": 1,
+      "filter": null,
+      "tune": null
+    },
+    "samples": []
+  },
+  "predicted_score": 30,
+  "remux": {
+    "eligible": false,
+    "reason": "video codec 'flv1' is not H.264"
+  },
+  "subtitles": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "no subtitle streams",
+    "result": [],
+    "samples": []
+  },
+  "sync": {
+    "durations": {
+      "audio": [
+        {
+          "duration": 5.041,
+          "end": 5.041,
+          "first_pts": 0.0,
+          "gap_seconds": 0.0,
+          "gaps": 0,
+          "index": 0,
+          "largest_gap_s": 0.0,
+          "packet_duration": 0.026,
+          "packets": 193,
+          "priming_s": 0.0,
+          "start": 0.0
+        }
+      ],
+      "video": {
+        "duration": 5.0,
+        "end": 5.025,
+        "first_pts": 0.025,
+        "gap_seconds": null,
+        "gaps": null,
+        "index": 1,
+        "largest_gap_s": null,
+        "packet_duration": 0.04,
+        "packets": 125,
+        "priming_s": 0.0,
+        "start": 0.025
+      }
+    },
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "audio stream 0: offset -0.025 s, durations 5.041 s audio / 5.000 s video differ by no more than one audio packet plus one video frame",
+    "result": [
+      {
+        "atempo": null,
+        "gaps": 0,
+        "index": 0,
+        "measured_offset": -0.025,
+        "needs_reencode": false,
+        "offset": -0.025,
+        "offset_source": "measured",
+        "quantised": true,
+        "ratio": 1.0
+      }
+    ],
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "version": "20261102",
+  "windows": [
+    [
+      0.0,
+      null
+    ]
+  ]
+}

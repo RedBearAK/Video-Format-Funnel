@@ -1,0 +1,229 @@
+{
+  "aspect": {
+    "crop": null,
+    "crop_windows": null,
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "signalled SAR 8:9 (DAR 4:3) kept",
+    "result": {
+      "candidate": null,
+      "dar": "4:3",
+      "sar": "8:9",
+      "source": "signalled"
+    },
+    "samples": []
+  },
+  "audio": [
+    {
+      "flags": [],
+      "penalties": [],
+      "penalty": 0,
+      "reason": "'ac3' re-encoded to AAC-LC at 192k",
+      "result": {
+        "action": "aac",
+        "bitrate": "192k",
+        "channel_layout": "stereo",
+        "channels": 2,
+        "filters": "aresample=async=1",
+        "index": 2,
+        "language": null,
+        "sample_rate": 48000
+      },
+      "samples": []
+    }
+  ],
+  "cadence": {
+    "flags": [],
+    "idet": {
+      "determined_frames": 150,
+      "kind": "interlaced",
+      "order": "tff",
+      "reason": "1 window(s): 1 interlaced",
+      "totals": {
+        "bff": 0,
+        "progressive": 0,
+        "repeated_bottom": 0,
+        "repeated_neither": 150,
+        "repeated_top": 0,
+        "single_bff": 0,
+        "single_progressive": 0,
+        "single_tff": 150,
+        "single_undetermined": 0,
+        "tff": 150,
+        "undetermined": 0
+      },
+      "windows": [
+        {
+          "counters": {
+            "bff": 0,
+            "progressive": 0,
+            "repeated_bottom": 0,
+            "repeated_neither": 150,
+            "repeated_top": 0,
+            "single_bff": 0,
+            "single_progressive": 0,
+            "single_tff": 150,
+            "single_undetermined": 0,
+            "tff": 150,
+            "undetermined": 0
+          },
+          "kind": "interlaced",
+          "order": "tff"
+        }
+      ]
+    },
+    "penalties": [
+      {
+        "code": "interlaced",
+        "points": 5,
+        "reason": "interlaced tff source deinterlaced"
+      }
+    ],
+    "penalty": 5,
+    "reason": "idet: 1 window(s): 1 interlaced; field-rate deinterlace",
+    "result": {
+      "filter": "bwdif=mode=1:parity=0",
+      "fps_multiplier": 2.0,
+      "kind": "interlaced",
+      "level": "4.1",
+      "order": "tff",
+      "output_fps": "60000/1001"
+    },
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "colour": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "untagged; SD, not PAL (480 lines) -> smpte170m/smpte170m/smpte170m",
+    "result": {
+      "primaries": "smpte170m",
+      "range": "tv",
+      "source": "inferred",
+      "space": "smpte170m",
+      "trc": "smpte170m"
+    },
+    "samples": []
+  },
+  "decode": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "decoded with no warnings; 1 benign class(es) not counted",
+    "result": {
+      "classes": {},
+      "ignored": {
+        "[mpeg] start time for stream # is not set in estimate_timings_from_pts": 1
+      },
+      "returncode": 0
+    },
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "flags": [],
+  "keyframes": null,
+  "penalties": [
+    {
+      "code": "interlaced",
+      "points": 5,
+      "reason": "interlaced tff source deinterlaced"
+    }
+  ],
+  "pixelart": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "codec 'mpeg2video' (yuv420p) is not palette/RLE class",
+    "result": {
+      "factor": 1,
+      "filter": null,
+      "tune": null
+    },
+    "samples": []
+  },
+  "predicted_score": 95,
+  "remux": {
+    "eligible": false,
+    "reason": "video codec 'mpeg2video' is not H.264"
+  },
+  "subtitles": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "no subtitle streams",
+    "result": [],
+    "samples": []
+  },
+  "sync": {
+    "durations": {
+      "audio": [
+        {
+          "duration": 5.024,
+          "end": 5.552033,
+          "first_pts": 0.528033,
+          "gap_seconds": 0.0,
+          "gaps": 0,
+          "index": 2,
+          "largest_gap_s": 0.0,
+          "packet_duration": 0.032,
+          "packets": 157,
+          "priming_s": 0.0,
+          "start": 0.528033
+        }
+      ],
+      "video": {
+        "duration": 5.005,
+        "end": 5.538367,
+        "first_pts": 0.533367,
+        "gap_seconds": null,
+        "gaps": null,
+        "index": 1,
+        "largest_gap_s": null,
+        "packet_duration": 0.033367,
+        "packets": 150,
+        "priming_s": 0.0,
+        "start": 0.533367
+      }
+    },
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "audio stream 2: offset -0.005 s, durations 5.024 s audio / 5.005 s video differ by no more than one audio packet plus one video frame",
+    "result": [
+      {
+        "atempo": null,
+        "gaps": 0,
+        "index": 2,
+        "measured_offset": -0.005334,
+        "needs_reencode": false,
+        "offset": -0.005334,
+        "offset_source": "measured",
+        "quantised": true,
+        "ratio": 1.0
+      }
+    ],
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "version": "20261102",
+  "windows": [
+    [
+      0.0,
+      null
+    ]
+  ]
+}

@@ -1,0 +1,217 @@
+{
+  "aspect": {
+    "crop": null,
+    "crop_windows": null,
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "signalled SAR 8:9 (DAR 4:3) kept",
+    "result": {
+      "candidate": null,
+      "dar": "4:3",
+      "sar": "8:9",
+      "source": "signalled"
+    },
+    "samples": []
+  },
+  "audio": [
+    {
+      "flags": [],
+      "penalties": [],
+      "penalty": 0,
+      "reason": "'pcm_s16le' re-encoded to AAC-LC at 192k",
+      "result": {
+        "action": "aac",
+        "bitrate": "192k",
+        "channel_layout": null,
+        "channels": 2,
+        "filters": "aresample=async=1",
+        "index": 1,
+        "language": null,
+        "sample_rate": 48000
+      },
+      "samples": []
+    }
+  ],
+  "cadence": {
+    "flags": [],
+    "idet": {
+      "determined_frames": 91,
+      "kind": "progressive",
+      "order": null,
+      "reason": "1 window(s): 1 progressive",
+      "totals": {
+        "bff": 0,
+        "progressive": 91,
+        "repeated_bottom": 0,
+        "repeated_neither": 120,
+        "repeated_top": 0,
+        "single_bff": 0,
+        "single_progressive": 78,
+        "single_tff": 0,
+        "single_undetermined": 42,
+        "tff": 0,
+        "undetermined": 29
+      },
+      "windows": [
+        {
+          "counters": {
+            "bff": 0,
+            "progressive": 91,
+            "repeated_bottom": 0,
+            "repeated_neither": 120,
+            "repeated_top": 0,
+            "single_bff": 0,
+            "single_progressive": 78,
+            "single_tff": 0,
+            "single_undetermined": 42,
+            "tff": 0,
+            "undetermined": 29
+          },
+          "kind": "progressive",
+          "order": null
+        }
+      ]
+    },
+    "penalties": [],
+    "penalty": 0,
+    "reason": "idet: 1 window(s): 1 progressive",
+    "result": {
+      "filter": null,
+      "fps_multiplier": 1.0,
+      "kind": "progressive",
+      "level": "4.1",
+      "order": null,
+      "output_fps": "30000/1001"
+    },
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "colour": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "untagged; SD, not PAL (480 lines) -> smpte170m/smpte170m/smpte170m",
+    "result": {
+      "primaries": "smpte170m",
+      "range": "tv",
+      "source": "inferred",
+      "space": "smpte170m",
+      "trc": "smpte170m"
+    },
+    "samples": []
+  },
+  "decode": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "decoded with no warnings; 1 benign class(es) not counted",
+    "result": {
+      "classes": {},
+      "ignored": {
+        "[aist##:#/pcm_s16le] Guessed Channel Layout: stereo": 1
+      },
+      "returncode": 0
+    },
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "flags": [],
+  "keyframes": null,
+  "penalties": [],
+  "pixelart": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "codec 'dvvideo' (yuv411p) is not palette/RLE class",
+    "result": {
+      "factor": 1,
+      "filter": null,
+      "tune": null
+    },
+    "samples": []
+  },
+  "predicted_score": 100,
+  "remux": {
+    "eligible": false,
+    "reason": "video codec 'dvvideo' is not H.264"
+  },
+  "subtitles": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "no subtitle streams",
+    "result": [],
+    "samples": []
+  },
+  "sync": {
+    "durations": {
+      "audio": [
+        {
+          "duration": 4.0,
+          "end": 4.0,
+          "first_pts": 0.0,
+          "gap_seconds": 0.0,
+          "gaps": 0,
+          "index": 1,
+          "largest_gap_s": 0.0,
+          "packet_duration": 0.021333,
+          "packets": 188,
+          "priming_s": 0.0,
+          "start": 0.0
+        }
+      ],
+      "video": {
+        "duration": 4.004,
+        "end": 4.004,
+        "first_pts": 0.0,
+        "gap_seconds": null,
+        "gaps": null,
+        "index": 0,
+        "largest_gap_s": null,
+        "packet_duration": 0.033367,
+        "packets": 120,
+        "priming_s": 0.0,
+        "start": 0.0
+      }
+    },
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "audio stream 1: offset +0.000 s, durations 4.000 s audio / 4.004 s video differ by no more than one audio packet plus one video frame",
+    "result": [
+      {
+        "atempo": null,
+        "gaps": 0,
+        "index": 1,
+        "measured_offset": 0.0,
+        "needs_reencode": false,
+        "offset": 0.0,
+        "offset_source": "measured",
+        "quantised": true,
+        "ratio": 1.0
+      }
+    ],
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "version": "20261102",
+  "windows": [
+    [
+      0.0,
+      null
+    ]
+  ]
+}

@@ -1,0 +1,240 @@
+{
+  "aspect": {
+    "crop": null,
+    "crop_windows": null,
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "320x240 is not a non-square frame size; SAR 1:1 means square pixels",
+    "result": {
+      "candidate": null,
+      "dar": "4:3",
+      "sar": "1:1",
+      "source": "square"
+    },
+    "samples": []
+  },
+  "audio": [
+    {
+      "flags": [],
+      "penalties": [],
+      "penalty": 0,
+      "reason": "AAC-LC copied",
+      "result": {
+        "action": "copy",
+        "bitrate": null,
+        "channel_layout": "stereo",
+        "channels": 2,
+        "filters": null,
+        "index": 1,
+        "language": null,
+        "sample_rate": 48000
+      },
+      "samples": []
+    }
+  ],
+  "cadence": {
+    "flags": [],
+    "idet": {
+      "determined_frames": 79,
+      "kind": "progressive",
+      "order": null,
+      "reason": "1 window(s): 1 progressive",
+      "totals": {
+        "bff": 0,
+        "progressive": 79,
+        "repeated_bottom": 0,
+        "repeated_neither": 128,
+        "repeated_top": 0,
+        "single_bff": 0,
+        "single_progressive": 1,
+        "single_tff": 0,
+        "single_undetermined": 127,
+        "tff": 0,
+        "undetermined": 49
+      },
+      "windows": [
+        {
+          "counters": {
+            "bff": 0,
+            "progressive": 79,
+            "repeated_bottom": 0,
+            "repeated_neither": 128,
+            "repeated_top": 0,
+            "single_bff": 0,
+            "single_progressive": 1,
+            "single_tff": 0,
+            "single_undetermined": 127,
+            "tff": 0,
+            "undetermined": 49
+          },
+          "kind": "progressive",
+          "order": null
+        }
+      ]
+    },
+    "penalties": [],
+    "penalty": 0,
+    "reason": "idet: 1 window(s): 1 progressive",
+    "result": {
+      "filter": null,
+      "fps_multiplier": 1.0,
+      "kind": "progressive",
+      "level": "4.1",
+      "order": null,
+      "output_fps": "25/1"
+    },
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "colour": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "untagged; SD PAL family (240 lines, 25 fps) -> bt470bg/bt470bg/bt709",
+    "result": {
+      "primaries": "bt470bg",
+      "range": "tv",
+      "source": "inferred",
+      "space": "bt470bg",
+      "trc": "bt709"
+    },
+    "samples": []
+  },
+  "decode": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "decoded with no warnings",
+    "result": {
+      "classes": {},
+      "ignored": {},
+      "returncode": 0
+    },
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "flags": [
+    "long-gop"
+  ],
+  "keyframes": {
+    "flags": [
+      "long-gop"
+    ],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "longest keyframe gap 5.120 s, over 5 s",
+    "result": {
+      "constant_frame_rate": true,
+      "frame_interval_s": 0.04,
+      "keyframes": 1,
+      "max_gap_frames": 128,
+      "max_gap_s": 5.12,
+      "mean_gap_s": 5.12,
+      "packets": 128,
+      "untimed_packets": 0
+    },
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "penalties": [],
+  "pixelart": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "codec 'h264' (yuv420p) is not palette/RLE class",
+    "result": {
+      "factor": 1,
+      "filter": null,
+      "tune": null
+    },
+    "samples": []
+  },
+  "predicted_score": 100,
+  "remux": {
+    "eligible": true,
+    "reason": "H.264 High level 1.3, yuv420p, progressive"
+  },
+  "subtitles": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "no subtitle streams",
+    "result": [],
+    "samples": []
+  },
+  "sync": {
+    "durations": {
+      "audio": [
+        {
+          "duration": 5.119667,
+          "end": 5.12,
+          "first_pts": -0.021,
+          "gap_seconds": 0.0,
+          "gaps": 0,
+          "index": 1,
+          "largest_gap_s": 0.0,
+          "packet_duration": 0.021,
+          "packets": 241,
+          "priming_s": 0.021333,
+          "start": 0.000333
+        }
+      ],
+      "video": {
+        "duration": 5.12,
+        "end": 5.12,
+        "first_pts": 0.0,
+        "gap_seconds": null,
+        "gaps": null,
+        "index": 0,
+        "largest_gap_s": null,
+        "packet_duration": 0.04,
+        "packets": 128,
+        "priming_s": 0.0,
+        "start": 0.0
+      }
+    },
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "audio stream 1: offset +0.000 s, durations 5.120 s audio / 5.120 s video differ by no more than one audio packet plus one video frame",
+    "result": [
+      {
+        "atempo": null,
+        "gaps": 0,
+        "index": 1,
+        "measured_offset": 0.000333,
+        "needs_reencode": false,
+        "offset": 0.000333,
+        "offset_source": "measured",
+        "quantised": true,
+        "ratio": 1.0
+      }
+    ],
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "version": "20261102",
+  "windows": [
+    [
+      0.0,
+      null
+    ]
+  ]
+}

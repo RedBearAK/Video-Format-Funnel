@@ -1,0 +1,269 @@
+{
+  "aspect": {
+    "crop": {
+      "h": 360,
+      "w": 720,
+      "x": 0,
+      "y": 60
+    },
+    "crop_windows": [
+      {
+        "h": 360,
+        "w": 720,
+        "x": 0,
+        "y": 60
+      }
+    ],
+    "flags": [],
+    "penalties": [
+      {
+        "code": "aspect-from-bars",
+        "points": 15,
+        "reason": "aspect 4:3 inferred from letterbox bars"
+      }
+    ],
+    "penalty": 15,
+    "reason": "SAR 1:1 on 720x480 with bars 720x360 at 0,60: 4:3 (SAR 8:9): active 1.778, 0.0 % from 16:9; 16:9 (SAR 32:27): active 2.370, 0.8 % from 2.39:1; chose 4:3",
+    "result": {
+      "candidate": "4:3",
+      "dar": "4:3",
+      "sar": "8:9",
+      "source": "bars"
+    },
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "audio": [
+    {
+      "flags": [],
+      "penalties": [],
+      "penalty": 0,
+      "reason": "AAC-LC copied",
+      "result": {
+        "action": "copy",
+        "bitrate": null,
+        "channel_layout": "stereo",
+        "channels": 2,
+        "filters": null,
+        "index": 1,
+        "language": null,
+        "sample_rate": 48000
+      },
+      "samples": []
+    }
+  ],
+  "cadence": {
+    "flags": [],
+    "idet": {
+      "determined_frames": 120,
+      "kind": "progressive",
+      "order": null,
+      "reason": "1 window(s): 1 progressive",
+      "totals": {
+        "bff": 0,
+        "progressive": 120,
+        "repeated_bottom": 0,
+        "repeated_neither": 150,
+        "repeated_top": 0,
+        "single_bff": 0,
+        "single_progressive": 3,
+        "single_tff": 0,
+        "single_undetermined": 147,
+        "tff": 0,
+        "undetermined": 30
+      },
+      "windows": [
+        {
+          "counters": {
+            "bff": 0,
+            "progressive": 120,
+            "repeated_bottom": 0,
+            "repeated_neither": 150,
+            "repeated_top": 0,
+            "single_bff": 0,
+            "single_progressive": 3,
+            "single_tff": 0,
+            "single_undetermined": 147,
+            "tff": 0,
+            "undetermined": 30
+          },
+          "kind": "progressive",
+          "order": null
+        }
+      ]
+    },
+    "penalties": [],
+    "penalty": 0,
+    "reason": "idet: 1 window(s): 1 progressive",
+    "result": {
+      "filter": null,
+      "fps_multiplier": 1.0,
+      "kind": "progressive",
+      "level": "4.1",
+      "order": null,
+      "output_fps": "30000/1001"
+    },
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "colour": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "untagged; SD, not PAL (480 lines) -> smpte170m/smpte170m/smpte170m",
+    "result": {
+      "primaries": "smpte170m",
+      "range": "tv",
+      "source": "inferred",
+      "space": "smpte170m",
+      "trc": "smpte170m"
+    },
+    "samples": []
+  },
+  "decode": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "decoded with no warnings",
+    "result": {
+      "classes": {},
+      "ignored": {},
+      "returncode": 0
+    },
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "flags": [
+    "long-gop"
+  ],
+  "keyframes": {
+    "flags": [
+      "long-gop"
+    ],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "longest keyframe gap 5.005 s, over 5 s",
+    "result": {
+      "constant_frame_rate": true,
+      "frame_interval_s": 0.03336912751677853,
+      "keyframes": 1,
+      "max_gap_frames": 150,
+      "max_gap_s": 5.005000000000001,
+      "mean_gap_s": 5.005000000000001,
+      "packets": 150,
+      "untimed_packets": 0
+    },
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "penalties": [
+    {
+      "code": "aspect-from-bars",
+      "points": 15,
+      "reason": "aspect 4:3 inferred from letterbox bars"
+    }
+  ],
+  "pixelart": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "codec 'h264' (yuv420p) is not palette/RLE class",
+    "result": {
+      "factor": 1,
+      "filter": null,
+      "tune": null
+    },
+    "samples": []
+  },
+  "predicted_score": 85,
+  "remux": {
+    "eligible": true,
+    "reason": "H.264 High level 3.0, yuv420p, progressive"
+  },
+  "subtitles": {
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "no subtitle streams",
+    "result": [],
+    "samples": []
+  },
+  "sync": {
+    "durations": {
+      "audio": [
+        {
+          "duration": 5.012667,
+          "end": 5.013,
+          "first_pts": -0.021,
+          "gap_seconds": 0.0,
+          "gaps": 0,
+          "index": 1,
+          "largest_gap_s": 0.0,
+          "packet_duration": 0.021,
+          "packets": 236,
+          "priming_s": 0.021333,
+          "start": 0.000333
+        }
+      ],
+      "video": {
+        "duration": 5.005,
+        "end": 5.005,
+        "first_pts": 0.0,
+        "gap_seconds": null,
+        "gaps": null,
+        "index": 0,
+        "largest_gap_s": null,
+        "packet_duration": 0.033,
+        "packets": 150,
+        "priming_s": 0.0,
+        "start": 0.0
+      }
+    },
+    "flags": [],
+    "penalties": [],
+    "penalty": 0,
+    "reason": "audio stream 1: offset +0.000 s, durations 5.013 s audio / 5.005 s video differ by no more than one audio packet plus one video frame",
+    "result": [
+      {
+        "atempo": null,
+        "gaps": 0,
+        "index": 1,
+        "measured_offset": 0.000333,
+        "needs_reencode": false,
+        "offset": 0.000333,
+        "offset_source": "measured",
+        "quantised": true,
+        "ratio": 1.0
+      }
+    ],
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ]
+  },
+  "version": "20261102",
+  "windows": [
+    [
+      0.0,
+      null
+    ]
+  ]
+}
