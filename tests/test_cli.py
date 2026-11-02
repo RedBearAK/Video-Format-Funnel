@@ -54,14 +54,25 @@ class DispatchTests(unittest.TestCase):
     def test_every_subcommand_is_registered(self):
         parser = cli.build_parser()
         registered = parser._subparsers._group_actions[0].choices
-        for name, _help in cli.SUBCOMMANDS:
-            self.assertIn(name, registered)
+        for entry in cli.SUBCOMMANDS:
+            self.assertIn(entry[0], registered)
 
     def test_unimplemented_subcommand_says_so(self):
-        code, out, err = run_main(["plan", "/some/path"])
+        missing = [entry[0] for entry in cli.SUBCOMMANDS if cli.load_stage(entry[1]) is None]
+        if not missing:
+            self.skipTest("every stage module exists; no stub left to test")
+        name = missing[0]
+        code, out, err = run_main([name, "/some/path"])
         self.assertEqual(code, cli.EXIT_ERROR)
         self.assertEqual(out, "")
-        self.assertIn("'plan' is not implemented yet", err)
+        self.assertIn("'{}' is not implemented yet".format(name), err)
+
+    def test_global_options_are_accepted_before_a_command(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--ffmpeg", "/opt/ff/ffmpeg", "--quiet", "check"])
+        self.assertEqual(args.ffmpeg, "/opt/ff/ffmpeg")
+        self.assertTrue(args.quiet)
+        self.assertEqual(args.command, "check")
 
 
 class LauncherTests(unittest.TestCase):
