@@ -1,0 +1,166 @@
+#!/bin/sh
+# vidfunnel-setup-distrobox: set up (or remove) the Alpine distrobox that gives a
+# workstation an ffmpeg with the dvdvideo demuxer, par2, mediainfo and ffsubsync,
+# and export those tools as host wrappers in a directory of their own. The host's
+# own ffmpeg is never shadowed; point vidfunnel at the wrappers with --ffmpeg.
+# See HANDOFF.md section 8. Idempotent: safe to re-run.
+
+VERSION="20261102"
+
+set -eu
+
+NAME="vidfunnel-alp"
+IMAGE="docker.io/library/alpine:3.24"
+TOOLS_DIR="${HOME}/.local/share/vidfunnel-tools/bin"
+VENV_DIR="${HOME}/.cache/ffsubsync-venv"
+WITH_SUBSYNC=1
+REMOVE=0
+
+usage() {
+    cat <<EOF
+Usage: vidfunnel-setup-distrobox [options]
+
+Creates an Alpine distrobox with ffmpeg (with the dvdvideo demuxer), par2cmdline,
+python3 and mediainfo, installs ffsubsync into a venv, and exports ffmpeg, ffprobe
+and ffsubsync as wrappers into a tools directory that is not on PATH.
+
+Options:
+  --name NAME        distrobox name (default: ${NAME})
+  --image IMAGE      container image (default: ${IMAGE})
+  --tools-dir DIR    where the wrappers go (default: ${TOOLS_DIR})
+  --venv-dir DIR     ffsubsync venv, must be under \$HOME (default: ${VENV_DIR})
+  --no-subsync       skip ffsubsync
+  --remove           remove the distrobox, its wrappers and the venv, nothing else
+  --version          print the script version
+  -h, --help         this text
+
+Afterwards: vidfunnel --ffmpeg ${TOOLS_DIR}/ffmpeg ...
+EOF
+}
+
+say() { printf '%s\n' "$*"; }
+die() { printf 'vidfunnel-setup-distrobox: %s\n' "$*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --name) NAME="$2"; shift 2 ;;
+        --image) IMAGE="$2"; shift 2 ;;
+        --tools-dir) TOOLS_DIR="$2"; shift 2 ;;
+        --venv-dir) VENV_DIR="$2"; shift 2 ;;
+        --no-subsync) WITH_SUBSYNC=0; shift ;;
+        --remove) REMOVE=1; shift ;;
+        --version) say "vidfunnel-setup-distrobox ${VERSION}"; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; die "unknown option '$1'" ;;
+    esac
+done
+
+command -v distrobox >/dev/null 2>&1 || die "distrobox is not on PATH; install it first (openSUSE: zypper install distrobox, Fedora: dnf install distrobox, Debian: apt install distrobox)"
+if ! command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
+    die "neither podman nor docker is on PATH; distrobox needs one of them"
+fi
+
+case "${TOOLS_DIR}" in "${HOME}"/*) ;; *) die "--tools-dir must be under \$HOME so the container can write the wrappers there: '${TOOLS_DIR}'" ;; esac
+case "${VENV_DIR}" in "${HOME}"/*) ;; *) die "--venv-dir must be under \$HOME so the container and the host both see it: '${VENV_DIR}'" ;; esac
+
+box_exists() { distrobox list --no-color 2>/dev/null | awk -F'|' 'NR > 1 { gsub(/ /, "", $2); print $2 }' | grep -qx "${NAME}"; }
+in_box() { distrobox enter --name "${NAME}" -- "$@"; }
+
+is_our_wrapper() {
+    [ -f "$1" ] && grep -q "distrobox-enter" "$1" && grep -q -- "-n ${NAME} " "$1"
+}
+
+if [ "${REMOVE}" -eq 1 ]; then
+    for tool in ffmpeg ffprobe ffsubsync; do
+        wrapper="${TOOLS_DIR}/${tool}"
+        if is_our_wrapper "${wrapper}"; then
+            say "Removing wrapper '${wrapper}'"
+            rm -f "${wrapper}"
+        elif [ -e "${wrapper}" ]; then
+            say "Leaving '${wrapper}' alone: not a wrapper for distrobox '${NAME}'"
+        fi
+    done
+    rmdir "${TOOLS_DIR}" 2>/dev/null && say "Removed empty directory '${TOOLS_DIR}'" || true
+    if [ -x "${VENV_DIR}/bin/ffsubsync" ] && [ -f "${VENV_DIR}/pyvenv.cfg" ]; then
+        say "Removing ffsubsync venv '${VENV_DIR}'"
+        rm -rf "${VENV_DIR}"
+    elif [ -e "${VENV_DIR}" ]; then
+        say "Leaving '${VENV_DIR}' alone: not an ffsubsync venv"
+    fi
+    if box_exists; then
+        say "Removing distrobox '${NAME}'"
+        distrobox rm --force "${NAME}"
+    else
+        say "No distrobox named '${NAME}'"
+    fi
+    say "Done. The container image '${IMAGE}' stays in the engine's cache; remove it with 'podman rmi ${IMAGE}' if wanted."
+    exit 0
+fi
+
+if box_exists; then
+    say "Distrobox '${NAME}' exists, reusing it"
+else
+    say "Creating distrobox '${NAME}' from '${IMAGE}' (pulls the image on first use)"
+    distrobox create --yes --name "${NAME}" --image "${IMAGE}"
+fi
+
+PKGS="ffmpeg par2cmdline python3 mediainfo"
+[ "${WITH_SUBSYNC}" -eq 1 ] && PKGS="${PKGS} py3-pip"
+say "Installing in '${NAME}': ${PKGS} (the first entry into a new box also initialises it)"
+in_box sudo apk add --no-cache ${PKGS}
+
+if [ "${WITH_SUBSYNC}" -eq 1 ]; then
+    if [ -x "${VENV_DIR}/bin/ffsubsync" ]; then
+        say "ffsubsync venv '${VENV_DIR}' exists, reusing it"
+    else
+        say "Creating venv '${VENV_DIR}' and installing ffsubsync (pip pulls numpy and friends; a minute or two)"
+        in_box python3 -m venv "${VENV_DIR}"
+        in_box "${VENV_DIR}/bin/pip" install --quiet ffsubsync
+    fi
+fi
+
+mkdir -p "${TOOLS_DIR}"
+export_tool() {
+    tool="$1"; path="$2"; wrapper="${TOOLS_DIR}/${tool}"
+    if [ -e "${wrapper}" ] && ! is_our_wrapper "${wrapper}"; then
+        die "'${wrapper}' exists and is not a wrapper for distrobox '${NAME}'; move it away or choose another --tools-dir"
+    fi
+    if is_our_wrapper "${wrapper}"; then
+        in_box distrobox-export --bin "${path}" --export-path "${TOOLS_DIR}" --delete >/dev/null
+    fi
+    say "Exporting '${path}' as '${wrapper}'"
+    in_box distrobox-export --bin "${path}" --export-path "${TOOLS_DIR}" >/dev/null
+}
+export_tool ffmpeg /usr/bin/ffmpeg
+export_tool ffprobe /usr/bin/ffprobe
+[ "${WITH_SUBSYNC}" -eq 1 ] && export_tool ffsubsync "${VENV_DIR}/bin/ffsubsync"
+
+say ""
+say "Verifying from the host:"
+fail=0
+check() {
+    label="$1"; shift
+    if "$@" >/dev/null 2>&1; then say "  ok       ${label}"; else say "  MISSING  ${label}"; fail=1; fi
+}
+ffver=$("${TOOLS_DIR}/ffmpeg" -version 2>/dev/null | head -n 1 | cut -d' ' -f3 || true)
+say "  ffmpeg ${ffver:-?} via '${TOOLS_DIR}/ffmpeg'"
+check "libx264 encoder" sh -c "'${TOOLS_DIR}/ffmpeg' -hide_banner -encoders | grep -qw libx264"
+check "aac encoder" sh -c "'${TOOLS_DIR}/ffmpeg' -hide_banner -encoders | grep -q ' aac '"
+check "dvdvideo demuxer" sh -c "'${TOOLS_DIR}/ffmpeg' -hide_banner -demuxers | grep -qw dvdvideo"
+check "h264_metadata bitstream filter" sh -c "'${TOOLS_DIR}/ffmpeg' -hide_banner -bsfs | grep -qw h264_metadata"
+check "ffprobe" "${TOOLS_DIR}/ffprobe" -version
+check "par2 (inside the box)" in_box par2 --version
+check "mediainfo (inside the box)" in_box mediainfo --Version
+if [ "${WITH_SUBSYNC}" -eq 1 ]; then
+    check "ffsubsync $("${TOOLS_DIR}/ffsubsync" --version 2>/dev/null | tail -n 1 | cut -d' ' -f2 || true)" "${TOOLS_DIR}/ffsubsync" --version
+fi
+
+say ""
+if [ "${fail}" -eq 0 ]; then
+    say "All good. '${TOOLS_DIR}' is not on PATH on purpose; use:"
+    say "  vidfunnel --ffmpeg ${TOOLS_DIR}/ffmpeg ..."
+else
+    die "something is missing (see above); the image or its packages may have changed"
+fi
+
+# End of File #
