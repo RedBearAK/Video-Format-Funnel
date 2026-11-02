@@ -5,6 +5,7 @@ VERSION = "20261102"
 import argparse
 import io
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -304,6 +305,59 @@ class RetireOneTests(RetireCase):
         self.assertEqual(saved["status"], "retired")
         self.assertEqual(saved["output"]["name"], "client_meeting.mp4")
         self.assertEqual(saved["output"]["interim_name"], "client_meeting.vidfunnel.mp4")
+
+    def add_interim_par2(self):
+        names = ["client_meeting.vidfunnel.mp4.par2", "client_meeting.vidfunnel.mp4.vol000+200.par2"]
+        for name in names:
+            write_bytes(self.meetings / name, b"fake par2 for the interim name")
+        return names
+
+    @unittest.skipIf(shutil.which("par2") is None, "par2 is not on PATH; the recreate path is not run")
+    def test_interim_par2_recreated_for_final_name(self):
+        old_names = self.add_interim_par2()
+        self.meeting_record["stages"]["plan"] = {"par2": 5}
+        out, _err = self.quietly()
+        stage = retire_one(self.meeting_source, self.meeting_record, self.root)
+        for name in old_names:
+            self.assertFalse((self.meetings / name).exists(), name)
+        self.assertTrue((self.meetings / "client_meeting.mp4.par2").is_file())
+        self.assertIn("client_meeting.mp4.par2", stage["par2_recreated"])
+        for name in stage["par2_recreated"]:
+            self.assertTrue((self.meetings / name).is_file(), name)
+            self.assertTrue(name.startswith("client_meeting.mp4."), name)
+        saved = load_record(self.meeting_source)
+        self.assertNotIn("par2-stale", saved["flags"])
+        self.assertEqual(saved["stages"]["retire"]["par2_recreated"], stage["par2_recreated"])
+        self.assertEqual(self.meeting_source.read_bytes(), OUTPUT_BYTES)
+
+    def test_interim_par2_kept_and_flagged_without_par2(self):
+        old_names = self.add_interim_par2()
+        self.quietly()
+        with mock.patch.object(retire.shutil, "which", return_value=None):
+            stage = retire_one(self.meeting_source, self.meeting_record, self.root)
+        for name in old_names:
+            self.assertTrue((self.meetings / name).is_file(), name)
+        self.assertEqual(stage["par2_recreated"], [])
+        self.assertEqual(stage["par2_stale"], old_names)
+        self.assertIn("not on PATH", stage["par2_error"])
+        saved = load_record(self.meeting_source)
+        self.assertIn("par2-stale", saved["flags"])
+        self.assertEqual(saved["status"], "retired")
+
+    def test_existing_final_name_par2_is_not_overwritten(self):
+        old_names = self.add_interim_par2()
+        users_par2 = write_bytes(self.meetings / "client_meeting.mp4.par2", b"the user's own par2")
+        self.quietly()
+        stage = retire_one(self.meeting_source, self.meeting_record, self.root)
+        self.assertEqual(users_par2.read_bytes(), b"the user's own par2")
+        for name in old_names:
+            self.assertTrue((self.meetings / name).is_file(), name)
+        self.assertIn("already exist", stage["par2_error"])
+        self.assertIn("par2-stale", load_record(self.meeting_source)["flags"])
+
+    def test_no_par2_fields_without_interim_par2(self):
+        stage = retire_one(self.meeting_source, self.meeting_record, self.root)
+        self.assertNotIn("par2_recreated", stage)
 
     def test_custom_quarantine_dir(self):
         custom = Path(self.holder.name) / "retired_elsewhere"

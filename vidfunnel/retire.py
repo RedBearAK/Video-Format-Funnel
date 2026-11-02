@@ -14,7 +14,10 @@ failed guard raises RetireRefused and nothing is moved.
 Only then the original is moved into the quarantine directory (default
 '<root>/.vidfunnel-retired/', relative path below the root preserved), or,
 with --destroy-originals-now after typing 'destroy' (or --yes), unlinked. An
-interim-named output is then renamed to its final name. The record gains a
+interim-named output is then renamed to its final name, and PAR2 files
+written for the interim name are replaced by PAR2 for the final name (PAR2
+stores the protected file's name); when that cannot be done the old ones are
+kept and the record is flagged 'par2-stale'. The record gains a
 'retire' stage and the status 'retired', and stays where it is as the audit
 trail. Output files are never removed, and records that are not 'verified'
 are never touched.
@@ -26,6 +29,7 @@ import contextlib
 import os
 import shutil
 import sys
+import types
 from pathlib import Path
 
 from vidfunnel.progress import Progress, StageSummary, format_bytes, is_tty, say
@@ -33,6 +37,7 @@ from vidfunnel.record import (
     FolderLock,
     LockHeld,
     RecordError,
+    add_flag,
     band,
     cheap_fingerprint,
     fingerprint_matches,
@@ -62,6 +67,8 @@ KEEP_LARGER_FLAG = "keep-larger"
 PROGRESS_THRESHOLD = 32 * 1024 * 1024     # hash and copy show live progress above this size
 COPY_BLOCK = 1024 * 1024
 DESTROY_WORD = "destroy"
+PAR2_STALE_FLAG = "par2-stale"
+PAR2_DEFAULT_REDUNDANCY = 10
 
 
 class RetireRefused(Exception):
@@ -297,14 +304,79 @@ def _copy_across(source, destination, quiet):
         raise
 
 
+def _par2_files_of(output_path):
+    """PAR2 files protecting output_path: '<name>.par2' and '<name>.vol*.par2', sorted."""
+    output_path = Path(output_path)
+    index_name = output_path.name + ".par2"
+    volume_prefix = output_path.name + ".vol"
+    found = []
+    for name in sorted(os.listdir(str(output_path.parent))):
+        if name == index_name or (name.startswith(volume_prefix) and name.endswith(".par2")):
+            found.append(output_path.parent / name)
+    return found
+
+
+def _par2_redundancy(record):
+    """Redundancy for recreated PAR2: plan's 'par2', else convert's 'par2_redundancy', else 10."""
+    stages = record.get("stages") or {}
+    redundancy = (stages.get("plan") or {}).get("par2")
+    if redundancy is None:
+        redundancy = (stages.get("convert") or {}).get("par2_redundancy")
+    if redundancy is None:
+        redundancy = PAR2_DEFAULT_REDUNDANCY
+    return redundancy
+
+
+def _redo_par2(record, interim_path, final_path, quiet):
+    """After the interim rename, replace interim-named PAR2 files by PAR2 for the final name.
+
+    PAR2 stores the protected file's name, so the old set no longer matches.
+    The new set is written first and the old one removed only after that
+    succeeded. When par2 is missing, fails, or final-named PAR2 files already
+    exist (they are not ours to overwrite), the old files are kept, the record
+    gets the flag 'par2-stale' and the reason is printed and returned.
+    Returns None when there were no interim PAR2 files, else a dict for the
+    retire stage: {'par2_recreated': [names]} or {'par2_recreated': [],
+    'par2_stale': [old names], 'par2_error': reason}.
+    """
+    old_files = _par2_files_of(interim_path)
+    if not old_files:
+        return None
+    old_names = [path.name for path in old_files]
+    error = None
+    existing = _par2_files_of(final_path)
+    if existing:
+        error = "PAR2 files for '{}' already exist ({}); not overwritten".format(
+            final_path.name, ", ".join("'{}'".format(path.name) for path in existing))
+    elif shutil.which("par2") is None:
+        error = "'par2' is not on PATH"
+    else:
+        from vidfunnel.encode import write_par2
+        options = types.SimpleNamespace(stream=None, quiet=quiet, verbose=False)
+        try:
+            written = write_par2(final_path, _par2_redundancy(record), options)
+        except OSError as failure:
+            error = str(failure)
+        else:
+            for path in old_files:
+                os.unlink(str(path))
+            return {"par2_recreated": [path.name for path in written]}
+    add_flag(record, PAR2_STALE_FLAG)
+    say("  PAR2 for '{}' not recreated ({}); the old files {} keep the interim name and are stale".format(
+        final_path.name, error, ", ".join("'{}'".format(name) for name in old_names)))
+    return {"par2_recreated": [], "par2_stale": old_names, "par2_error": error}
+
+
 def retire_one(source, record, root, quarantine_dir=None, destroy=False, allow_review=False,
                progress=None, quiet=False):
     """Check the guards, then quarantine (or, destroy=True, unlink) one source; return the retire stage.
 
     destroy=True unlinks without asking: the caller (run) has already obtained
     the confirmation. After the source is gone an interim-named output is
-    renamed to its final name. The record gets a 'retire' stage
-    {mode, destination, method, renamed_output, score, band} and status
+    renamed to its final name and its PAR2 files redone (_redo_par2). The
+    record gets a 'retire' stage {mode, destination, method, renamed_output,
+    score, band}, plus par2_recreated (and par2_stale, par2_error when the
+    PAR2 could not be redone) when interim PAR2 files existed, and status
     'retired' and is saved; a failed rename is recorded as 'rename_error' and
     raised as OSError after the record is saved, because the source is gone.
     """
@@ -358,6 +430,10 @@ def retire_one(source, record, root, quarantine_dir=None, destroy=False, allow_r
             rename_error = "renaming '{}' to '{}' failed: {}".format(
                 output_path.name, final_output_path.name, error)
 
+    par2_outcome = None
+    if renamed_output:
+        par2_outcome = _redo_par2(record, output_path, final_output_path, quiet)
+
     stage = {
         "mode": mode,
         "destination": str(destination) if destination is not None else None,
@@ -368,6 +444,8 @@ def retire_one(source, record, root, quarantine_dir=None, destroy=False, allow_r
     }
     if rename_error is not None:
         stage["rename_error"] = rename_error
+    if par2_outcome is not None:
+        stage.update(par2_outcome)
     add_stage(record, "retire", stage)
     set_status(record, "retired")
     save_record(source, record)

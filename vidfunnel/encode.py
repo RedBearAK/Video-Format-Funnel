@@ -14,7 +14,8 @@ What convert writes into the record:
 - stages.convert, on success: outcome 'ok', output_path (file name),
   part_path (file name), elapsed_s, ffmpeg_stderr (last 4000 characters),
   sidecars_written (file names), sidecar_errors (only when one failed),
-  par2_files (file names), par2_error (only when par2 failed), output_size,
+  par2_files (file names), par2_redundancy (the N used, or None), par2_error
+  (only when par2 failed), output_size,
   source_size, size_ratio (None when the source size is unknown);
 - stages.convert on an ffmpeg failure: outcome 'failed', error,
   returncode, stderr (last 4000 characters), argv; status 'failed';
@@ -476,7 +477,8 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
 
     stage = {"outcome": "ok", "output_path": output_path.name, "part_path": temp.name,
              "elapsed_s": round(elapsed, 3), "ffmpeg_stderr": _tail(completed.stderr),
-             "sidecars_written": sidecars_written, "par2_files": par2_files, "output_size": output_size,
+             "sidecars_written": sidecars_written, "par2_files": par2_files,
+             "par2_redundancy": int(redundancy) if redundancy else None, "output_size": output_size,
              "source_size": source_size, "size_ratio": ratio}
     if sidecar_errors:
         stage["sidecar_errors"] = sidecar_errors
