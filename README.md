@@ -328,6 +328,26 @@ Sources that cannot be converted are quarantined in place with a reason and a re
 
 The output profile in short: libx264 High profile, level 4.1 (4.2 only for field-rate HD), `yuv420p`, CRF 18 up to 576 lines, 19 at 720p, 20 at 1080p, `-preset slower`, closed GOP of at most 2 s, source resolution and frame rate (VFR stays VFR), aspect as SAR, colour tags set from the frame size and rate when the source has none. Audio: AAC-LC and MP3 copied unchanged, everything else AAC-LC at 96 kb/s per channel with the channel layout and sample rate kept. Text subtitles become `mov_text` (plus an `.srt` sidecar when ASS styling would be lost), bitmap subtitles go to sidecars (`.sup` for PGS, `NAME.subs.mkv` for DVD subtitles), chapters are kept. Container: `-movflags +frag_keyframe+empty_moov+default_base_moof+use_metadata_tags`. The full specification, with the reasons for each choice, is in `HANDOFF.md` sections 2 to 5.
 
+### What to expect in output sizes
+
+The profile aims at transparency and playability, not at shrinking, so the result depends almost entirely on the source. Expectations by source class, from how x264 behaves at these settings on typical material; the honest numbers for a library come from converting one representative folder and reading the sizes in its records:
+
+| Source | Path | Expected output size |
+|---|---|---|
+| H.264 in MKV, AVI, FLV, MOV, MP4 | remux | about the same; AVI shrinks a little (index gone), very small files grow a little (fragment headers, flag `remux-larger`) |
+| H.264 in MPEG-TS (broadcast captures) | remux | 5 to 10 % smaller |
+| DVD MPEG-2 at 4 to 8 Mb/s, progressive or telecined | re-encode | 40 to 60 % smaller; a 4.5 GB disc image lands around 1.5 to 2.5 GB |
+| MPEG-2, true interlaced, field-rate deinterlaced | re-encode at double frame rate | 25 to 45 % smaller; the doubled rate eats part of the saving |
+| DV AVI (25 Mb/s video, PCM audio) | re-encode | 85 to 92 % smaller; 13 GB per hour becomes 1 to 2 GB |
+| Uncompressed, RLE, QuickTime Animation, palette AVI | re-encode | 90 % or more smaller |
+| DivX/Xvid AVI, WMV, FLV1, Sorenson at the usual 0.7 to 1.5 Mb/s | re-encode | often larger, 1.2 to 2.5 times: CRF 18 preserves the blocking and ringing of the source as if it were detail |
+| Low-bitrate web H.264 that must be re-encoded (Baseline, wrong level, damaged) | re-encode | similar to somewhat larger |
+| 1080i broadcast H.264 or MPEG-2 at 15 to 18 Mb/s | re-encode | 50 to 70 % smaller |
+
+Audio moves the same way: AAC and MP3 are byte-identical copies; AC-3 stereo becomes AAC 192k, a modest saving; PCM at 1.5 Mb/s becomes 192k, a large one on DV and camera clips; AC-3 5.1 at 448k becomes AAC at the 448k cap, about the same. The closed 2 s GOP costs roughly 5 to 15 % against x264's default GOP; it is the price of bounding decode damage to two seconds.
+
+The DivX and WMV row is the reason the size rule exists (see `convert`): on a library of 2000s rips a good share of re-encodes will come out larger than their sources. That is the correct result for the stated goal, since a lower quality setting would visibly degrade already poor material, but it means the tool does not shrink that class. `--par2 N` adds roughly N % of the output size plus a small index file; the `.subs.mkv` sidecar for DVD bitmap subtitles is a few megabytes at most.
+
 ## Records and identity
 
 Each folder that `plan` processes gets a hidden `.vidfunnel/` directory with one JSON record per source, named after the full source file name with its extension (`movie.avi.json`, `movie.mkv.json`), so two sources with the same stem never share a record. Quarantined sources get records too. Each record holds a random record ID, the source fingerprint (size, mtime, SHA-256 of the first and last MiB) and full SHA-256, every probe result and decision with its reason, the ffmpeg command, the output name, hashes, verify results, score and status, with a timestamped section per stage. Every write is atomic. `folder.json` holds the last scan time, the tool version and the inventory of source names seen. While a run is active, `.vidfunnel/lock` records the host, pid and start time, so two machines working on the same share cannot run in one folder at once; a lock older than 24 hours is taken over with a warning. If a source changes after it was planned, its record is marked `source-changed` and the file is planned again under a new record ID, with the old one kept in its history.
