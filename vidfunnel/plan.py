@@ -37,7 +37,7 @@ analyze_input(), which runs the same passes with an input-argument list and
 returns the same dict shape, built from analyze's own pure rules.
 """
 
-VERSION = "20261102"
+VERSION = "20261107"
 
 import hashlib
 import json
@@ -1336,7 +1336,8 @@ def _positive_int(text):
 
 
 def add_arguments(parser):
-    parser.add_argument("paths", nargs="+", metavar="PATH", help="files or folders to plan (folders are walked)")
+    parser.add_argument("paths", nargs="*", metavar="PATH",
+                        help="files or folders to plan (folders are walked; default: the current directory)")
     parser.add_argument("--samples", type=_positive_int, default=None, metavar="N",
                         help="sample windows for idet and cropdetect (default 12)")
     parser.add_argument("--full-analysis", action="store_true", help="analyse the whole file instead of samples")
@@ -1358,8 +1359,9 @@ def add_arguments(parser):
 def run(args):
     """`vidfunnel plan`: EXIT_OK, EXIT_ERROR when any file failed or a folder could not be locked, EXIT_USAGE,
     EXIT_DEPS."""
-    from vidfunnel.cli import EXIT_DEPS, EXIT_ERROR, EXIT_OK, EXIT_USAGE
+    from vidfunnel.cli import EXIT_DEPS, EXIT_ERROR, EXIT_OK, EXIT_USAGE, paths_or_current_directory
     from vidfunnel.deps import DependencyError, require
+    paths_or_current_directory(args, "plan")
     try:
         tools = require(args)
     except DependencyError as error:

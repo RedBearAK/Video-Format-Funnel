@@ -80,6 +80,39 @@ class DispatchTests(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, environment, clear=True):
             self.assertIsNone(cli.build_parser().parse_args(["check"]).ffmpeg)
 
+    def test_path_is_optional_for_the_working_stages_and_required_for_retire(self):
+        parser = cli.build_parser()
+        for name in ("plan", "convert", "verify", "index"):
+            self.assertEqual(parser.parse_args([name]).paths, [], name)
+            self.assertEqual(parser.parse_args([name, "/a", "/b"]).paths, ["/a", "/b"], name)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors), self.assertRaises(SystemExit) as raised:
+            parser.parse_args(["retire"])
+        self.assertEqual(raised.exception.code, cli.EXIT_USAGE)
+        self.assertIn("PATH", errors.getvalue())
+        self.assertIn("never assumes the current directory", parser.parse_args(["retire", "/a"]) and
+                      "".join(action.help or "" for action in
+                              parser._subparsers._group_actions[0].choices["retire"]._actions))
+
+    def test_paths_or_current_directory(self):
+        import argparse
+        here = os.getcwd()
+        args = argparse.Namespace(paths=[], quiet=False)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(cli.paths_or_current_directory(args, "plan"), [here])
+        self.assertEqual(args.paths, [here])
+        self.assertEqual(output.getvalue(),
+                         "vidfunnel plan: no PATH given; using the current directory '{}'\n".format(here))
+        args = argparse.Namespace(paths=[], quiet=True)
+        with contextlib.redirect_stdout(io.StringIO()) as silent:
+            cli.paths_or_current_directory(args, "verify")
+        self.assertEqual((args.paths, silent.getvalue()), ([here], ""))
+        args = argparse.Namespace(paths=["/given"], quiet=False)
+        with contextlib.redirect_stdout(io.StringIO()) as silent:
+            self.assertEqual(cli.paths_or_current_directory(args, "index"), ["/given"])
+        self.assertEqual((args.paths, silent.getvalue()), (["/given"], ""))
+
     def test_global_options_are_accepted_before_a_command(self):
         parser = cli.build_parser()
         args = parser.parse_args(["--ffmpeg", "/opt/ff/ffmpeg", "--quiet", "check"])

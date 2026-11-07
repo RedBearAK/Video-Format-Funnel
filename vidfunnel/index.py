@@ -7,7 +7,7 @@ record ID (or a unique prefix) through the index when it holds the ID, and
 otherwise by walking the given roots (default: the current directory).
 """
 
-VERSION = "20261102"
+VERSION = "20261107"
 
 import json
 import os
@@ -362,7 +362,8 @@ def _db_path_from(args):
 
 def add_arguments(parser):
     """Arguments of 'vidfunnel index'."""
-    parser.add_argument("paths", nargs="+", metavar="PATH", help="trees whose records are indexed")
+    parser.add_argument("paths", nargs="*", metavar="PATH",
+                        help="trees whose records are indexed (default: the current directory)")
     parser.add_argument("--rebuild", action="store_true", help="drop and recreate the index before indexing")
     parser.add_argument("--db", metavar="PATH", default=None,
                         help="index database (default: {})".format(DEFAULT_DB))
@@ -370,8 +371,9 @@ def add_arguments(parser):
 
 def run(args):
     """'vidfunnel index': walk each PATH and load its records into the index."""
-    from vidfunnel.cli import EXIT_ERROR, EXIT_OK, EXIT_USAGE
+    from vidfunnel.cli import EXIT_ERROR, EXIT_OK, EXIT_USAGE, paths_or_current_directory
 
+    paths_or_current_directory(args, "index")
     missing = [path for path in args.paths if not os.path.isdir(str(path))]
     for path in missing:
         _warn("vidfunnel index: '{}' is not a directory".format(path))

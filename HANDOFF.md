@@ -172,19 +172,21 @@ Every stage is a separate subcommand, idempotent, and resumable. State lives in 
 
 ```
 vidfunnel check
-vidfunnel plan   [--samples N] [--full-analysis] [--assume-dar R] [--audio-offset S] [--audio-strict-aac] [--reencode-video] [--max-level 4.1|4.2] [--plain-mp4] [--par2 N] [--replan] PATH...
-vidfunnel convert [--par2 N] [--jobs N] [--dry-run] [--keep-larger] PATH...
-vidfunnel verify PATH...
+vidfunnel plan   [--samples N] [--full-analysis] [--assume-dar R] [--audio-offset S] [--audio-strict-aac] [--reencode-video] [--max-level 4.1|4.2] [--plain-mp4] [--par2 N] [--replan] [PATH...]
+vidfunnel convert [--par2 N] [--jobs N] [--dry-run] [--keep-larger] [PATH...]
+vidfunnel verify [PATH...]
 vidfunnel report [--format md|json|csv] [--min-score N] [--reveal] [--with-logs] PATH...
 vidfunnel report --from REPORT [--reveal]
 vidfunnel find ID
 vidfunnel retire [--allow-review] [--quarantine DIR] PATH...
 vidfunnel retire --destroy-originals-now [--allow-review] PATH...
-vidfunnel index [--rebuild] [--db PATH] PATH...
+vidfunnel index [--rebuild] [--db PATH] [PATH...]
 vidfunnel --install-command [--user|--system]
 vidfunnel --uninstall-command
 vidfunnel --version
 ```
+
+Where `PATH...` is bracketed, no PATH means the current directory, announced on the first output line (`vidfunnel plan: no PATH given; using the current directory '...'`). `retire` keeps PATH required, as a deliberate-action check for the one stage that moves originals (decided 2026-11-07).
 
 ### 6.1 `check`
 

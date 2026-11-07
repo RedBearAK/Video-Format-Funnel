@@ -25,7 +25,7 @@ trail. Output files are never removed, and records that are not 'verified'
 are never touched.
 """
 
-VERSION = "20261102"
+VERSION = "20261107"
 
 import contextlib
 import os
@@ -562,7 +562,8 @@ def confirm_destroy(sources, stdin=None, stdout=None, yes=False):
 
 def add_arguments(parser):
     parser.add_argument("paths", nargs="+", metavar="PATH",
-                        help="folders to walk for records, or single source files")
+                        help="folders to walk for records, or single source files; always required, "
+                        "retire never assumes the current directory")
     parser.add_argument("--allow-review", action="store_true",
                         help="also retire sources whose score is in the review band (60-89)")
     parser.add_argument("--quarantine", metavar="DIR", default=None,

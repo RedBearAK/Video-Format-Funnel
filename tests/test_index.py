@@ -325,6 +325,17 @@ class TestSubcommands(IndexTestCase):
         self.addCleanup(conn.close)
         self.assertEqual(self.row_count(conn), 2)
 
+    def test_index_subcommand_without_path_uses_the_current_directory(self):
+        args = self.parse(add_arguments, ["--db", str(self.db_path)])
+        self.assertEqual(args.paths, [])
+        previous = os.getcwd()
+        os.chdir(str(self.holidays))
+        self.addCleanup(os.chdir, previous)
+        code, output, _errors = self.run_captured(run, args)
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("no PATH given; using the current directory '{}'".format(os.getcwd()), output)
+        self.assertIn("2 records from 1 folder", output)
+
     def test_index_subcommand_rejects_missing_path(self):
         missing = Path(self.workspace.name) / "nowhere"
         args = self.parse(add_arguments, ["--db", str(self.db_path), str(missing)])

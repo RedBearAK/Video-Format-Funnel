@@ -45,7 +45,7 @@ refused without being touched, except that a converted or verified record
 whose output still matches its fingerprint is reported as already converted.
 """
 
-VERSION = "20261102"
+VERSION = "20261107"
 
 import concurrent.futures
 import os
@@ -746,8 +746,9 @@ def _positive_int(text):
 
 
 def add_arguments(parser):
-    parser.add_argument("paths", nargs="+", metavar="PATH",
-                        help="files or folders whose planned records to convert (folders are walked)")
+    parser.add_argument("paths", nargs="*", metavar="PATH",
+                        help="files or folders whose planned records to convert "
+                        "(folders are walked; default: the current directory)")
     parser.add_argument("--par2", type=_positive_int, default=None, metavar="N",
                         help="write PAR2 with N %% redundancy, overriding the planned value")
     parser.add_argument("--jobs", type=_positive_int, default=1, metavar="N",
@@ -761,8 +762,9 @@ def add_arguments(parser):
 def run(args):
     """`vidfunnel convert`: EXIT_OK, EXIT_ERROR when anything failed, collided or could not be locked, EXIT_USAGE,
     EXIT_DEPS."""
-    from vidfunnel.cli import EXIT_DEPS, EXIT_ERROR, EXIT_OK, EXIT_USAGE
+    from vidfunnel.cli import EXIT_DEPS, EXIT_ERROR, EXIT_OK, EXIT_USAGE, paths_or_current_directory
     from vidfunnel.deps import DependencyError, require
+    paths_or_current_directory(args, "convert")
     try:
         tools = require(args)
     except DependencyError as error:

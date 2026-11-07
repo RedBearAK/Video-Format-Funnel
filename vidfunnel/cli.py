@@ -47,6 +47,24 @@ SUBCOMMANDS = (
 )
 
 
+def paths_or_current_directory(args, stage):
+    """Default an empty positional PATH list to the current directory, and say so.
+
+    plan, convert, verify and index call this: with no PATH they work on the
+    directory the command was run from, like ls or git status, and print the
+    resolved folder first so a run from the wrong place is obvious at once.
+    retire never calls it: the only stage that moves originals keeps PATH
+    required as a deliberate-action check.
+    """
+    if getattr(args, "paths", None):
+        return list(args.paths)
+    here = os.getcwd()
+    if not getattr(args, "quiet", False):
+        print("vidfunnel {}: no PATH given; using the current directory '{}'".format(stage, here))
+    args.paths = [here]
+    return args.paths
+
+
 def module_versions():
     """Return (module name, VERSION) for every module in the package, sorted by name.
 

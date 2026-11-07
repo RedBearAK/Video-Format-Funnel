@@ -47,7 +47,7 @@ missing, cannot be probed, does not decode at all (non-zero exit and no
 decoded frame), or changed while it was verified.
 """
 
-VERSION = "20261102"
+VERSION = "20261107"
 
 import json
 import os
@@ -694,8 +694,9 @@ def _unit_fraction(text):
 
 
 def add_arguments(parser):
-    parser.add_argument("paths", nargs="+", metavar="PATH",
-                        help="folders to verify (walked for records), or source or output files")
+    parser.add_argument("paths", nargs="*", metavar="PATH",
+                        help="folders to verify (walked for records), or source or output files "
+                        "(default: the current directory)")
     parser.add_argument("--ssim-check", action="store_true",
                         help="also compare sampled windows with the source by SSIM on luma (slow)")
     parser.add_argument("--ssim-threshold", type=_unit_fraction, default=DEFAULT_SSIM_THRESHOLD, metavar="F",
@@ -725,8 +726,9 @@ def _records_under(path, stream):
 
 def run(args):
     """`vidfunnel verify`: EXIT_OK, EXIT_ERROR when any record failed, EXIT_USAGE, EXIT_DEPS."""
-    from vidfunnel.cli import EXIT_DEPS, EXIT_ERROR, EXIT_OK, EXIT_USAGE
+    from vidfunnel.cli import EXIT_DEPS, EXIT_ERROR, EXIT_OK, EXIT_USAGE, paths_or_current_directory
     from vidfunnel.deps import DependencyError, require
+    paths_or_current_directory(args, "verify")
     stream = getattr(args, "stream", None)
     try:
         tools = require(args)
