@@ -18,9 +18,10 @@ venv/
 htmlcov/
 .tox/
 
-# Editors and IDEs
+# Editors, IDEs and assistant state (never committed; a settings file can carry approved command lines)
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~
