@@ -9,6 +9,7 @@ import pathlib
 import re
 import subprocess
 import unittest
+import unittest.mock
 
 import vidfunnel
 from vidfunnel import cli
@@ -66,6 +67,18 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(code, cli.EXIT_ERROR)
         self.assertEqual(out, "")
         self.assertIn("'{}' is not implemented yet".format(name), err)
+
+    def test_ffmpeg_defaults_to_the_environment_variable(self):
+        with unittest.mock.patch.dict(os.environ, {cli.FFMPEG_ENV: "/opt/box/ffmpeg"}):
+            self.assertEqual(cli.build_parser().parse_args(["check"]).ffmpeg, "/opt/box/ffmpeg")
+            self.assertEqual(
+                cli.build_parser().parse_args(["--ffmpeg", "/usr/bin/ffmpeg", "check"]).ffmpeg,
+                "/usr/bin/ffmpeg", "the option wins over the variable")
+        with unittest.mock.patch.dict(os.environ, {cli.FFMPEG_ENV: ""}):
+            self.assertIsNone(cli.build_parser().parse_args(["check"]).ffmpeg, "an empty variable means PATH")
+        environment = {key: value for key, value in os.environ.items() if key != cli.FFMPEG_ENV}
+        with unittest.mock.patch.dict(os.environ, environment, clear=True):
+            self.assertIsNone(cli.build_parser().parse_args(["check"]).ffmpeg)
 
     def test_global_options_are_accepted_before_a_command(self):
         parser = cli.build_parser()

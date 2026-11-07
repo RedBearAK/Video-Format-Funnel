@@ -6,10 +6,11 @@ Modules are imported lazily by name, so a stage that is not built yet
 shows up as a stub that says so and exits with EXIT_ERROR, never silently.
 """
 
-VERSION = "20261102"
+VERSION = "20261107"
 
 import argparse
 import importlib
+import os
 import pkgutil
 import sys
 
@@ -19,6 +20,10 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
 EXIT_DEPS = 3  # a required external tool is missing (see vidfunnel.deps)
+
+# Environment variable read as the default for --ffmpeg, so an installed command
+# can use a container's exported wrapper without the option on every call.
+FFMPEG_ENV = "VIDFUNNEL_FFMPEG"
 
 # (name, module, add_arguments function, run function, one-line help),
 # in the order HANDOFF.md section 6 lists them.
@@ -84,8 +89,9 @@ def add_global_arguments(parser):
     parser.add_argument(
         "--ffmpeg",
         metavar="PATH",
-        default=None,
-        help="ffmpeg binary or wrapper to use; ffprobe is looked up next to it (default: PATH)",
+        default=os.environ.get(FFMPEG_ENV) or None,
+        help="ffmpeg binary or wrapper to use; ffprobe is looked up next to it "
+        "(default: the {} environment variable, else ffmpeg on PATH)".format(FFMPEG_ENV),
     )
     parser.add_argument(
         "--quiet",

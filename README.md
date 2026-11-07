@@ -89,11 +89,20 @@ On a workstation whose distro ffmpeg lacks `dvdvideo` (Fedora, openSUSE), an Alp
 bin/vidfunnel-setup-distrobox
 ```
 
-It creates a distrobox named `vidfunnel-alp` from `alpine:3.24` with ffmpeg, par2cmdline, python3 and mediainfo, installs `ffsubsync` into a venv in your home (`~/.cache/ffsubsync-venv`), and exports `ffmpeg`, `ffprobe` and `ffsubsync` as wrappers into `~/.local/share/vidfunnel-tools/bin`, a directory that is deliberately not on PATH. It ends by printing the line to use, which points `vidfunnel` at the wrapper (ffprobe is looked up next to it):
+It creates a distrobox named `vidfunnel-alp` from `alpine:3.24` with ffmpeg, par2cmdline, python3 and mediainfo, installs `ffsubsync` into a venv in your home (`~/.cache/ffsubsync-venv`), and exports `ffmpeg`, `ffprobe` and `ffsubsync` as wrappers into `~/.local/share/vidfunnel-tools/bin`, a directory that is deliberately not on PATH. It ends by printing the two ways to point `vidfunnel` at the wrapper (ffprobe and ffsubsync are looked up next to it). Per call:
 
 ```
 vidfunnel --ffmpeg ~/.local/share/vidfunnel-tools/bin/ffmpeg check
 ```
+
+Or once per shell, so the installed command is used exactly as it would be with the host ffmpeg. Add the line to `~/.bashrc` or `~/.zshrc` to keep it:
+
+```
+export VIDFUNNEL_FFMPEG=~/.local/share/vidfunnel-tools/bin/ffmpeg
+vidfunnel check
+```
+
+`--ffmpeg` on the command line wins over the variable.
 
 `--name`, `--image`, `--tools-dir` and `--venv-dir` change the defaults, and `--no-subsync` skips ffsubsync. The script can be run again safely and refuses to overwrite a wrapper that is not its own. To take away exactly what it created (the box, the wrappers and the venv; the pulled image stays in the engine's cache):
 
@@ -114,7 +123,7 @@ Every argument that is an existing file or folder on the host is bind-mounted re
 
 ## Usage
 
-The pipeline is five separate subcommands, run in order. Each one is idempotent and resumable: run it again on the same folder and it picks up where it left off. Folders are walked recursively. Global options (`--ffmpeg`, `--quiet`, `--verbose`, `--yes`) go before the subcommand name.
+The pipeline is five separate subcommands, run in order. Each one is idempotent and resumable: run it again on the same folder and it picks up where it left off. Folders are walked recursively. Global options (`--ffmpeg`, `--quiet`, `--verbose`, `--yes`) go before the subcommand name; `--ffmpeg` defaults to the `VIDFUNNEL_FFMPEG` environment variable when set.
 
 The examples below are real output from a scratch folder holding copies of six test fixtures under made-up names: two H.264 MKVs, an H.264 MP4, an XviD AVI, and a `movie.avi`/`movie.mkv` pair that share a name.
 

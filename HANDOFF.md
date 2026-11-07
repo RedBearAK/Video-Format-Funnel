@@ -274,7 +274,7 @@ Standing rule: nothing the tool does that may take more than one second of wall-
 
 ## 7. Architecture and repo layout
 
-Python ≥ 3.9, standard library only (subprocess, json, argparse, pathlib, concurrent.futures). No third-party packages, so it runs from a clone with the system Python on Fedora, Tumbleweed, Debian and macOS. ffmpeg/ffprobe are external and discovered on PATH (`--ffmpeg PATH` override points at the ffmpeg binary or wrapper; ffprobe is looked up next to it under the same name pattern, so a pair of `distrobox-export` wrappers in a directory of their own works, and the host's ffmpeg is never shadowed).
+Python ≥ 3.9, standard library only (subprocess, json, argparse, pathlib, concurrent.futures). No third-party packages, so it runs from a clone with the system Python on Fedora, Tumbleweed, Debian and macOS. ffmpeg/ffprobe are external and discovered on PATH (`--ffmpeg PATH`, defaulting to the `VIDFUNNEL_FFMPEG` environment variable, points at the ffmpeg binary or wrapper; ffprobe is looked up next to it under the same name pattern, so a pair of `distrobox-export` wrappers in a directory of their own works, and the host's ffmpeg is never shadowed).
 
 Each module is named for the single stage it implements and declares `VERSION` at the top; the CLI's `--version` lists the package version and every module's version.
 

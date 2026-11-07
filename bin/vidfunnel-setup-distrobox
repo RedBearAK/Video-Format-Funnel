@@ -2,10 +2,10 @@
 # vidfunnel-setup-distrobox: set up (or remove) the Alpine distrobox that gives a
 # workstation an ffmpeg with the dvdvideo demuxer, par2, mediainfo and ffsubsync,
 # and export those tools as host wrappers in a directory of their own. The host's
-# own ffmpeg is never shadowed; point vidfunnel at the wrappers with --ffmpeg.
+# own ffmpeg is never shadowed; point vidfunnel at the wrappers with --ffmpeg or VIDFUNNEL_FFMPEG.
 # See HANDOFF.md section 8. Idempotent: safe to re-run.
 
-VERSION="20261102"
+VERSION="20261107"
 
 set -eu
 
@@ -34,7 +34,9 @@ Options:
   --version          print the script version
   -h, --help         this text
 
-Afterwards: vidfunnel --ffmpeg ${TOOLS_DIR}/ffmpeg ...
+Afterwards, either per call:    vidfunnel --ffmpeg ${TOOLS_DIR}/ffmpeg ...
+or once per shell (or in ~/.bashrc, ~/.zshrc):
+    export VIDFUNNEL_FFMPEG=${TOOLS_DIR}/ffmpeg
 EOF
 }
 
@@ -157,8 +159,10 @@ fi
 
 say ""
 if [ "${fail}" -eq 0 ]; then
-    say "All good. '${TOOLS_DIR}' is not on PATH on purpose; use:"
+    say "All good. '${TOOLS_DIR}' is not on PATH on purpose. Either pass the wrapper per call:"
     say "  vidfunnel --ffmpeg ${TOOLS_DIR}/ffmpeg ..."
+    say "or set it once for the shell (add the line to ~/.bashrc or ~/.zshrc to keep it):"
+    say "  export VIDFUNNEL_FFMPEG=${TOOLS_DIR}/ffmpeg"
 else
     die "something is missing (see above); the image or its packages may have changed"
 fi
