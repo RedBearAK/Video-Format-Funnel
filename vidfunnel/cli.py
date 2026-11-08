@@ -4,6 +4,15 @@ Each subcommand lives in the module named for its stage (HANDOFF.md
 section 7) and exposes `add_arguments(parser)` and `run(args) -> int`.
 Modules are imported lazily by name, so a stage that is not built yet
 shows up as a stub that says so and exits with EXIT_ERROR, never silently.
+
+SIGTERM (kill, or 'podman stop', where vidfunnel runs as the container's
+PID 1 and would otherwise ignore it) is handled like Ctrl+C: the handler
+sets vidfunnel.interrupt.interrupted, sends SIGTERM to the ffmpeg and par2
+children that vidfunnel.ffmpeg has registered (a signal to the Python
+process alone does not reach them, unlike Ctrl+C to a terminal's process
+group), and raises Terminated, a KeyboardInterrupt, so the same finally
+blocks release folder locks and remove part files. main() then prints
+'vidfunnel: terminated' and returns EXIT_ERROR.
 """
 
 VERSION = "20261107"
@@ -12,7 +21,9 @@ import argparse
 import importlib
 import os
 import pkgutil
+import signal
 import sys
+import threading
 
 import vidfunnel
 
@@ -163,6 +174,44 @@ def dispatch(args):
     return EXIT_USAGE
 
 
+# Set by the first SIGTERM; a second one only signals the children again, so it cannot cut the
+# cleanup that the first one started (finally blocks releasing locks, removing part files) short.
+_terminating = threading.Event()
+
+
+class Terminated(KeyboardInterrupt):
+    """Raised on the main thread by the SIGTERM handler; handled like Ctrl+C, reported as 'terminated'."""
+
+
+def _on_sigterm(signum, frame):
+    """Set the interrupt event, pass SIGTERM to the registered children, raise Terminated (once)."""
+    from vidfunnel.ffmpeg import terminate_children
+    from vidfunnel.interrupt import interrupted
+    first = not _terminating.is_set()
+    _terminating.set()
+    interrupted.set()
+    terminate_children()
+    if first:
+        raise Terminated()
+
+
+def install_sigterm_handler():
+    """Install _on_sigterm; returns the handler it replaced, or None when it installed nothing.
+
+    Only on the main thread (signal.signal works nowhere else) and only
+    while SIGTERM has its default action, so an embedding program's own
+    handler, or an ignored SIGTERM, is left alone.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return None
+    import vidfunnel.ffmpeg  # imported here, not inside the handler, which must not wait on an import lock
+    previous = signal.getsignal(signal.SIGTERM)
+    if previous is not signal.SIG_DFL:
+        return None
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    return previous
+
+
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -175,10 +224,19 @@ def main(argv=None):
     if args.command is None:
         parser.print_help()
         return EXIT_USAGE
+    previous = install_sigterm_handler()
     try:
         return dispatch(args)
-    except KeyboardInterrupt:
-        print("\nvidfunnel: interrupted", file=sys.stderr)
+    except KeyboardInterrupt as error:
+        terminated = isinstance(error, Terminated) or _terminating.is_set()
+        print("\nvidfunnel: {}".format("terminated" if terminated else "interrupted"), file=sys.stderr)
         return EXIT_ERROR
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
+            if _terminating.is_set():
+                from vidfunnel.interrupt import interrupted
+                interrupted.clear()
+                _terminating.clear()
 
 # End of File #

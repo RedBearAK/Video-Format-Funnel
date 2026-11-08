@@ -1,17 +1,21 @@
 """Tests for the command-line entry points: --version, dispatch, the launcher."""
 
-VERSION = "20261102"
+VERSION = "20261107"
 
 import contextlib
 import io
 import os
 import pathlib
 import re
+import signal
 import subprocess
+import threading
+import time
 import unittest
 import unittest.mock
 
 import vidfunnel
+import vidfunnel.interrupt
 from vidfunnel import cli
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -119,6 +123,71 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(args.ffmpeg, "/opt/ff/ffmpeg")
         self.assertTrue(args.quiet)
         self.assertEqual(args.command, "check")
+
+
+class SigtermTests(unittest.TestCase):
+    """main() handles SIGTERM like Ctrl+C while a command runs, and puts the previous handler back."""
+
+    def setUp(self):
+        previous = signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+        self.addCleanup(vidfunnel.interrupt.interrupted.clear)
+
+    def run_with_dispatch(self, dispatch):
+        with unittest.mock.patch.object(cli, "dispatch", side_effect=dispatch):
+            return run_main(["check"])
+
+    def test_handler_is_installed_during_the_command_and_removed_after(self):
+        seen = []
+        code, _out, err = self.run_with_dispatch(lambda args: seen.append(signal.getsignal(signal.SIGTERM)) or 0)
+        self.assertEqual((code, err), (cli.EXIT_OK, ""))
+        self.assertEqual(seen, [cli._on_sigterm])
+        self.assertIs(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+
+    def test_sigterm_during_a_command_is_reported_as_terminated(self):
+        def dispatch(args):
+            # Without the handler this SIGTERM would end the test run itself.
+            if signal.getsignal(signal.SIGTERM) is not cli._on_sigterm:
+                raise AssertionError("main() installed no SIGTERM handler")
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(5)  # the handler raises Terminated before this ends
+            return cli.EXIT_OK
+
+        started = time.monotonic()
+        code, _out, err = self.run_with_dispatch(dispatch)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertEqual(code, cli.EXIT_ERROR)
+        self.assertIn("vidfunnel: terminated", err)
+        self.assertNotIn("interrupted", err)
+        self.assertFalse(vidfunnel.interrupt.interrupted.is_set(), "the event outlived the terminated command")
+        self.assertFalse(cli._terminating.is_set())
+        self.assertIs(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+
+    def test_ctrl_c_is_still_reported_as_interrupted(self):
+        def dispatch(args):
+            raise KeyboardInterrupt()
+
+        code, _out, err = self.run_with_dispatch(dispatch)
+        self.assertEqual(code, cli.EXIT_ERROR)
+        self.assertIn("vidfunnel: interrupted", err)
+
+    def test_an_existing_handler_is_left_alone(self):
+        def own_handler(signum, frame):
+            pass
+
+        signal.signal(signal.SIGTERM, own_handler)
+        seen = []
+        self.run_with_dispatch(lambda args: seen.append(signal.getsignal(signal.SIGTERM)) or 0)
+        self.assertEqual(seen, [own_handler])
+        self.assertIs(signal.getsignal(signal.SIGTERM), own_handler)
+
+    def test_nothing_is_installed_off_the_main_thread(self):
+        result = []
+        thread = threading.Thread(target=lambda: result.append(cli.install_sigterm_handler()))
+        thread.start()
+        thread.join()
+        self.assertEqual(result, [None])
+        self.assertIs(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
 
 
 class LauncherTests(unittest.TestCase):

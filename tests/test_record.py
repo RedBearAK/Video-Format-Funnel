@@ -1,11 +1,14 @@
 """Tests for vidfunnel.record: paths, atomic saves, fingerprints, hashes, stages, lock."""
 
-VERSION = "20261102"
+VERSION = "20261107"
 
 import datetime
 import hashlib
 import json
 import os
+import socket
+import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
@@ -312,7 +315,7 @@ class FolderLockTests(TempDirCase):
         with FolderLock(self.base):
             content = json.loads(self.lock_file().read_text(encoding="utf-8"))
             self.assertEqual(content["pid"], os.getpid())
-            self.assertEqual(sorted(content), ["host", "pid", "started"])
+            self.assertEqual(sorted(content), ["container", "host", "pid", "started"])
             with self.assertRaises(LockHeld) as caught:
                 with FolderLock(self.base):
                     pass
@@ -342,6 +345,120 @@ class FolderLockTests(TempDirCase):
                 pass
         self.assertEqual(caught.exception.host, "otherhost")
         self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), foreign)
+
+    def write_lock(self, host, pid, hours_ago, container=None):
+        started = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours_ago)
+        content = {"host": host, "pid": pid, "started": started.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        if container is not None:
+            content["container"] = container
+        write_bytes(self.lock_file(), json.dumps(content).encode("utf-8"))
+        return content
+
+    def finished_pid(self):
+        """The pid of a child that has exited and been reaped, so no process holds it (barring reuse)."""
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        return child.pid
+
+    def test_dead_holder_on_this_host_is_taken_over_at_once(self):
+        dead = self.finished_pid()
+        self.write_lock(socket.gethostname(), dead, 0.5, container=False)
+        warnings = []
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with FolderLock(self.base, warn=warnings.append):
+                content = json.loads(self.lock_file().read_text(encoding="utf-8"))
+                self.assertEqual(content["pid"], os.getpid())
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("pid {}".format(dead), warnings[0])
+        self.assertIn("no longer runs", warnings[0])
+        self.assertRegex(warnings[0], r"lock written 18[0-9][0-9] s ago")
+        self.assertFalse(self.lock_file().exists())
+
+    def test_dead_holder_in_a_lock_without_the_container_field_is_taken_over(self):
+        dead = self.finished_pid()
+        self.write_lock(socket.gethostname(), dead, 0.1)
+        warnings = []
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with FolderLock(self.base, warn=warnings.append):
+                pass
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("pid {}".format(dead), warnings[0])
+
+    def test_live_holder_on_this_host_is_respected(self):
+        held = self.write_lock(socket.gethostname(), os.getpid(), 0.5, container=False)
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with self.assertRaises(LockHeld) as caught:
+                with FolderLock(self.base, warn=self.fail):
+                    pass
+        self.assertIn("still running", str(caught.exception))
+        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), held)
+
+    def test_live_holder_on_this_host_is_respected_even_when_old(self):
+        held = self.write_lock(socket.gethostname(), os.getpid(), 30, container=False)
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with self.assertRaises(LockHeld):
+                with FolderLock(self.base, warn=self.fail):
+                    pass
+        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), held)
+
+    def test_holder_we_may_not_signal_counts_as_alive(self):
+        held = self.write_lock(socket.gethostname(), 4242, 0.5, container=False)
+        with mock.patch("vidfunnel.record.in_container", return_value=False), \
+                mock.patch("vidfunnel.record.os.kill", side_effect=PermissionError("not ours")):
+            with self.assertRaises(LockHeld):
+                with FolderLock(self.base, warn=self.fail):
+                    pass
+        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), held)
+
+    def test_other_host_with_a_dead_looking_pid_is_respected_until_stale(self):
+        dead = self.finished_pid()
+        held = self.write_lock("otherhost", dead, 23, container=False)
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with self.assertRaises(LockHeld) as caught:
+                with FolderLock(self.base, warn=self.fail):
+                    pass
+            self.assertIn("another host name", str(caught.exception))
+            self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), held)
+            self.write_lock("otherhost", dead, 25, container=False)
+            warnings = []
+            with FolderLock(self.base, warn=warnings.append):
+                pass
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("stale lock", warnings[0])
+
+    def test_container_lock_with_our_host_name_is_judged_by_age(self):
+        dead = self.finished_pid()
+        held = self.write_lock(socket.gethostname(), dead, 1, container=True)
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with self.assertRaises(LockHeld) as caught:
+                with FolderLock(self.base, warn=self.fail):
+                    pass
+        self.assertIn("held by a container run", str(caught.exception))
+        self.assertIn("a container run on host", str(caught.exception))
+        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), held)
+
+    def test_container_marker_is_written_and_read(self):
+        markers = []
+
+        def exists(path):
+            markers.append(path)
+            return path == "/run/.containerenv"
+
+        with mock.patch("vidfunnel.record.os.path.exists", side_effect=exists):
+            with FolderLock(self.base):
+                content = json.loads(self.lock_file().read_text(encoding="utf-8"))
+        self.assertIs(content["container"], True)
+        self.assertIn("/run/.containerenv", markers)
+        with mock.patch("vidfunnel.record.os.path.exists", return_value=False):
+            with FolderLock(self.base):
+                content = json.loads(self.lock_file().read_text(encoding="utf-8"))
+        self.assertIs(content["container"], False)
+        held = self.write_lock("0123abcdef45", 1, 2, container=True)
+        with self.assertRaises(LockHeld) as caught:
+            with FolderLock(self.base, warn=self.fail):
+                pass
+        self.assertIn("held by a container run", str(caught.exception))
+        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), held)
 
     def test_lock_removed_after_exception(self):
         with self.assertRaises(RuntimeError):

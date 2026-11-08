@@ -337,12 +337,67 @@ def _warn(message):
     sys.stderr.flush()
 
 
+# Files a container runtime leaves in the container's root: podman's and Docker's.
+CONTAINER_MARKERS = ("/run/.containerenv", "/.dockerenv")
+
+
+def in_container():
+    """True when this process runs inside a podman or Docker container (one of CONTAINER_MARKERS exists)."""
+    return any(os.path.exists(marker) for marker in CONTAINER_MARKERS)
+
+
+def pid_alive(pid):
+    """True when a process with this pid exists here, False when none does, None when that cannot be told.
+
+    os.kill(pid, 0) sends no signal; PermissionError means the process
+    exists under another user. A pid that is not a positive int gives None.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def _whole_seconds(age):
+    return "{:.0f}".format(age) if age is not None else "an unknown number of"
+
+
+def _unjudged_reason(host, holder_in_container, ours):
+    """Why a lock's pid could not be checked, for the LockHeld message."""
+    if holder_in_container:
+        return "held by a container run, whose pid cannot be checked from here; taken over once 24 h old"
+    if host != ours["host"]:
+        return "written on another host name, whose pid cannot be checked from here; taken over once 24 h old"
+    if ours["container"]:
+        return "written outside this container, whose pid cannot be checked from here; taken over once 24 h old"
+    return "its pid cannot be checked; taken over once 24 h old"
+
+
 class FolderLock:
     """Context manager holding '.vidfunnel/lock' for one folder.
 
-    Raises LockHeld when another holder's lock is younger than 24 h; an older
-    lock is taken over with a warning naming the stale holder. The lock file is
-    removed on exit, including on exception, if it is still ours.
+    The lock file holds host (socket.gethostname()), pid, started (ISO time)
+    and container (True when this run is inside a container: '/run/.containerenv'
+    or '/.dockerenv' exists). An existing lock written on this host is judged
+    by its pid: a holder that no longer runs (os.kill(pid, 0) raises
+    ProcessLookupError) is taken over at once with a message naming the dead
+    pid and the lock's age; a live one (or one we may not signal,
+    PermissionError) raises LockHeld. A lock from another host name is judged
+    by age alone, since its pid means nothing here: a container run shows
+    the container id as its host name and has a pid namespace of its own.
+    Such a lock raises LockHeld while it is younger than 24 h and is taken
+    over with a warning after that. A lock with the same host name written
+    by a run inside a container is also judged by age (the container's pid
+    namespace differs from ours), and so is a lock written on the host when
+    this run is inside a container. The lock file is removed on exit,
+    including on exception, if it is still ours.
     """
 
     def __init__(self, folder, warn=None, stale_seconds=LOCK_STALE_SECONDS):
@@ -378,7 +433,8 @@ class FolderLock:
 
     def acquire(self):
         record_dir(self.folder).mkdir(parents=True, exist_ok=True)
-        content = {"host": socket.gethostname(), "pid": os.getpid(), "started": now_iso()}
+        content = {"host": socket.gethostname(), "pid": os.getpid(), "started": now_iso(),
+                   "container": in_container()}
         text = _dump_json(content)
         try:
             handle = os.open(str(self.path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
@@ -388,14 +444,28 @@ class FolderLock:
                 return self.acquire()
             host = holder.get("host")
             pid = holder.get("pid")
-            if age < self.stale_seconds:
+            holder_in_container = holder.get("container") is True
+            holder_words = "a container run on host" if holder_in_container else "host"
+            liveness = None
+            if host == content["host"] and holder_in_container == content["container"]:
+                liveness = pid_alive(pid)
+            if liveness is False:
+                self.warn("warning: taking over lock '{}': its holder, host '{}' pid {}, no longer runs "
+                          "(lock written {} s ago)".format(self.path, host, pid, _whole_seconds(age)))
+                _write_json_atomic(self.path, content)
+            elif liveness is True or age < self.stale_seconds:
+                if liveness is True:
+                    why = "the process is still running"
+                else:
+                    why = _unjudged_reason(host, holder_in_container, content)
                 raise LockHeld(
-                    "folder '{}' is locked by host '{}' pid {} since {} ({:.0f} s ago); lock file '{}'".format(
-                        self.folder, host, pid, holder.get("started"), age, self.path),
+                    "folder '{}' is locked by {} '{}' pid {} since {} ({:.0f} s ago; {}); lock file '{}'".format(
+                        self.folder, holder_words, host, pid, holder.get("started"), age, why, self.path),
                     host=host, pid=pid, age_seconds=age)
-            self.warn("warning: taking over stale lock '{}' held by host '{}' pid {} since {} ({:.1f} h ago)".format(
-                self.path, host, pid, holder.get("started"), age / 3600.0))
-            _write_json_atomic(self.path, content)
+            else:
+                self.warn("warning: taking over stale lock '{}' held by {} '{}' pid {} since {} ({:.1f} h ago)".format(
+                    self.path, holder_words, host, pid, holder.get("started"), age / 3600.0))
+                _write_json_atomic(self.path, content)
         else:
             with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
                 stream.write(text)

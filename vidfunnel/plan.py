@@ -18,6 +18,9 @@ What the record carries for the later stages:
 - stages.plan.argv: ffmpeg argv, argv[0] the ffmpeg path, every path
   absolute, ending in the output path ('-f mp4' is explicit, so convert may
   substitute its '.part' name for the last element);
+- stages.plan.ffmpeg: {'path', 'version', 'configuration_sha256'} of the
+  ffmpeg the plan was made with (vidfunnel.ffmpeg.plan_identity), so convert
+  refuses to run the argv with a different build found at the same path;
 - stages.plan.sidecars: [{'path', 'argv', 'kind'}], one argv per subtitle
   sidecar, each ending in its own output path;
 - stages.plan.size_class ({'class', 'bits_per_pixel'}) and
@@ -74,7 +77,7 @@ from vidfunnel.analyze import (
     window_pass,
     PACKET_ENTRIES,
 )
-from vidfunnel.ffmpeg import DecodeResult, FfmpegError, classify_messages, ffprobe_json
+from vidfunnel.ffmpeg import DecodeResult, FfmpegError, classify_messages, ffprobe_json, plan_identity
 from vidfunnel.ffmpeg import capabilities as ffmpeg_capabilities
 from vidfunnel.ffmpeg import run as run_tool
 from vidfunnel.interrupt import check as check_interrupted
@@ -1107,7 +1110,8 @@ def _plan_one_locked(tools, work, options, folder_sources, capabilities, progres
             "options": _options_dict(options), "par2": getattr(options, "par2", None),
             "plain_mp4": bool(getattr(options, "plain_mp4", False)), "dvd_title": work.dvd_title, "argv": None,
             "sidecars": [], "output": {"name": None, "interim_name": None}, "predicted_score": None,
-            "keyframes": None, "size_class": None, "blockiness": None}
+            "keyframes": None, "size_class": None, "blockiness": None,
+            "ffmpeg": plan_identity(tools.ffmpeg, capabilities)}
     input_args = input_arguments(work.inputs, work.dvd_title)
     try:
         if known_probe is not None:

@@ -15,12 +15,13 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import threading
 from collections import namedtuple
 from pathlib import Path
 
-from vidfunnel.interrupt import Interrupted, child_interrupted
+from vidfunnel.interrupt import Interrupted, child_interrupted, interrupted
 from vidfunnel.interrupt import check as check_interrupted
 from vidfunnel.progress import say
 
@@ -357,12 +358,79 @@ def capabilities(tools, refresh=False):
     return result
 
 
+def configuration_sha256(configuration):
+    """SHA-256 (hex) of a parsed configuration list, joined back with shlex.join, UTF-8."""
+    return hashlib.sha256(shlex.join([str(part) for part in configuration or []]).encode("utf-8")).hexdigest()
+
+
+def plan_identity(path, caps):
+    """{'path', 'version', 'configuration_sha256'} of the ffmpeg at `path`, from its capabilities(). Pure.
+
+    What plan records under stages.plan.ffmpeg, so convert can tell whether
+    the ffmpeg named in the argv is still the build the plan was made with.
+    """
+    return {"path": str(path), "version": (caps or {}).get("version") or "",
+            "configuration_sha256": configuration_sha256((caps or {}).get("configuration"))}
+
+
+def current_identity(path):
+    """plan_identity() of the ffmpeg at `path` as it is now, from one `-version` call.
+
+    Raises FfmpegError or ToolNotFound when it does not run.
+    """
+    output = run([path, "-hide_banner", "-version"]).stdout
+    return {"path": str(path), "version": _version_string(output),
+            "configuration_sha256": configuration_sha256(_parse_configuration(output))}
+
+
 def clear_capabilities_cache():
     """Forget the in-process copies (the on-disk cache stays; capabilities(refresh=True) rewrites it)."""
     _capabilities_cache.clear()
 
 
 # --- runner and -progress parsing --------------------------------------------
+
+# Every child started by run() (and encode.write_par2) while it runs, so a SIGTERM to vidfunnel alone,
+# which unlike Ctrl+C in a terminal does not reach the children, can pass it on (terminate_children).
+# Reentrant: the SIGTERM handler runs on the main thread, possibly while that thread holds the lock.
+_children = set()
+_children_lock = threading.RLock()
+
+
+def register_child(process):
+    """Note a started child (a subprocess.Popen) until forget_child(); see terminate_children.
+
+    A child registered after the interrupt event was set (a SIGTERM that
+    arrived between its Popen and this call) is sent SIGTERM at once, since
+    terminate_children() ran before it was in the set.
+    """
+    with _children_lock:
+        _children.add(process)
+    if interrupted.is_set():
+        try:
+            process.send_signal(signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def forget_child(process):
+    with _children_lock:
+        _children.discard(process)
+
+
+def terminate_children(signum=signal.SIGTERM):
+    """Send `signum` to every registered child that is still running; returns how many were signalled."""
+    with _children_lock:
+        running = list(_children)
+    sent = 0
+    for process in running:
+        try:
+            process.send_signal(signum)  # a no-op for a child already reaped
+        except OSError:
+            continue
+        sent += 1
+    return sent
+
 
 
 def _number(text, kind):
@@ -429,6 +497,36 @@ def _error_message(argv, returncode, stderr):
     return message
 
 
+def _collect(process, progress):
+    """(stdout, stderr) of a started child, feeding -progress blocks to `progress` when given (see run)."""
+    if progress is None:
+        return process.communicate()
+    stderr_parts = []
+    reader = threading.Thread(target=lambda: stderr_parts.append(process.stderr.read()), daemon=True)
+    reader.start()
+    stdout_lines = []
+    block_lines = []
+    try:
+        for line in process.stdout:
+            stdout_lines.append(line)
+            block_lines.append(line)
+            if line.startswith("progress="):
+                block = parse_progress_block(block_lines)
+                block_lines = []
+                progress(block)
+        process.wait()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        reader.join()
+        process.stdout.close()
+        process.stderr.close()
+    stdout = "".join(stdout_lines)
+    stderr = "".join(stderr_parts)
+    return stdout, stderr
+
+
 def run(argv, progress=None, check=True):
     """Run argv (a list) and return CompletedRun(argv, returncode, stdout, stderr).
 
@@ -438,7 +536,8 @@ def run(argv, progress=None, check=True):
     by parse_progress_block. stderr is collected whole on a reader thread.
     check=True raises FfmpegError on a non-zero status. A missing executable
     raises ToolNotFound. If the callback raises (or Ctrl+C arrives), ffmpeg is
-    killed before the exception propagates.
+    killed before the exception propagates. The child is in the registry
+    of terminate_children() while it runs.
 
     While vidfunnel.interrupt.interrupted is set (Ctrl+C during a --jobs
     pool), no process is started and a child that exits non-zero is not
@@ -461,33 +560,11 @@ def run(argv, progress=None, check=True):
         raise ToolNotFound("'{}' does not exist".format(argv[0]))
     except PermissionError:
         raise ToolNotFound("'{}' is not executable".format(argv[0]))
-
-    if progress is None:
-        stdout, stderr = process.communicate()
-    else:
-        stderr_parts = []
-        reader = threading.Thread(target=lambda: stderr_parts.append(process.stderr.read()), daemon=True)
-        reader.start()
-        stdout_lines = []
-        block_lines = []
-        try:
-            for line in process.stdout:
-                stdout_lines.append(line)
-                block_lines.append(line)
-                if line.startswith("progress="):
-                    block = parse_progress_block(block_lines)
-                    block_lines = []
-                    progress(block)
-            process.wait()
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
-            reader.join()
-            process.stdout.close()
-            process.stderr.close()
-        stdout = "".join(stdout_lines)
-        stderr = "".join(stderr_parts)
+    register_child(process)
+    try:
+        stdout, stderr = _collect(process, progress)
+    finally:
+        forget_child(process)
 
     if child_interrupted(process.returncode):
         raise Interrupted("'{}' was stopped by the interrupt (status {})".format(

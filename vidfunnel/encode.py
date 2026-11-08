@@ -66,7 +66,7 @@ import time
 import types
 from pathlib import Path
 
-from vidfunnel.ffmpeg import FfmpegError, ToolNotFound
+from vidfunnel.ffmpeg import FfmpegError, ToolNotFound, current_identity, forget_child, register_child
 from vidfunnel.ffmpeg import run as run_tool
 from vidfunnel.interrupt import Interrupted, child_interrupted, run_pool
 from vidfunnel.interrupt import check as check_interrupted
@@ -219,8 +219,38 @@ def skip_reason(record, output_path):
     return None
 
 
+def plan_ffmpeg_problem(record):
+    """Why the ffmpeg at stages.plan.argv[0] is not the build the plan was made with, or None.
+
+    Compares its version and configuration hash now (one '-version' call,
+    vidfunnel.ffmpeg.current_identity) with stages.plan.ffmpeg. A record
+    planned before plan wrote that field (20261107) gives None and runs as
+    before. Call it once argv[0] is known to be an executable file.
+    """
+    plan = (record.get("stages") or {}).get("plan") or {}
+    if "ffmpeg" not in plan:
+        return None
+    recorded = plan["ffmpeg"]
+    path = plan["argv"][0]
+    if not isinstance(recorded, dict):
+        return "stages.plan.ffmpeg is not understood; plan again with --replan on this machine"
+    try:
+        current = current_identity(path)
+    except (FfmpegError, ToolNotFound) as error:
+        return "ffmpeg '{}' named in the plan does not run here ({}); plan again with --replan on this machine".format(
+            path, error)
+    if (current["version"] == recorded.get("version")
+            and current["configuration_sha256"] == recorded.get("configuration_sha256")):
+        return None
+    return ("the plan was made with ffmpeg {} at '{}' (configuration {}), but '{}' here is ffmpeg {} "
+            "(configuration {}); plan again with --replan on this machine".format(
+                recorded.get("version") or "of unknown version", recorded.get("path"),
+                str(recorded.get("configuration_sha256") or "unknown")[:12], current["path"],
+                current["version"] or "of unknown version", current["configuration_sha256"][:12]))
+
+
 def _refusal(record, folder, output_path):
-    """Why a record cannot be converted as it stands, or None. Touches nothing."""
+    """Why a record cannot be converted as it stands, or None. Writes nothing; runs 'ffmpeg -version' once."""
     status = record.get("status")
     if status != "planned":
         if status in DONE_STATUSES:
@@ -240,7 +270,7 @@ def _refusal(record, folder, output_path):
                 "plan again with --replan".format(argv[-1], output_path))
     if not (os.path.isfile(argv[0]) and os.access(argv[0], os.X_OK)):
         return "ffmpeg '{}' named in the plan does not exist here; plan again on this machine".format(argv[0])
-    return None
+    return plan_ffmpeg_problem(record)
 
 
 def _ours(tools, path, record):
@@ -289,6 +319,7 @@ def write_par2(output_path, redundancy, progress=None):
     process = subprocess.Popen(argv, cwd=str(output_path.parent), stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
                                encoding="utf-8", errors="replace")
+    register_child(process)
     collected = []
     reader = threading.Thread(target=lambda: collected.append(process.stdout.read()), daemon=True)
     reader.start()
@@ -304,6 +335,7 @@ def write_par2(output_path, redundancy, progress=None):
             if process.poll() is None:
                 process.kill()
                 process.wait()
+            forget_child(process)
             reader.join()
             process.stdout.close()
     if process.returncode != 0:
@@ -696,7 +728,7 @@ def _refit_plan_problem(record, output_path):
         return "ffmpeg '{}' named in the plan does not exist here".format(argv[0])
     if parse_crf(argv) is None:
         return "the planned command has no -crf"
-    return None
+    return plan_ffmpeg_problem(record)
 
 
 def refit_checks(tools, record, path):

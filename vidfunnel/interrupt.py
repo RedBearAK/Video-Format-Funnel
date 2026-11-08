@@ -18,6 +18,12 @@ run and write that into a record. The contract instead:
 - run_pool() starts no further task, waits for the running ones (which
   end at their next check), and raises KeyboardInterrupt again;
   vidfunnel.cli.main prints 'vidfunnel: interrupted'.
+
+SIGTERM goes to the Python process alone, so its children do not see it.
+vidfunnel.cli installs a handler that sets `interrupted` itself, sends
+SIGTERM to the children registered in vidfunnel.ffmpeg (which then end
+the way child_interrupted() expects), and raises a KeyboardInterrupt on
+the main thread; the contract above then applies unchanged.
 """
 
 VERSION = "20261107"

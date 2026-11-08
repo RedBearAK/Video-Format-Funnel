@@ -17,6 +17,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,7 @@ from vidfunnel.encode import (
     output_path_for,
     parse_crf,
     part_path,
+    plan_ffmpeg_problem,
     record_key,
     refit_argv,
     refit_crf,
@@ -43,7 +45,7 @@ from vidfunnel.encode import (
     skip_reason,
     write_par2,
 )
-from vidfunnel.ffmpeg import FfmpegError, ToolNotFound, find_tools
+from vidfunnel.ffmpeg import FfmpegError, ToolNotFound, current_identity, find_tools, plan_identity
 from vidfunnel.ffmpeg import run as ffmpeg_run
 from vidfunnel.plan import make_options, plan_paths
 from vidfunnel.record import cheap_fingerprint, load_record, record_path, save_record, set_status
@@ -161,6 +163,60 @@ class SkipReasonTest(unittest.TestCase):
         self.assertIsNone(skip_reason(self.record("converted", None), self.output))
         self.output.unlink()
         self.assertIsNone(skip_reason(self.record("converted", fingerprint), self.output))
+
+
+class PlanFfmpegTest(unittest.TestCase):
+    """plan_ffmpeg_problem against stand-in ffmpeg scripts that print a '-version' banner."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.ffmpeg = Path(self.temporary.name) / "ffmpeg"
+
+    def banner(self, version, configuration):
+        self.ffmpeg.write_text("#!/bin/sh\necho 'ffmpeg version {} Copyright (c) 2000-2026 the FFmpeg developers'\n"
+                               "echo 'configuration: {}'\n".format(version, configuration))
+        self.ffmpeg.chmod(self.ffmpeg.stat().st_mode | stat.S_IXUSR)
+
+    def record(self, recorded):
+        plan = {"argv": [str(self.ffmpeg), "-i", "in.avi", "-f", "mp4", "/library/out.mp4"]}
+        if recorded is not None:
+            plan["ffmpeg"] = recorded
+        return {"stages": {"plan": plan}}
+
+    def test_same_build_runs(self):
+        self.banner("8.1.3", "--enable-gpl --enable-libx264")
+        recorded = plan_identity(self.ffmpeg, {"version": "8.1.3", "configuration": ["--enable-gpl",
+                                                                                      "--enable-libx264"]})
+        self.assertEqual(recorded, current_identity(str(self.ffmpeg)))
+        self.assertIsNone(plan_ffmpeg_problem(self.record(recorded)))
+
+    def test_other_version_at_the_same_path_is_refused(self):
+        recorded = plan_identity(self.ffmpeg, {"version": "8.1.3", "configuration": ["--enable-libx264"]})
+        self.banner("7.1.5", "--enable-libx264")
+        problem = plan_ffmpeg_problem(self.record(recorded))
+        self.assertIn("ffmpeg 8.1.3 at '{}'".format(self.ffmpeg), problem)
+        self.assertIn("'{}' here is ffmpeg 7.1.5".format(self.ffmpeg), problem)
+        self.assertIn("plan again with --replan on this machine", problem)
+
+    def test_same_version_with_another_configuration_is_refused(self):
+        recorded = plan_identity(self.ffmpeg, {"version": "7.1.5", "configuration": ["--enable-libx264"]})
+        self.banner("7.1.5", "--disable-gpl")
+        problem = plan_ffmpeg_problem(self.record(recorded))
+        self.assertIn("ffmpeg 7.1.5 at", problem)
+        self.assertIn(recorded["configuration_sha256"][:12], problem)
+        self.assertIn("plan again with --replan on this machine", problem)
+
+    def test_record_without_the_field_runs_as_before(self):
+        self.banner("7.1.5", "--disable-gpl")
+        self.assertIsNone(plan_ffmpeg_problem(self.record(None)))
+
+    def test_malformed_field_or_an_ffmpeg_that_does_not_run_is_refused(self):
+        self.banner("7.1.5", "--disable-gpl")
+        self.assertIn("not understood", plan_ffmpeg_problem(self.record("7.1.5")))
+        self.ffmpeg.write_text("#!/bin/sh\nexit 3\n")
+        recorded = plan_identity(self.ffmpeg, {"version": "7.1.5", "configuration": ["--disable-gpl"]})
+        self.assertIn("does not run here", plan_ffmpeg_problem(self.record(recorded)))
 
 
 # --- integration --------------------------------------------------------------------------
@@ -300,6 +356,37 @@ class ConvertRunTest(unittest.TestCase):
         self.assertIn("source-changed", saved["flags"])
         self.assertNotIn("convert", saved["stages"])
         self.assertFalse((self.root / "h264_high_mkv_aac.mp4").exists())
+
+    def test_plan_records_the_ffmpeg_it_was_made_with(self):
+        record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
+        recorded = record["stages"]["plan"]["ffmpeg"]
+        self.assertEqual(recorded, current_identity(TOOLS.ffmpeg))
+        self.assertEqual(recorded["path"], record["stages"]["plan"]["argv"][0])
+        self.assertRegex(recorded["configuration_sha256"], "^[0-9a-f]{64}$")
+
+    def test_plan_made_with_another_ffmpeg_build_is_skipped_not_failed(self):
+        record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
+        record["stages"]["plan"]["ffmpeg"]["version"] = "8.1.3"
+        save_record(self.root / REMUX_SOURCE, record)
+        record_bytes = record_path(self.root / REMUX_SOURCE).read_bytes()
+        before = listing(self.root)
+        progress = quiet()
+        summary = convert_paths(TOOLS, [str(self.root)], convert_options(), progress)
+        text = progress.stream.getvalue()
+        self.assertEqual(summary.counts["skipped"], 1, text)
+        self.assertEqual(summary.counts["failed"], 0, text)
+        self.assertIn("the plan was made with ffmpeg 8.1.3 at '{}'".format(TOOLS.ffmpeg), text)
+        self.assertIn("here is ffmpeg {}".format(current_identity(TOOLS.ffmpeg)["version"]), text)
+        self.assertIn("plan again with --replan on this machine", text)
+        self.assertEqual(record_path(self.root / REMUX_SOURCE).read_bytes(), record_bytes)
+        self.assertEqual(listing(self.root), before)
+
+    def test_plan_without_the_ffmpeg_field_converts_as_before(self):
+        record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
+        del record["stages"]["plan"]["ffmpeg"]
+        save_record(self.root / REMUX_SOURCE, record)
+        stage = self.convert(REMUX_SOURCE, record)
+        self.assertEqual(stage["outcome"], "ok", stage)
 
     def test_bogus_codec_fails_with_stderr_and_no_part(self):
         record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
@@ -677,6 +764,28 @@ class RefitRunTest(unittest.TestCase):
         summary, text = self.refit()
         self.assertEqual(summary.counts["refitted"] + summary.counts["kept"], 0, text)
         self.assertEqual(summary.skip_reasons, {"already refitted": 1, "not larger": 1}, text)
+
+    def test_refit_of_a_plan_made_with_another_ffmpeg_build_is_skipped(self):
+        records = self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
+        record = records[REFIT_SOURCE]
+        self.assertIn("output-larger", record["flags"], "the fixture no longer re-encodes larger; pick another")
+        record["stages"]["plan"]["ffmpeg"]["configuration_sha256"] = "0" * 64
+        save_record(self.root / REFIT_SOURCE, record)
+        record_bytes = record_path(self.root / REFIT_SOURCE).read_bytes()
+        output_hash = sha256_of(self.root / REFIT_OUTPUT)
+        summary, text = self.refit()
+        self.assertEqual(summary.counts["refitted"] + summary.counts["kept"] + summary.counts["failed"], 0, text)
+        self.assertEqual(summary.counts["skipped"], 1, text)
+        self.assertIn("(configuration 000000000000), but '{}' here is ffmpeg".format(TOOLS.ffmpeg), text)
+        self.assertIn("plan again with --replan on this machine", text)
+        self.assertEqual(record_path(self.root / REFIT_SOURCE).read_bytes(), record_bytes)
+        self.assertEqual(sha256_of(self.root / REFIT_OUTPUT), output_hash)
+
+        del record["stages"]["plan"]["ffmpeg"]
+        save_record(self.root / REFIT_SOURCE, record)
+        with unittest.mock.patch("vidfunnel.encode._verify", side_effect=lambda tools, key, record, *rest: record):
+            summary, text = self.refit()
+        self.assertEqual(summary.counts["refitted"], 1, "a record without stages.plan.ffmpeg refits as before\n" + text)
 
     def test_reset_record_goes_through_a_separate_verify_run(self):
         self.plan_and_convert(REFIT_SOURCE, reencode_video=True)

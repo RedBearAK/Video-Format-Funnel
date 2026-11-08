@@ -1,16 +1,18 @@
 #!/bin/sh
 # vidfunnel-podman: run vidfunnel inside its container image. Every argument that
 # is an existing path on the host is bind-mounted read-write at the same absolute
-# path inside the container, as is the current directory (the container's working
-# directory), and the container runs as the invoking uid/gid. --quarantine and --db
-# targets are created on the host first and mounted. HOME is passed in, with its
-# vidfunnel state and cache folders mounted. --install-command and
+# path inside the container (and at its symlink-resolved path when that differs),
+# as is the current directory (the container's working directory), and the
+# container runs as the invoking uid/gid. --quarantine and --db targets are
+# created on the host first and mounted. HOME is passed in, with its vidfunnel
+# state and cache folders mounted. --ffmpeg is refused. --install-command and
 # --uninstall-command run on the host and link 'vidfunnel' to this wrapper.
 # See HANDOFF.md section 8.
 
 VERSION="20261107"
 
 set -eu
+unset CDPATH
 
 VIDFUNNEL_IMAGE_DIGEST=""
 
@@ -37,30 +39,57 @@ What the wrapper does:
   Every vidfunnel argument that is an existing file or folder on the host is
   resolved to an absolute path and bind-mounted read-write at the same path inside
   the container. The current directory is mounted too and used as the working
-  directory. A path inside another mounted folder is not mounted separately.
+  directory. A file argument mounts its folder, not the file alone, because
+  vidfunnel writes its records, output and sidecars beside the source. Each
+  folder is also mounted at its physical path (symlinks resolved, as 'pwd -P'
+  gives it) when that differs, and when the argument is a symlink, every link
+  on the way and the folder it ends in are mounted too, so a symlink inside a
+  mounted folder that points to another disk still leads somewhere inside the
+  container. A path inside another mounted folder is not mounted separately,
+  and '/' is never mounted (the wrapper stops instead).
   Paths that vidfunnel will create are prepared on the host first, so they are
   not written into the container's own filesystem (removed with the container):
     --quarantine DIR, --quarantine=DIR   DIR is created on the host (mkdir -p)
-                                         and mounted; after 'retire', the
-                                         abbreviations argparse accepts
-                                         (--quar DIR) are treated alike
+                                         and mounted
     --db PATH, --db=PATH                 the folder holding PATH is created on
                                          the host (mkdir -p) and mounted
+  Option values given with '=' are mounted like separate arguments when they
+  exist: report --from=REPORT and find --root=PATH. After the subcommand that
+  has the option, the abbreviations argparse accepts are treated like the full
+  name, with or without '=': --q (and longer) for --quarantine after 'retire';
+  --d for --db after 'index', 'find' and 'report'; --fr for --from after
+  'report'; --r for --root after 'find'. The full names --quarantine and --db
+  are prepared wherever they appear.
   A --quarantine directory that cannot be created or is still not under a
   mounted path stops the wrapper before the container starts.
+  --ffmpeg PATH and --ffmpeg=PATH (and their abbreviations, such as --ff) are
+  refused before the container starts: the image's own ffmpeg is the only one
+  that works inside it. VIDFUNNEL_FFMPEG from the host environment is not passed
+  into the container.
   The container gets your HOME (-e HOME=\$HOME), and the wrapper creates
   \$HOME/.local/state/vidfunnel (the index database) and \$HOME/.cache/vidfunnel
   (the ffmpeg capability cache) on the host and mounts both at the same path,
   so they persist between runs, are owned by you, and nothing reaches the
-  current directory by way of '~'. An unset or empty HOME stops the wrapper.
+  current directory by way of '~'. Without -e HOME, the passwd entry that
+  --userns=keep-id adds gives a home that is not usable ('/' on one host, the
+  working directory on another). Inside the container HOME's own directory is
+  root-owned and not writable; only the two mounted folders are, and vidfunnel
+  writes nothing else under HOME. Both folders are also mounted at their
+  physical path when ~/.cache or ~/.local/state is a symlink to another disk.
+  An unset or empty HOME stops the wrapper.
   The container runs with --rm, --userns=keep-id (podman) or --user uid:gid
   (docker) so files are owned by you, and --security-opt label=disable for SELinux
   hosts. It gets a terminal (-it) only when stdin is one.
 
 Installing the command:
-  --install-command and --uninstall-command, as the first vidfunnel argument
-  (after other options such as --yes), run on the host instead of in the
-  container: they make or remove a symlink 'vidfunnel' in ~/.local/bin (or
+  --install-command and --uninstall-command (or an abbreviation argparse
+  accepts, such as --install), given among the options before the subcommand,
+  run on the host instead of in the container. The wrapper looks for them up to
+  the first argument that is neither an option nor the value of --ffmpeg or
+  --launcher, and not past '--'; 'check --install-command' goes to the
+  container. They need neither podman nor docker. With --build, the image is
+  built first (which does need one of them), then the command is installed.
+  They make or remove a symlink 'vidfunnel' in ~/.local/bin (or
   /usr/local/bin with --system) pointing at this wrapper, so that 'vidfunnel'
   runs the container. With a python3 of 3.9 or newer on the host, the repo's
   own installer does it (with --launcher set to this wrapper), including the
@@ -132,20 +161,62 @@ install_hint() {
     esac
 }
 
-if command -v podman >/dev/null 2>&1; then
-    ENGINE="podman"
-elif command -v docker >/dev/null 2>&1; then
-    ENGINE="docker"
-    say "vidfunnel-podman: podman was not found, using 'docker' instead" >&2
-else
-    {
-        say "vidfunnel-podman: neither podman nor docker was found on PATH. Install podman with:"
-        install_hint
-    } >&2
-    exit 1
+is_option_prefix() {
+    case "$2" in "$1"*) ;; *) return 1 ;; esac
+    [ "${#1}" -ge "${#3}" ]
+}
+
+is_ffmpeg_option() { is_option_prefix "$1" "--ffmpeg" "--f"; }
+
+install_mode=""
+ffmpeg_given=""
+skip_value=0
+for arg in "$@"; do
+    if [ "${skip_value}" -eq 1 ]; then
+        skip_value=0
+        continue
+    fi
+    case "${arg}" in
+        --) break ;;
+        --*=*)
+            is_ffmpeg_option "${arg%%=*}" && ffmpeg_given="${arg}"
+            ;;
+        -*)
+            if is_option_prefix "${arg}" "--install-command" "--i"; then
+                install_mode="install"; break
+            elif is_option_prefix "${arg}" "--uninstall-command" "--un"; then
+                install_mode="uninstall"; break
+            elif is_ffmpeg_option "${arg}"; then
+                ffmpeg_given="${arg}"; skip_value=1
+            elif is_option_prefix "${arg}" "--launcher" "--l"; then
+                skip_value=1
+            fi
+            ;;
+        *) break ;;
+    esac
+done
+
+if [ -z "${install_mode}" ] && [ -n "${ffmpeg_given}" ]; then
+    die "'${ffmpeg_given}' is refused: the image's own ffmpeg is the only one that works inside the container (a host ffmpeg is not mounted and is usually built for another C library); leave --ffmpeg out"
 fi
 
+find_engine() {
+    if command -v podman >/dev/null 2>&1; then
+        ENGINE="podman"
+    elif command -v docker >/dev/null 2>&1; then
+        ENGINE="docker"
+        say "vidfunnel-podman: podman was not found, using 'docker' instead" >&2
+    else
+        {
+            say "vidfunnel-podman: neither podman nor docker was found on PATH. Install podman with:"
+            install_hint
+        } >&2
+        exit 1
+    fi
+}
+
 if [ "${BUILD}" -eq 1 ]; then
+    find_engine
     [ -f "${root}/Containerfile" ] || die "no Containerfile in '${root}'"
     say "Building image '${IMAGE}' from '${root}/Containerfile' with ${ENGINE}"
     "${ENGINE}" build -t "${IMAGE}" -f "${root}/Containerfile" "${root}"
@@ -154,16 +225,6 @@ if [ "${BUILD}" -eq 1 ]; then
         exit 0
     fi
 fi
-
-install_mode=""
-for arg in "$@"; do
-    case "${arg}" in
-        --install-command) install_mode="install"; break ;;
-        --uninstall-command) install_mode="uninstall"; break ;;
-        -*) ;;
-        *) break ;;
-    esac
-done
 
 host_python_ok() {
     command -v python3 >/dev/null 2>&1 || return 1
@@ -219,10 +280,14 @@ path_advice() {
 sh_install_command() {
     scope="user"
     for arg in "$@"; do
+        if is_option_prefix "${arg}" "--install-command" "--i" \
+            || is_option_prefix "${arg}" "--uninstall-command" "--un" \
+            || is_option_prefix "${arg}" "--yes" "--y"; then
+            continue
+        fi
         case "${arg}" in
-            --install-command|--uninstall-command|--yes) ;;
-            --user) scope="user" ;;
-            --system) scope="system" ;;
+            --us|--use|--user) scope="user" ;;
+            --s|--sy|--sys|--syst|--syste|--system) scope="system" ;;
             *) die "'${arg}' is not understood by the wrapper's own installer (it takes --user, --system and --yes)" ;;
         esac
     done
@@ -275,6 +340,8 @@ if [ -n "${install_mode}" ]; then
     exit 0
 fi
 
+[ -n "${ENGINE:-}" ] || find_engine
+
 state_dir="${HOME}/.local/state/vidfunnel"
 cache_dir="${HOME}/.cache/vidfunnel"
 
@@ -297,6 +364,7 @@ MOUNTS=""
 
 add_mount() {
     new="$1"
+    [ "${new}" != "/" ] || die "refusing to mount '/' into the container: it would cover the image's own root; give a path below it"
     kept=""
     old_list="${MOUNTS}"
     MOUNTS=""
@@ -315,32 +383,87 @@ add_mount() {
 "
 }
 
+mount_folder() {
+    logical=$(cd "$1" && pwd) || die "cannot resolve the folder '$1' to an absolute path"
+    add_mount "${logical}"
+    physical=$(cd "$1" && pwd -P) || die "cannot resolve the symlinks of the folder '$1'"
+    [ "${physical}" = "${logical}" ] || add_mount "${physical}"
+}
+
+mount_path() {
+    if [ -d "$1" ]; then
+        mount_folder "$1"
+    else
+        mount_folder "$(dirname -- "$1")"
+    fi
+    hop="$1"
+    hops=0
+    while [ -L "${hop}" ]; do
+        hops=$((hops + 1))
+        [ "${hops}" -le 40 ] || die "more than 40 symlinks lead from '$1'; not following them"
+        target=$(readlink -- "${hop}") || die "cannot read the symlink '${hop}'"
+        case "${target}" in
+            /*) ;;
+            *) target="$(cd "$(dirname -- "${hop}")" && pwd -P)/${target}" ;;
+        esac
+        [ -e "${target}" ] || die "the symlink '${hop}' leads to '${target}', which does not exist"
+        if [ -d "${target}" ] && [ -L "${target}" ]; then
+            add_mount "$(abs_path "${target}")"
+        elif [ -d "${target}" ]; then
+            mount_folder "${target}"
+        else
+            mount_folder "$(dirname -- "${target}")"
+        fi
+        hop="${target}"
+    done
+}
+
 CWD=$(pwd)
-add_mount "${CWD}"
+mount_path "${CWD}"
 
 for home_dir in "${state_dir}" "${cache_dir}"; do
     mkdir -p -- "${home_dir}" || die "cannot create '${home_dir}' on the host for the container's HOME"
-    add_mount "$(abs_path "${home_dir}")"
+    mount_path "${home_dir}"
 done
 
 QUARANTINES=""
 
-SEEN_RETIRE=0
+SUBCOMMAND=""
 
-is_quarantine_option() {
-    [ "$1" = "--quarantine" ] && return 0
-    [ "${SEEN_RETIRE}" -eq 1 ] || return 1
+path_option_kind() {
+    option_kind=""
     case "$1" in
-        --q*) case "--quarantine" in "$1"*) return 0 ;; esac ;;
+        --quarantine) option_kind="quarantine"; return 0 ;;
+        --db) option_kind="db"; return 0 ;;
     esac
-    return 1
+    case "${SUBCOMMAND}" in
+        retire)
+            is_option_prefix "$1" "--quarantine" "--q" && option_kind="quarantine" ;;
+        index)
+            is_option_prefix "$1" "--db" "--d" && option_kind="db" ;;
+        find)
+            if is_option_prefix "$1" "--db" "--d"; then
+                option_kind="db"
+            elif is_option_prefix "$1" "--root" "--r"; then
+                option_kind="existing"
+            fi
+            ;;
+        report)
+            if is_option_prefix "$1" "--db" "--d"; then
+                option_kind="db"
+            elif is_option_prefix "$1" "--from" "--fr"; then
+                option_kind="existing"
+            fi
+            ;;
+    esac
+    [ -n "${option_kind}" ]
 }
 
 prepare_quarantine() {
     [ -n "$1" ] || die "--quarantine needs a directory"
     mkdir -p -- "$1" || die "cannot create the quarantine directory '$1' on the host"
     q=$(abs_path "$1") || die "cannot resolve the quarantine directory '$1'"
-    add_mount "${q}"
+    mount_path "$1"
     QUARANTINES="${QUARANTINES}${q}
 "
 }
@@ -349,40 +472,50 @@ prepare_db() {
     [ -n "$1" ] || die "--db needs a path"
     db_parent=$(dirname -- "$1")
     mkdir -p -- "${db_parent}" || die "cannot create the folder '${db_parent}' for the index database on the host"
-    add_mount "$(abs_path "${db_parent}")"
+    mount_path "${db_parent}"
+}
+
+prepare_option_value() {
+    case "$1" in
+        quarantine) prepare_quarantine "$2" ;;
+        db) prepare_db "$2" ;;
+        existing) if [ -e "$2" ]; then mount_path "$2"; fi ;;
+    esac
 }
 
 count=$#
 i=0
 pending=""
+skip_value=0
 while [ "${i}" -lt "${count}" ]; do
     arg="$1"
     shift
-    if [ "${pending}" = "quarantine" ]; then
-        prepare_quarantine "${arg}"
+    if [ -n "${pending}" ]; then
+        prepare_option_value "${pending}" "${arg}"
         pending=""
-    elif [ "${pending}" = "db" ]; then
-        prepare_db "${arg}"
-        pending=""
+    elif [ "${skip_value}" -eq 1 ]; then
+        skip_value=0
     else
         case "${arg}" in
-            --db) pending="db" ;;
-            --db=*) prepare_db "${arg#--db=}" ;;
             --*=*)
-                if is_quarantine_option "${arg%%=*}"; then
-                    prepare_quarantine "${arg#*=}"
+                if path_option_kind "${arg%%=*}"; then
+                    prepare_option_value "${option_kind}" "${arg#*=}"
                 fi
                 ;;
-            retire) SEEN_RETIRE=1 ;;
-            *)
-                if is_quarantine_option "${arg}"; then
-                    pending="quarantine"
+            -*)
+                if path_option_kind "${arg}"; then
+                    pending="${option_kind}"
+                elif [ -z "${SUBCOMMAND}" ] && is_option_prefix "${arg}" "--launcher" "--l"; then
+                    skip_value=1
                 fi
+                ;;
+            *)
+                [ -n "${SUBCOMMAND}" ] || SUBCOMMAND="${arg}"
                 ;;
         esac
     fi
     if [ -e "${arg}" ]; then
-        add_mount "$(abs_path "${arg}")"
+        mount_path "${arg}"
     fi
     set -- "$@" "${arg}"
     i=$((i + 1))
