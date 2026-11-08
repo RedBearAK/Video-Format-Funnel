@@ -357,11 +357,14 @@ MACHINE_ID_FILES = ("/etc/machine-id", "/proc/sys/kernel/random/boot_id")
 
 
 def machine_id():
-    """An identity of this machine (and boot) for the lock file: /etc/machine-id, else the kernel boot id, else None.
+    """An identity of this machine for the lock file, or None when none can be found.
 
-    Two machines on one share may carry the same host name (fresh installs,
-    images); a pid is judged alive or dead only when the lock was written on
-    this very machine, which the host name alone cannot tell.
+    /etc/machine-id, else the kernel boot id (Linux), else the hardware
+    address uuid.getnode() reports (macOS has neither file), unless that is
+    the random value getnode falls back to (multicast bit set). Two machines
+    on one share may carry the same host name (fresh installs, images); a
+    pid is judged alive or dead only when the lock was written on this very
+    machine, which the host name alone cannot tell.
     """
     for path in MACHINE_ID_FILES:
         try:
@@ -371,7 +374,10 @@ def machine_id():
             continue
         if value:
             return value
-    return None
+    node = uuid.getnode()
+    if (node >> 40) & 1:  # a random 48-bit value, not a hardware address
+        return None
+    return "node-{:012x}".format(node)
 
 
 def pid_alive(pid):

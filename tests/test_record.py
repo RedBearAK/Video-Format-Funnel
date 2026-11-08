@@ -382,6 +382,17 @@ class FolderLockTests(TempDirCase):
         child.wait()
         return child.pid
 
+    def test_machine_id_falls_back_to_the_hardware_address_and_rejects_a_random_node(self):
+        # macOS has neither /etc/machine-id nor /proc; CI there found every pid unjudgeable.
+        absent = (str(self.base / "no-machine-id"), str(self.base / "no-boot-id"))
+        with mock.patch("vidfunnel.record.MACHINE_ID_FILES", absent), \
+                mock.patch("vidfunnel.record.uuid.getnode", return_value=0x001122334455):
+            self.assertEqual(machine_id(), "node-001122334455")
+        with mock.patch("vidfunnel.record.MACHINE_ID_FILES", absent), \
+                mock.patch("vidfunnel.record.uuid.getnode", return_value=0x011122334455):
+            self.assertIsNone(machine_id(), "the multicast bit marks getnode's random fallback")
+        self.assertIsNotNone(machine_id(), "this machine has an identity")
+
     def test_null_lock_file_is_judged_by_age_and_never_loops(self):
         # A lock file holding JSON null once sent acquire() into an endless loop (the base crashed on it).
         script = ("import sys; from vidfunnel.record import FolderLock, LockHeld\n"

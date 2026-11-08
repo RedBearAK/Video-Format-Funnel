@@ -379,7 +379,7 @@ class ConvertRunTest(unittest.TestCase):
 
     def test_plan_made_with_another_ffmpeg_build_is_skipped_not_failed(self):
         record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
-        record["stages"]["plan"]["ffmpeg"]["version"] = "8.1.3"
+        record["stages"]["plan"]["ffmpeg"]["version"] = OTHER_BUILD_VERSION  # can match no real ffmpeg
         save_record(self.root / REMUX_SOURCE, record)
         record_bytes = record_path(self.root / REMUX_SOURCE).read_bytes()
         before = listing(self.root)
@@ -388,7 +388,7 @@ class ConvertRunTest(unittest.TestCase):
         text = progress.stream.getvalue()
         self.assertEqual(summary.counts["skipped"], 1, text)
         self.assertEqual(summary.counts["failed"], 0, text)
-        self.assertIn("the plan was made with ffmpeg 8.1.3 at '{}'".format(TOOLS.ffmpeg), text)
+        self.assertIn("the plan was made with ffmpeg {} at '{}'".format(OTHER_BUILD_VERSION, TOOLS.ffmpeg), text)
         self.assertIn("here is ffmpeg {}".format(current_identity(TOOLS.ffmpeg)["version"]), text)
         self.assertIn("plan again with --replan on this machine", text)
         self.assertEqual(record_path(self.root / REMUX_SOURCE).read_bytes(), record_bytes)
@@ -698,6 +698,7 @@ class RefitRuleTest(unittest.TestCase):
 
 # --- refit: integration --------------------------------------------------------------------
 
+OTHER_BUILD_VERSION = "0.0.0-other-build"  # the CI container's ffmpeg is 8.1.3, so no real version may be used here
 REFIT_SOURCE = "h264_avi_mp3.avi"       # re-encoded with --reencode-video it comes out larger than the source
 REFIT_OUTPUT = "h264_avi_mp3.mp4"
 
