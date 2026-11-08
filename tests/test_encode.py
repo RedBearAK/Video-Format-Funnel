@@ -8,7 +8,7 @@ ends at 'converted' or 'verified' depends on whether vidfunnel.verify is
 present, so both are accepted.
 """
 
-VERSION = "20261102"
+VERSION = "20261107"
 
 import argparse
 import contextlib
@@ -26,12 +26,19 @@ import unittest.mock
 from pathlib import Path
 
 from vidfunnel.encode import (
+    REFIT_DENOISE,
     convert_one,
     convert_paths,
     expected_duration,
     output_path_for,
+    parse_crf,
     part_path,
     record_key,
+    refit_argv,
+    refit_crf,
+    refit_denoise,
+    refit_one,
+    refit_selection,
     run,
     skip_reason,
     write_par2,
@@ -52,7 +59,7 @@ def quiet():
 
 
 def convert_options(**values):
-    defaults = dict(par2=None, verbose=False, jobs=1, dry_run=False)
+    defaults = dict(par2=None, verbose=False, jobs=1, dry_run=False, refit=False)
     defaults.update(values)
     return types.SimpleNamespace(**defaults)
 
@@ -474,6 +481,307 @@ class ConvertRunTest(unittest.TestCase):
         self.assertTrue(any(".vol" in name for name in stage["par2_files"]), stage["par2_files"])
         for name in stage["par2_files"]:
             self.assertTrue((self.root / name).is_file(), name)
+
+
+# --- refit: pure --------------------------------------------------------------------------
+
+PLANNED_ARGV = ["/usr/bin/ffmpeg", "-hide_banner", "-i", "/library/clip.avi", "-map", "0:v:0", "-map", "0:a?",
+                "-vf", "setparams=range=tv", "-c:v", "libx264", "-preset", "slower", "-crf", "18",
+                "-profile:v", "high", "-c:a:0", "aac", "-filter:a:0", "aresample=async=1",
+                "-metadata", "vidfunnel={}", "-f", "mp4", "/library/clip.mp4"]
+
+
+def refit_record(**changes):
+    record = {"status": "verified", "action": "reencode", "flags": ["output-larger"], "stages": {}}
+    record.update(changes)
+    return record
+
+
+class RefitRuleTest(unittest.TestCase):
+
+    def test_parse_crf(self):
+        self.assertEqual(parse_crf(PLANNED_ARGV), 18)
+        self.assertIsNone(parse_crf(["ffmpeg", "-c:v", "copy", "out.mp4"]))
+        self.assertIsNone(parse_crf(["ffmpeg", "-crf", "eighteen", "out.mp4"]))
+        self.assertIsNone(parse_crf(["ffmpeg", "-crf"]))
+
+    def test_crf_steps_follow_the_size_ratio(self):
+        # ceil(ln(ratio) / 0.14): 1.05 -> 0.35 -> 1 step; 1.42 -> 2.50 -> 3 steps; 2.5 -> 6.54 -> 7 steps.
+        self.assertEqual(refit_crf(18, 1.05, 480), (19, 23, 1))
+        self.assertEqual(refit_crf(18, 1.42, 480), (21, 23, 3))
+        self.assertEqual(refit_crf(20, 1.42, 1080), (23, 24, 3))
+
+    def test_crf_caps_by_height(self):
+        self.assertEqual(refit_crf(18, 2.5, 480), (23, 23, 7))
+        self.assertEqual(refit_crf(20, 2.5, 1080), (24, 24, 7))
+        self.assertEqual(refit_crf(18, 2.5, 576)[1], 23)
+        self.assertEqual(refit_crf(19, 2.5, 577)[1], 24)
+        self.assertEqual(refit_crf(18, 2.5, None)[1], 23)
+
+    def test_ratio_not_above_one_gives_no_step(self):
+        self.assertEqual(refit_crf(18, 1.0, 480), (18, 23, 0))
+        self.assertEqual(refit_crf(18, 0.8, 480), (18, 23, 0))
+        self.assertEqual(refit_crf(23, 1.42, 480), (23, 23, 3))
+
+    def test_argv_with_a_filter_chain_and_denoise(self):
+        argv, chain = refit_argv(PLANNED_ARGV, 21, True, "/library/.clip.mp4.0f2b6c1e.part")
+        self.assertEqual(chain, REFIT_DENOISE + ",setparams=range=tv")
+        expected = list(PLANNED_ARGV)
+        expected[expected.index("-crf") + 1] = "21"
+        expected[expected.index("-vf") + 1] = chain
+        expected[-1] = "/library/.clip.mp4.0f2b6c1e.part"
+        self.assertEqual(argv, expected)
+        self.assertEqual(PLANNED_ARGV[PLANNED_ARGV.index("-crf") + 1], "18", "the planned argv must not change")
+
+    def test_argv_with_a_filter_chain_without_denoise(self):
+        argv, chain = refit_argv(PLANNED_ARGV, 21, False, "/library/part")
+        self.assertEqual(chain, "setparams=range=tv")
+        self.assertEqual(argv[argv.index("-vf") + 1], "setparams=range=tv")
+        self.assertEqual(argv[argv.index("-crf") + 1], "21")
+        self.assertEqual(argv[:-1][:argv.index("-crf")], PLANNED_ARGV[:PLANNED_ARGV.index("-crf")])
+
+    def test_argv_without_a_filter_chain(self):
+        bare = [item for position, item in enumerate(PLANNED_ARGV)
+                if item != "-vf" and (position == 0 or PLANNED_ARGV[position - 1] != "-vf")]
+        argv, chain = refit_argv(bare, 20, True, "/library/part")
+        self.assertEqual(chain, REFIT_DENOISE)
+        self.assertEqual(argv[argv.index("-c:v") - 2:argv.index("-c:v")], ["-vf", REFIT_DENOISE])
+        self.assertEqual(argv.count("-vf"), 1)
+        argv, chain = refit_argv(bare, 20, False, "/library/part")
+        self.assertIsNone(chain)
+        self.assertNotIn("-vf", argv)
+        self.assertEqual(len(argv), len(bare))
+
+    def test_argv_with_filter_v_spelling(self):
+        spelled = ["-filter:v" if item == "-vf" else item for item in PLANNED_ARGV]
+        argv, chain = refit_argv(spelled, 20, True, "/library/part")
+        self.assertEqual(argv[argv.index("-filter:v") + 1], REFIT_DENOISE + ",setparams=range=tv")
+        self.assertNotIn("-vf", argv)
+        self.assertEqual(argv[argv.index("-filter:a:0") + 1], "aresample=async=1")
+
+    def test_denoise_goes_after_a_cadence_filter(self):
+        chained = list(PLANNED_ARGV)
+        chained[chained.index("-vf") + 1] = "fieldmatch,decimate,setparams=range=tv"
+        _argv, chain = refit_argv(chained, 20, True, "/library/part", cadence_filter="fieldmatch,decimate")
+        self.assertEqual(chain, "fieldmatch,decimate," + REFIT_DENOISE + ",setparams=range=tv")
+
+    def test_argv_without_crf_is_refused(self):
+        with self.assertRaises(ValueError):
+            refit_argv(["ffmpeg", "-c:v", "copy", "-f", "mp4", "out.mp4"], 20, False, "part")
+
+    def test_selection(self):
+        self.assertIsNone(refit_selection(refit_record()))
+        self.assertIsNone(refit_selection(refit_record(status="converted")))
+        self.assertEqual(refit_selection(refit_record(status="planned")), "not converted")
+        self.assertEqual(refit_selection(refit_record(action="remux")), "not a re-encode")
+        self.assertEqual(refit_selection(refit_record(flags=[])), "not larger")
+        self.assertEqual(refit_selection(refit_record(flags=["output-larger", "fit-capped"])), "already capped")
+        self.assertEqual(refit_selection(refit_record(stages={"refit": {"outcome": "replaced"}})),
+                         "already refitted")
+        self.assertIsNone(refit_selection(refit_record(stages={"refit": {"outcome": "failed"}})))
+
+    def test_denoise_needs_heavy_class_and_high_blockiness(self):
+        def with_analysis(klass, score):
+            return refit_record(stages={"analyze": {"size_class": {"class": klass, "bits_per_pixel": 0.1},
+                                                    "blockiness": {"score": score}}})
+        self.assertTrue(refit_denoise(with_analysis("heavy", 3.5))[0])
+        self.assertFalse(refit_denoise(with_analysis("heavy", 3.4999))[0])
+        self.assertFalse(refit_denoise(with_analysis("near", 200.0))[0])
+        self.assertFalse(refit_denoise(with_analysis("heavy", None))[0])
+        denoise, reason = refit_denoise(refit_record())
+        self.assertFalse(denoise)
+        self.assertIn("planned before", reason)
+
+
+# --- refit: integration --------------------------------------------------------------------
+
+REFIT_SOURCE = "h264_avi_mp3.avi"       # re-encoded with --reencode-video it comes out larger than the source
+REFIT_OUTPUT = "h264_avi_mp3.mp4"
+
+
+@unittest.skipIf(TOOLS is None, "ffmpeg not found on PATH; refit integration tests skipped")
+class RefitRunTest(unittest.TestCase):
+
+    def setUp(self):
+        missing = [name for name in (REFIT_SOURCE, REENCODE_SOURCE, REMUX_SOURCE)
+                   if not os.path.exists(os.path.join(FIXTURE_DIR, name))]
+        if missing:
+            self.skipTest("fixtures missing ({}); run tests/make_fixtures.sh".format(", ".join(missing)))
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "library"
+        self.root.mkdir()
+
+    def plan_and_convert(self, *names, **plan_values):
+        for name in names:
+            shutil.copy2(os.path.join(FIXTURE_DIR, name), str(self.root / name))
+        plan_paths(TOOLS, [str(self.root)], make_options(**plan_values), progress=quiet())
+        progress = quiet()
+        convert_paths(TOOLS, [str(self.root)], convert_options(), progress)
+        return {name: load_record(self.root / name) for name in names}
+
+    def refit(self, **values):
+        progress = quiet()
+        summary = convert_paths(TOOLS, [str(self.root)], convert_options(refit=True, **values), progress)
+        return summary, progress.stream.getvalue()
+
+    def leftover_parts(self):
+        return [name for name in os.listdir(str(self.root)) if name.endswith(".part")]
+
+    def test_larger_reencode_is_refitted_replaced_and_verified(self):
+        records = self.plan_and_convert(REFIT_SOURCE, REENCODE_SOURCE, reencode_video=True)
+        record = records[REFIT_SOURCE]
+        self.assertIn("output-larger", record["flags"], "the fixture no longer re-encodes larger; pick another")
+        self.assertNotIn("output-larger", records[REENCODE_SOURCE]["flags"])
+        self.assertEqual(record["stages"]["plan"]["size_class"]["class"], "heavy")
+        self.assertGreaterEqual(record["stages"]["plan"]["blockiness"]["score"], 3.5)
+        source_size = (self.root / REFIT_SOURCE).stat().st_size
+        before_size = (self.root / REFIT_OUTPUT).stat().st_size
+        ratio = before_size / float(source_size)
+        self.assertGreater(ratio, 1.0)
+
+        summary, text = self.refit()
+        self.assertEqual(summary.counts["refitted"], 1, text)
+        self.assertEqual(summary.counts["kept"], 0, text)
+        self.assertEqual(summary.counts["failed"], 0, text)
+        self.assertEqual(summary.skip_reasons, {"not larger": 1}, text)
+        self.assertIn("[refit 1/1] '{}': CRF 18 -> 19, hqdn3d, ratio {:.2f}".format(REFIT_SOURCE, ratio), text)
+        self.assertEqual(self.leftover_parts(), [])
+
+        saved = load_record(self.root / REFIT_SOURCE)
+        stage = saved["stages"]["refit"]
+        self.assertEqual(stage["outcome"], "replaced")
+        attempt = stage["attempt"]
+        self.assertEqual((attempt["crf"], attempt["base_crf"], attempt["denoise"]), (19, 18, True))
+        self.assertTrue(attempt["filters"].startswith(REFIT_DENOISE + ","), attempt["filters"])
+        after_size = (self.root / REFIT_OUTPUT).stat().st_size
+        self.assertLess(after_size, before_size)
+        self.assertEqual(attempt["output_size"], after_size)
+        self.assertIn("refitted", saved["flags"])
+        self.assertEqual("output-larger" in saved["flags"], after_size > source_size)
+        self.assertEqual(saved["output"]["size"], after_size)
+        self.assertEqual(saved["status"], "verified", text)
+        self.assertEqual(saved["output"]["sha256"], sha256_of(self.root / REFIT_OUTPUT))
+        self.assertEqual(len(saved["stages"]["verify_history"]), 1)
+        self.assertEqual(saved["stages"]["verify"]["size"]["output"], after_size)
+        self.assertEqual(saved["stages"]["verify"]["identity"]["ok"], True)
+
+        from vidfunnel.verify import verify_record
+        again = verify_record(TOOLS, self.root / REFIT_SOURCE, saved, None, progress=quiet())
+        self.assertEqual(again["status"], "verified")
+        self.assertEqual(again["score"], saved["score"])
+
+        summary, text = self.refit()
+        self.assertEqual(summary.counts["refitted"] + summary.counts["kept"], 0, text)
+        self.assertEqual(summary.skip_reasons, {"already refitted": 1, "not larger": 1}, text)
+
+    def test_reset_record_goes_through_a_separate_verify_run(self):
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
+        with unittest.mock.patch("vidfunnel.encode._verify", side_effect=lambda tools, key, record, *rest: record):
+            summary, text = self.refit()
+        self.assertEqual(summary.counts["refitted"], 1, text)
+        saved = load_record(self.root / REFIT_SOURCE)
+        self.assertEqual(saved["status"], "converted")
+        self.assertNotIn("sha256", saved["output"])
+        self.assertNotIn("verify", saved["stages"])
+        self.assertNotIn("score", saved)
+        from vidfunnel import verify
+        args = argparse.Namespace(paths=[str(self.root)], ffmpeg=None, quiet=True, verbose=False, ssim_check=False,
+                                  ssim_threshold=0.97, samples=None, stream=io.StringIO())
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = verify.run(args)
+        self.assertEqual(code, 0, args.stream.getvalue())
+        verified = load_record(self.root / REFIT_SOURCE)
+        self.assertEqual(verified["status"], "verified")
+        self.assertEqual(verified["output"]["sha256"], sha256_of(self.root / REFIT_OUTPUT))
+
+    def test_refit_not_smaller_keeps_the_output_and_retire_refuses_it(self):
+        # Constructed: the planned CRF is lowered to 10, so the refit at CRF 11 comes out larger
+        # than the existing CRF 18 output.
+        record = self.plan_and_convert(REFIT_SOURCE, reencode_video=True)[REFIT_SOURCE]
+        argv = record["stages"]["plan"]["argv"]
+        argv[argv.index("-crf") + 1] = "10"
+        save_record(self.root / REFIT_SOURCE, record)
+        output_hash = sha256_of(self.root / REFIT_OUTPUT)
+        summary, text = self.refit()
+        self.assertEqual(summary.counts["kept"], 1, text)
+        self.assertEqual(summary.counts["refitted"], 0, text)
+        self.assertEqual(sha256_of(self.root / REFIT_OUTPUT), output_hash)
+        self.assertEqual(self.leftover_parts(), [])
+        saved = load_record(self.root / REFIT_SOURCE)
+        self.assertEqual(saved["status"], "verified")
+        self.assertEqual(saved["output"]["sha256"], output_hash)
+        self.assertIn("fit-capped", saved["flags"])
+        self.assertIn("output-larger", saved["flags"])
+        self.assertNotIn("refitted", saved["flags"])
+        stage = saved["stages"]["refit"]
+        self.assertEqual(stage["outcome"], "kept-existing")
+        self.assertIn("not smaller than the existing output", stage["reason"])
+        self.assertEqual(stage["attempt"]["crf"], 11)
+        self.assertGreater(stage["attempt"]["output_size"], saved["output"]["size"])
+        self.assertIn("kept the existing output, flagged 'fit-capped'", text)
+
+        summary, text = self.refit()
+        self.assertEqual(summary.skip_reasons, {"already capped": 1}, text)
+
+        from vidfunnel.retire import RetireRefused, check_eligible
+        with self.assertRaises(RetireRefused) as caught:
+            check_eligible(self.root / REFIT_SOURCE, saved, quiet=True)
+        self.assertEqual(caught.exception.reason, "output-larger")
+        self.assertTrue(check_eligible(self.root / REFIT_SOURCE, saved, quiet=True, allow_larger=True)["larger"])
+
+    def test_refit_that_fails_a_check_keeps_the_output(self):
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
+        output_hash = sha256_of(self.root / REFIT_OUTPUT)
+        with unittest.mock.patch("vidfunnel.encode.refit_checks", return_value="identity tag: made up for the test"):
+            summary, text = self.refit()
+        self.assertEqual(summary.counts["kept"], 1, text)
+        self.assertEqual(sha256_of(self.root / REFIT_OUTPUT), output_hash)
+        self.assertEqual(self.leftover_parts(), [])
+        saved = load_record(self.root / REFIT_SOURCE)
+        self.assertEqual(saved["stages"]["refit"]["reason"], "identity tag: made up for the test")
+        self.assertIn("fit-capped", saved["flags"])
+
+    def test_dry_run_prints_the_refit_command_and_writes_nothing(self):
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
+        before = listing(self.root)
+        record_bytes = record_path(self.root / REFIT_SOURCE).read_bytes()
+        summary, text = self.refit(dry_run=True)
+        self.assertIn("-crf 19", text)
+        self.assertIn("-vf hqdn3d=2:1:2:3,setparams=", text)
+        self.assertIn("would refit '{}'".format(REFIT_SOURCE), text)
+        self.assertEqual(listing(self.root), before)
+        self.assertEqual(record_path(self.root / REFIT_SOURCE).read_bytes(), record_bytes)
+
+    def test_without_refit_a_larger_output_is_left_alone(self):
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
+        record_bytes = record_path(self.root / REFIT_SOURCE).read_bytes()
+        output_hash = sha256_of(self.root / REFIT_OUTPUT)
+        progress = quiet()
+        summary = convert_paths(TOOLS, [str(self.root)], convert_options(), progress)
+        self.assertEqual(summary.counts["skipped"], 1, progress.stream.getvalue())
+        self.assertEqual(record_path(self.root / REFIT_SOURCE).read_bytes(), record_bytes)
+        self.assertEqual(sha256_of(self.root / REFIT_OUTPUT), output_hash)
+
+    def test_changed_output_is_skipped_with_its_reason(self):
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
+        with open(str(self.root / REFIT_OUTPUT), "ab") as handle:
+            handle.write(b"x")
+        record_bytes = record_path(self.root / REFIT_SOURCE).read_bytes()
+        record = load_record(self.root / REFIT_SOURCE)
+        outcome, reason = refit_one(TOOLS, self.root / REFIT_SOURCE, record, convert_options(), quiet())
+        self.assertEqual(outcome, "skipped")
+        self.assertIn("changed since convert", reason)
+        self.assertEqual(record_path(self.root / REFIT_SOURCE).read_bytes(), record_bytes)
+        (self.root / REFIT_OUTPUT).unlink()
+        outcome, reason = refit_one(TOOLS, self.root / REFIT_SOURCE, record, convert_options(), quiet())
+        self.assertEqual((outcome, reason), ("skipped", "output '{}' is missing".format(REFIT_OUTPUT)))
+
+    def test_refit_option_parses(self):
+        from vidfunnel import cli
+        args = cli.build_parser().parse_args(["convert", "--refit", "somewhere"])
+        self.assertTrue(args.refit)
+        self.assertFalse(cli.build_parser().parse_args(["convert"]).refit)
 
 
 @unittest.skipIf(shutil.which("par2") is None, "par2 not on PATH; write_par2 test skipped")

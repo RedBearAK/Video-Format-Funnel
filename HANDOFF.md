@@ -32,6 +32,8 @@ Disk space is secondary to compatibility. AV1 and HEVC are not goals; H.264 is t
 
 Deinterlacing and telecine handling: §4.3.
 
+`convert --refit` (§6.3) may raise the CRF of a re-encode that came out larger than its source, capped at 23 for sources up to 576 lines and 24 above; past those the output is no longer treated as transparent, and the existing output is kept instead.
+
 ### 2.2 Audio
 
 | Source | Action |
@@ -163,6 +165,9 @@ Each converted file gets a score from 100 minus the penalties above, plus post-c
 | Identity tag missing or naming another record or source | −100 |
 | Optional sampled SSIM against source below threshold (`--ssim-check`, default off, threshold 0.97 on luma) | −25 |
 | Quarantined for any reason | 0 |
+| Size class (`stages.analyze.size_class`: bits per pixel per frame, classes `heavy` < 0.15, `near` to 0.4, `smaller` to 1.0, `much-smaller` above) and blockiness (`stages.analyze.blockiness`: mean blockdetect score over the sample windows, "not measured" without the filter) | 0, informational; read by `convert --refit` |
+| Refit replaced the output (flag `refitted`) | 0, informational; the replaced output is verified and scored again |
+| Refit kept the existing output (flag `fit-capped`) | 0, informational; the record keeps `output-larger` and `retire` still needs `--allow-larger` |
 
 Bands: ≥ 90 `ok`, 60–89 `review`, < 60 `hold`. The report sorts ascending so the worst conversions are at the top for hand checking. `retire` (§6.5) refuses `hold` and, without `--allow-review`, refuses `review`.
 
@@ -173,7 +178,7 @@ Every stage is a separate subcommand, idempotent, and resumable. State lives in 
 ```
 vidfunnel check
 vidfunnel plan   [--samples N] [--full-analysis] [--assume-dar R] [--audio-offset S] [--audio-strict-aac] [--reencode-video] [--max-level 4.1|4.2] [--plain-mp4] [--par2 N] [--replan] [PATH...]
-vidfunnel convert [--par2 N] [--jobs N] [--dry-run] [PATH...]
+vidfunnel convert [--par2 N] [--jobs N] [--dry-run] [--refit] [PATH...]
 vidfunnel verify [PATH...]
 vidfunnel report [--format md|json|csv] [--min-score N] [--reveal] [--with-logs] PATH...
 vidfunnel report --from REPORT [--reveal]
@@ -199,6 +204,8 @@ Probe + analysis (§4), writes the JSON record with the full decision list, the 
 ### 6.3 `convert`
 
 Runs the planned command to a temp file in the same directory (`.NAME.mp4.part`), renames into place on success, sets mtime, writes PAR2 if asked, then runs `verify` on the result. `--jobs N` parallelises at the file level; x264 already uses all cores for one file, so the default is 1 and `--jobs` is for remux-heavy sets. `--dry-run` prints the commands only. A file whose record says `converted` or `verified` and whose output still matches its cheap fingerprint (size, mtime, first and last MiB, §6.7) is skipped; a failed run leaves the record at `failed` with the ffmpeg stderr, and the `.part` file is removed.
+
+`--refit` (built 2026-11-07) revisits re-encodes flagged `output-larger` (status `converted` or `verified`, no `fit-capped`, no completed refit) instead of planned records. It runs the planned command once more with the CRF raised by `ceil(ln(ratio) / 0.14)`, where ratio is output size over source size (one CRF step is about 12 to 15 % of size), capped at 23 up to 576 lines and 24 above (§2.1). When the analysis put the source in the `heavy` size class and its blockiness is at or above 3.5, `hqdn3d=2:1:2:3` goes into the video filter chain, first or right after the cadence filter. The result goes to the part file; it replaces the output only when it is smaller and passes the identity, stream-count and duration checks of §6.4, after which the record returns to `converted` with its verify stage moved to history, gets the flag `refitted`, loses `output-larger` only when the new output is no larger than the source, has its PAR2 written again when convert wrote one, and is verified straight away. Otherwise the part file is removed, the output is kept, and the record gets the flag `fit-capped`. The attempt (CRF, filters, size, ratio, time) and the outcome are recorded under `stages.refit`; an attempt whose ffmpeg run failed is recorded as `failed` and tried again on the next `--refit` run. `--dry-run` prints the refit commands.
 
 ### 6.4 `verify`
 

@@ -7,7 +7,7 @@ fixture folder itself is never planned) and skip with a message when
 ffmpeg or the fixtures are missing.
 """
 
-VERSION = "20261102"
+VERSION = "20261107"
 
 import contextlib
 import copy
@@ -29,6 +29,7 @@ from vidfunnel.plan import (
     PROFILE,
     PlanError,
     build_argv,
+    plan_size_entries,
     build_sidecar_argvs,
     crf_for_height,
     decide_action,
@@ -397,6 +398,19 @@ class DecideActionTest(unittest.TestCase):
         for key in ("tff", "bff", "progressive", "undetermined"):
             broken["cadence"]["idet"]["totals"][key] = 0
         self.assertEqual(decide_action(probe, broken, make_options(), {}), ("quarantine", "decode-failed"))
+
+
+class PlanSizeEntriesTest(unittest.TestCase):
+
+    def test_entries_copied_from_the_analysis(self):
+        analysis = {"size_class": {"bits_per_pixel": 0.1035, "class": "heavy", "reason": "words"},
+                    "blockiness": {"score": 209.88, "frames": 125, "reason": "words"}}
+        self.assertEqual(plan_size_entries(analysis),
+                         ({"class": "heavy", "bits_per_pixel": 0.1035}, {"score": 209.88}))
+
+    def test_analysis_without_the_entries(self):
+        self.assertEqual(plan_size_entries({}), (None, None))
+        self.assertEqual(plan_size_entries(None), (None, None))
 
 
 # --- names and sources on a temporary tree ---------------------------------------------

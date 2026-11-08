@@ -205,7 +205,28 @@ Options:
 - `--dry-run` prints the commands and writes nothing.
 - `--jobs N` converts N files at once. The default is 1, because x264 already uses every core for one file; `--jobs` is for remux-heavy sets.
 - `--par2 N` writes PAR2 with N % redundancy, overriding the planned value (10 is a reasonable choice).
+- `--refit` revisits re-encodes that came out larger than their sources, described below.
 A re-encode that comes out larger than its source is kept like any other output and flagged `output-larger`, with both sizes in the record; convert prints `output is larger than the source (N > M bytes); kept and flagged 'output-larger'`. `retire` refuses such a record unless `--allow-larger` is given, so you can compare the two files first. Remuxes are exempt from this size rule: only the container changed, and fragment headers can make a small file grow slightly. A larger remux is kept and flagged `remux-larger` for information.
+
+`convert --refit` gives those larger re-encodes one more try. It selects the records under the given paths that are `converted` or `verified`, re-encoded, flagged `output-larger` and not yet flagged `fit-capped`; the rest are skipped and counted by reason (`not converted`, `not a re-encode`, `not larger`, `already capped`, `already refitted`). For each selected record it raises the CRF of the planned command by `ceil(ln(ratio) / 0.14)` steps, where `ratio` is the output size over the source size: one CRF step changes the size by roughly 12 to 15 %, so an output 1.42 times its source goes from CRF 18 to 21. The CRF is capped at 23 for sources up to 576 lines and at 24 above, chosen as the point past which x264 stops being transparent on this kind of material. When `plan` measured the source as heavily compressed (fewer than 0.15 bits per pixel per frame) and blocky (blockdetect's score at or above 3.5), a light `hqdn3d=2:1:2:3` denoise goes into the filter chain as well (first, or right after the deinterlacing or inverse-telecine filter), so the encoder spends fewer bits on the blocks. The rest of the command stays as planned, and the result is written to the hidden part file. If it is smaller than the existing output and passes the identity, stream and duration checks, it replaces the output, the record gets the flag `refitted` and goes back to `converted`, and `verify` runs on it as after a conversion; `output-larger` is removed only when the new output is no larger than the source. Otherwise the part file is deleted, the existing output is kept, and the record gets the flag `fit-capped` with the attempt and the reason. The record holds the CRF, the filters, the size and the ratio of the attempt. A record gets one refit; only an attempt whose ffmpeg run failed is tried again on a later `--refit` run. `--dry-run` with `--refit` prints the refit commands and writes nothing.
+
+```
+vidfunnel convert --refit "Home Videos"
+```
+
+```
+[refit 1/1] 'Web clip 2006.avi': CRF 18 -> 19, hqdn3d, ratio 1.08
+  size class 'heavy' and blockiness 173.8731 at or above 3.5: hqdn3d=2:1:2:3
+[refit] 00:00:05 / 00:00:05  97.7 %  0 fps  13.8x  eta 00:00:00
+  refit 'Web clip 2006.avi': CRF 18 -> 19, hqdn3d, ratio 1.08 -> 1.05; replaced 'Web clip 2006.mp4' (123535 bytes, was 126343); still larger than the source, 'output-larger' kept
+verifying 'Web clip 2006.mp4' (121 KiB)
+[verify decode] 00:00:05 / 00:00:05  97.8 %  0 fps  162.0x  eta 00:00:00
+  verified 'Web clip 2006.mp4': score 100 (ok); frames 124 of 125 expected, duration delta 0.12 s
+skipped: 1 not larger
+convert --refit: 1 refitted, 0 kept, 1 skipped, 0 failed in 00:00:01; records in '.vidfunnel/' under each folder
+```
+
+That run is the H.264 AVI test clip re-encoded with `--reencode-video`: one CRF step and the denoise took it from 108 % to 105 % of the source, so it was replaced but keeps `output-larger`, and `retire` still asks for `--allow-larger`. The synthetic test pattern compresses unlike real footage, which is also why its blockiness score is so high.
 
 ### verify
 
@@ -354,7 +375,7 @@ The profile aims at transparency and playability, not at shrinking, so the resul
 
 Audio moves the same way: AAC and MP3 are byte-identical copies; AC-3 stereo becomes AAC 192k, a modest saving; PCM at 1.5 Mb/s becomes 192k, a large one on DV and camera clips; AC-3 5.1 at 448k becomes AAC at the 448k cap, about the same. The closed 2 s GOP costs roughly 5 to 15 % against x264's default GOP; it is the price of bounding decode damage to two seconds.
 
-The DivX and WMV row is the reason the size rule exists (see `convert`): on a library of 2000s rips a good share of re-encodes will come out larger than their sources. That is the correct result for the stated goal, since a lower quality setting would visibly degrade already poor material, but it means the tool does not shrink that class. `--par2 N` adds roughly N % of the output size plus a small index file; the `.subs.mkv` sidecar for DVD bitmap subtitles is a few megabytes at most.
+The DivX and WMV row is the reason the size rule exists (see `convert`): on a library of 2000s rips a good share of re-encodes will come out larger than their sources. That is the correct result for the stated goal, since a lower quality setting would visibly degrade already poor material, but it means the tool does not shrink that class by default. `convert --refit` (see `convert`) re-encodes such outputs once more at a CRF chosen from how much larger they came out, up to 23 for SD and 24 for HD, and keeps the result only when it is smaller. `--par2 N` adds roughly N % of the output size plus a small index file; the `.subs.mkv` sidecar for DVD bitmap subtitles is a few megabytes at most.
 
 ## Records and identity
 

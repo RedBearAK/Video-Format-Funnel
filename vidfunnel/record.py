@@ -6,7 +6,7 @@ per source file, named after the full source file name including its extension
 Records are the authority; every write is atomic (temp file, then os.replace).
 """
 
-VERSION = "20261102"
+VERSION = "20261107"
 
 import datetime
 import hashlib
@@ -25,7 +25,7 @@ LOCK_NAME = "lock"
 FOLDER_FILE = "folder.json"
 RECORD_SUFFIX = ".json"
 STATUSES = ("planned", "converted", "verified", "quarantined", "failed", "retired", "source-changed")
-STAGES = ("probe", "analyze", "plan", "convert", "verify", "retire")
+STAGES = ("probe", "analyze", "plan", "convert", "refit", "verify", "retire")
 
 # HANDOFF section 5 bands; shared by verify, report and retire.
 BAND_OK = 90

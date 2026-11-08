@@ -12,40 +12,49 @@ tests read it), from the repo root:
     python3 -m tests.test_analyze --capture
 """
 
-VERSION = "20261102"
+VERSION = "20261107"
 
 import io
 import json
+import math
 import os
 import sys
 import types
 import unittest
 
 from vidfunnel.analyze import (
+    BLOCKINESS_HIGH,
     aac_bitrate,
     aggregate_crop,
     aggregate_idet,
     analyze,
+    bits_per_pixel,
+    blockdetect_run,
     classify_idet_window,
     cropdetect_run,
     decide_aspect,
     decide_audio,
+    decide_blockiness,
     decide_cadence,
     decide_colour,
     decide_decode,
     decide_keyframes,
     decide_pixelart,
+    decide_size_class,
     decide_subtitles,
     decide_sync,
     durations_from_packets,
     idet_run,
     measure_durations,
     needs_cropdetect,
+    parse_blockdetect,
     parse_cropdetect,
     parse_idet,
     predicted_score,
     remux_eligible,
     sample_windows,
+    size_class,
+    video_bitrate,
 )
 from vidfunnel.ffmpeg import DecodeResult, ToolNotFound, find_tools
 
@@ -837,6 +846,144 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(result["audio"][0]["result"]["bitrate"], "192k")
         self.assertFalse(result["remux"]["eligible"])
         self.assertEqual(result["predicted_score"], 95)
+
+    def test_analyze_records_size_class_and_blockiness(self):
+        from vidfunnel.probe import probe_file
+        path = self.fixture("xvid_avi_mp3.avi")
+        progress = quiet_progress()
+        result = analyze(TOOLS, path, probe_file(TOOLS, path), options(), progress)
+        self.assertEqual(result["size_class"]["class"], "heavy")
+        blockiness = result["blockiness"]
+        self.assertEqual(blockiness["frames"], 125)
+        # testsrc's hard edges score about 210 whatever the codec (see BLOCKINESS_HIGH).
+        self.assertGreater(blockiness["score"], BLOCKINESS_HIGH)
+        self.assertEqual(blockiness["samples"], [[0.0, None]])
+        self.assertIn("blockdetect over 1 window(s) of 'xvid_avi_mp3.avi'", progress.stream.getvalue())
+        self.assertEqual(result["flags"], [])
+        self.assertEqual(result["predicted_score"], 100)
+
+    def test_blockdetect_run_on_a_window(self):
+        path = self.fixture("dv_avi_ntsc_pcm.avi")
+        per_window = blockdetect_run(TOOLS, path, [(1.0, 1.0)], quiet_progress())
+        self.assertEqual(len(per_window), 1)
+        values, skipped = per_window[0]
+        self.assertAlmostEqual(len(values) + skipped, 30, delta=1)
+
+    def test_analyze_without_blockdetect_records_why(self):
+        from unittest import mock
+        from vidfunnel.probe import probe_file
+        path = self.fixture("h264_high_mkv_aac.mkv")
+        with mock.patch("vidfunnel.analyze.has_blockdetect", return_value=False):
+            with mock.patch("vidfunnel.analyze.blockdetect_run", side_effect=AssertionError("must not run")):
+                result = analyze(TOOLS, path, probe_file(TOOLS, path), options(), quiet_progress())
+        self.assertIsNone(result["blockiness"]["score"])
+        self.assertEqual(result["blockiness"]["reason"], "blockdetect filter not in this ffmpeg")
+
+
+# --- size prediction and blockiness -------------------------------------------------------
+
+
+def size_probe(video_rate=None, format_rate=None, audio_rates=(), width=320, height=240, fps=25.0, avg_fps=None):
+    return {"video": {"bit_rate": video_rate, "width": width, "height": height, "fps": fps, "avg_fps": avg_fps},
+            "format": {"bit_rate": format_rate}, "audio": [{"bit_rate": rate} for rate in audio_rates]}
+
+
+class SizeClassTests(unittest.TestCase):
+    PIXELS_PER_SECOND = 320 * 240 * 25.0
+
+    def test_video_stream_bit_rate_comes_first(self):
+        probe = size_probe(video_rate=192000, format_rate=900000, audio_rates=(128000,))
+        self.assertEqual(video_bitrate(probe), (192000.0, "video stream bit_rate"))
+        self.assertAlmostEqual(bits_per_pixel(probe), 192000 / self.PIXELS_PER_SECOND)
+
+    def test_container_minus_audio_when_every_audio_rate_is_known(self):
+        probe = size_probe(format_rate=500000, audio_rates=(128000, 64000))
+        self.assertEqual(video_bitrate(probe)[0], 308000.0)
+        self.assertAlmostEqual(bits_per_pixel(probe), 308000 / self.PIXELS_PER_SECOND)
+
+    def test_container_rate_when_an_audio_rate_is_unknown(self):
+        probe = size_probe(format_rate=500000, audio_rates=(128000, None))
+        self.assertEqual(video_bitrate(probe), (500000.0, "container bit_rate (an audio bit_rate is unknown)"))
+        self.assertAlmostEqual(bits_per_pixel(probe), 500000 / self.PIXELS_PER_SECOND)
+
+    def test_container_rate_without_audio(self):
+        probe = size_probe(format_rate=480000)
+        self.assertAlmostEqual(bits_per_pixel(probe), 480000 / self.PIXELS_PER_SECOND)
+
+    def test_average_frame_rate_is_preferred(self):
+        probe = size_probe(video_rate=192000, fps=50.0, avg_fps=25.0)
+        self.assertAlmostEqual(bits_per_pixel(probe), 192000 / self.PIXELS_PER_SECOND)
+
+    def test_missing_terms_give_none(self):
+        self.assertIsNone(bits_per_pixel(size_probe()))
+        self.assertIsNone(bits_per_pixel(size_probe(video_rate=192000, width=None)))
+        self.assertIsNone(bits_per_pixel(size_probe(video_rate=192000, height=0)))
+        self.assertIsNone(bits_per_pixel(size_probe(video_rate=192000, fps=None)))
+        self.assertIsNone(bits_per_pixel(size_probe(format_rate=100000, audio_rates=(128000,))))
+        self.assertIsNone(bits_per_pixel({}))
+
+    def test_class_boundaries(self):
+        self.assertEqual(size_class(math.nextafter(0.15, 0.0)), "heavy")
+        self.assertEqual(size_class(0.15), "near")
+        self.assertEqual(size_class(math.nextafter(0.4, 0.0)), "near")
+        self.assertEqual(size_class(0.4), "smaller")
+        self.assertEqual(size_class(1.0), "smaller")
+        self.assertEqual(size_class(math.nextafter(1.0, 2.0)), "much-smaller")
+        self.assertEqual(size_class(0.0), "heavy")
+        self.assertIsNone(size_class(None))
+
+    def test_decide_size_class_records_value_class_and_reason(self):
+        decision = decide_size_class(size_probe(video_rate=192000))
+        self.assertEqual(decision["class"], "heavy")
+        self.assertAlmostEqual(decision["bits_per_pixel"], 0.1, places=6)
+        self.assertIn("video stream bit_rate", decision["reason"])
+        unknown = decide_size_class(size_probe())
+        self.assertEqual((unknown["class"], unknown["bits_per_pixel"]), (None, None))
+        self.assertIn("unknown", unknown["reason"])
+
+    def test_captured_xvid_probe_is_heavy(self):
+        if not PROBES_AVAILABLE:
+            self.skipTest(PROBE_SKIP)
+        decision = decide_size_class(load_probe("xvid_avi_mp3.avi"))
+        self.assertEqual(decision["class"], "heavy")
+        self.assertAlmostEqual(decision["bits_per_pixel"], 198645 / self.PIXELS_PER_SECOND, places=5)
+
+
+class BlockinessTests(unittest.TestCase):
+    LOG = ("[Parsed_metadata_1 @ 0x1] frame:0    pts:0       pts_time:0\n"
+           "[Parsed_metadata_1 @ 0x1] lavfi.block=2.5\n"
+           "[Parsed_metadata_1 @ 0x1] lavfi.block=inf\n"
+           "[Parsed_metadata_1 @ 0x1] lavfi.block=4.5\n"
+           "[Parsed_metadata_1 @ 0x1] lavfi.block=nan\n")
+
+    def test_parse_keeps_finite_scores_and_counts_the_rest(self):
+        self.assertEqual(parse_blockdetect(self.LOG), ([2.5, 4.5], 2))
+        self.assertEqual(parse_blockdetect(""), ([], 0))
+        self.assertEqual(parse_blockdetect(None), ([], 0))
+
+    def test_mean_over_frames_of_all_windows(self):
+        decision = decide_blockiness([([2.0, 4.0], 0), ([6.0], 1)], True, [(3.0, 3.0), (50.0, 3.0)])
+        self.assertEqual(decision["score"], 4.0)
+        self.assertEqual(decision["frames"], 3)
+        self.assertEqual(decision["skipped_frames"], 1)
+        self.assertTrue(decision["high"])
+        self.assertEqual(decision["samples"], [[3.0, 3.0], [50.0, 3.0]])
+
+    def test_threshold_is_inclusive(self):
+        self.assertTrue(decide_blockiness([([BLOCKINESS_HIGH], 0)])["high"])
+        # The score is stored rounded to 4 places and 'high' is judged on the stored value.
+        self.assertFalse(decide_blockiness([([BLOCKINESS_HIGH - 0.0001], 0)])["high"])
+
+    def test_filter_absent(self):
+        decision = decide_blockiness(None, False, [(0.0, None)])
+        self.assertIsNone(decision["score"])
+        self.assertEqual(decision["frames"], 0)
+        self.assertEqual(decision["reason"], "blockdetect filter not in this ffmpeg")
+
+    def test_no_finite_frame(self):
+        decision = decide_blockiness([([], 5)])
+        self.assertIsNone(decision["score"])
+        self.assertIn("5 frame(s) inf or nan", decision["reason"])
 
 
 # --- capture ---------------------------------------------------------------------------------

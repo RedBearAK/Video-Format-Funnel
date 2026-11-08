@@ -1,4 +1,4 @@
-"""Analysis stage: sampled idet and cropdetect, aspect, cadence, sync, colour, pixel art, audio, subtitles.
+"""Analysis stage: sampled idet, cropdetect and blockdetect, aspect, cadence, sync, colour, pixel art, audio, subtitles.
 
 HANDOFF.md sections 2.1 to 2.3, 3, 4 and 5. Every decision is a dict
 
@@ -21,6 +21,12 @@ the dict that plan stores under stages.analyze.
 Readings of HANDOFF that are choices, not quotations, are documented on the
 function that implements them (aspect tie-break, idet window classes, the
 packet-quantisation tolerance on drift, audio priming).
+
+Two entries are informational and carry no penalty or flag: 'size_class'
+(bits per pixel per frame of the source video and the class it falls in,
+a prediction of how a CRF re-encode will compare in size) and 'blockiness'
+(the mean of blockdetect's per-frame score over the sample windows, when
+this ffmpeg has the filter). convert --refit reads both.
 """
 
 VERSION = "20261107"
@@ -118,6 +124,31 @@ AUDIO_BITRATE_CAP_K = 448
 TEXT_SUBTITLE_CODECS = ("subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text")
 STYLED_SUBTITLE_CODECS = ("ass", "ssa")
 BITMAP_SUBTITLE_SIDECARS = {"dvd_subtitle": ".subs.mkv", "hdmv_pgs_subtitle": ".sup"}
+
+# --- size prediction and blockiness (convert --refit) ---------------------------------
+
+# Bits per pixel per frame of the source video. Below 0.15 the source is heavily
+# compressed and a re-encode at the standard CRF is expected to come out larger;
+# 0.15 to 0.4 near the source size; 0.4 to 1.0 smaller; above 1.0 much smaller.
+BPP_HEAVY_BELOW = 0.15
+BPP_NEAR_BELOW = 0.4
+BPP_SMALLER_UP_TO = 1.0
+SIZE_CLASSES = ("heavy", "near", "smaller", "much-smaller")
+# blockdetect's per-frame 'lavfi.block' score, averaged over the frames of the
+# sample windows; frames for which it reports inf or nan (flat frames) are left out.
+# Measured with ffmpeg 7.1.5 on 2026-11-07. The test fixtures are drawn from testsrc,
+# whose hard 8-pixel-aligned edges dominate the score whatever the codec, so they do
+# not separate: xvid_avi_mp3.avi 209.9, flv1_flv_mp3.flv 210.0, wmv2_asf_wmav2.wmv
+# 133.8, against h264_high_mkv_aac.mkv 173.9 and dv_avi_ntsc_pcm.avi 49.4. On natural
+# detail (the mandelbrot source, 320x240, 5 s) the score follows compression: raw
+# 1.08, x264 CRF 18 1.07 and CRF 40 1.39 (x264 deblocks), MPEG-4 q2 1.49, MPEG-4 q5
+# 2.67, WMV2 600k 2.81, MPEG-4 300k 3.84, FLV1 200k 4.75, MPEG-4 q10 5.14, WMV2 200k
+# 5.20, MPEG-4 q20 13.0. 3.5 sits between the moderate (2.8 and below) and the
+# low-bitrate (3.8 and above) DCT encodes. Every testsrc fixture scores above it.
+BLOCKINESS_HIGH = 3.5
+BLOCKDETECT_FILTER = "blockdetect"
+BLOCKDETECT_CHAIN = "blockdetect,metadata=mode=print:key=lavfi.block"
+
 
 # --- remux eligibility (HANDOFF 3) ----------------------------------------------------
 
@@ -1122,6 +1153,163 @@ def decide_keyframes(spacing):
     return _decision(spacing, reason, flags=flags, samples=[(0.0, None)])
 
 
+# --- size prediction and blockiness ------------------------------------------------
+
+
+def video_bitrate(probe):
+    """(bits per second, how) of the source video, or (None, why). Pure.
+
+    The video stream's bit_rate; else the container's bit_rate minus the
+    audio streams' bit_rates when every audio stream gives one; else the
+    container's bit_rate. A subtraction that leaves nothing is unknown.
+    """
+    video = (probe or {}).get("video") or {}
+    stream_rate = _number(video.get("bit_rate"))
+    if stream_rate is not None and stream_rate > 0:
+        return stream_rate, "video stream bit_rate"
+    format_rate = _number(((probe or {}).get("format") or {}).get("bit_rate"))
+    if format_rate is None or format_rate <= 0:
+        return None, "no video or container bit_rate"
+    audio_rates = [_number(entry.get("bit_rate")) for entry in (probe or {}).get("audio") or []]
+    if audio_rates and all(rate is not None and rate > 0 for rate in audio_rates):
+        remaining = format_rate - sum(audio_rates)
+        if remaining <= 0:
+            return None, "container bit_rate {:.0f} is not above the audio bit_rates {:.0f}".format(
+                format_rate, sum(audio_rates))
+        return remaining, "container bit_rate minus {} audio bit_rate(s)".format(len(audio_rates))
+    if audio_rates:
+        return format_rate, "container bit_rate (an audio bit_rate is unknown)"
+    return format_rate, "container bit_rate (no audio)"
+
+
+def bits_per_pixel(probe):
+    """Video bits per pixel per frame: video_bitrate / (width * height * fps); None when a term is missing. Pure.
+
+    fps is the average frame rate (avg_frame_rate), else r_frame_rate.
+    """
+    rate, _how = video_bitrate(probe)
+    video = (probe or {}).get("video") or {}
+    width = _number(video.get("width"))
+    height = _number(video.get("height"))
+    fps = _number(video.get("avg_fps")) or _number(video.get("fps"))
+    if rate is None or not width or not height or not fps or width <= 0 or height <= 0 or fps <= 0:
+        return None
+    return rate / (width * height * fps)
+
+
+def size_class(bpp):
+    """'heavy' below 0.15, 'near' 0.15 to below 0.4, 'smaller' 0.4 to 1.0, 'much-smaller' above 1.0; None for None.
+
+    Pure. A value exactly on a boundary goes to the class above it, except
+    1.0, which is still 'smaller' ("above 1.0" is 'much-smaller').
+    """
+    if bpp is None:
+        return None
+    if bpp < BPP_HEAVY_BELOW:
+        return "heavy"
+    if bpp < BPP_NEAR_BELOW:
+        return "near"
+    if bpp <= BPP_SMALLER_UP_TO:
+        return "smaller"
+    return "much-smaller"
+
+
+_SIZE_CLASS_WORDS = {
+    "heavy": "heavily compressed: a re-encode at the standard CRF is expected to come out larger",
+    "near": "a re-encode is expected near the source size",
+    "smaller": "a re-encode is expected to come out smaller",
+    "much-smaller": "a re-encode is expected to come out much smaller",
+}
+
+
+def decide_size_class(probe):
+    """{'bits_per_pixel': float|None, 'class': str|None, 'reason': str}. Pure; informational, no penalty."""
+    rate, how = video_bitrate(probe)
+    bpp = bits_per_pixel(probe)
+    klass = size_class(bpp)
+    if bpp is None:
+        video = (probe or {}).get("video") or {}
+        reason = "bits per pixel unknown ({}; {}x{} at {} fps)".format(
+            how if rate is None else "bit rate {:.0f} b/s from {}".format(rate, how), video.get("width"),
+            video.get("height"), video.get("avg_fps") or video.get("fps"))
+    else:
+        reason = "{:.4f} bits per pixel per frame ({:.0f} b/s from {}): {}".format(
+            bpp, rate, how, _SIZE_CLASS_WORDS[klass])
+    return {"bits_per_pixel": None if bpp is None else round(bpp, 6), "class": klass, "reason": reason}
+
+
+_BLOCK_VALUE = re.compile(r"lavfi\.block=(\S+)")
+
+
+def parse_blockdetect(stderr):
+    """(finite per-frame scores, count of inf/nan frames) from blockdetect + metadata=print output. Pure."""
+    values = []
+    skipped = 0
+    for text in _BLOCK_VALUE.findall(stderr or ""):
+        number = _number(text)
+        if number is None:
+            skipped += 1
+        else:
+            values.append(number)
+    return values, skipped
+
+
+def has_blockdetect(tools):
+    """True when this ffmpeg lists the blockdetect filter (vidfunnel.ffmpeg.capabilities, cached per ffmpeg)."""
+    from vidfunnel.ffmpeg import capabilities
+    return BLOCKDETECT_FILTER in (capabilities(tools).get("filters") or ())
+
+
+def decide_blockiness(per_window, available=True, windows=()):
+    """{'score': float|None, 'frames': int, 'reason': str, ...} from per-window parse_blockdetect results. Pure.
+
+    The score is the mean over every finite frame score of every window;
+    frames for which blockdetect gave inf or nan are counted under
+    'skipped_frames'. The score is rounded to 4 places, and 'high' is judged
+    on that rounded value, the one stored and read by convert --refit. `available` False (the filter is not in this ffmpeg)
+    gives score None. 'high' says whether the score reaches BLOCKINESS_HIGH.
+    """
+    samples = [list(window) for window in windows]
+    if not available:
+        return {"score": None, "frames": 0, "skipped_frames": 0, "high": None, "threshold": BLOCKINESS_HIGH,
+                "reason": "blockdetect filter not in this ffmpeg", "samples": samples}
+    values = []
+    skipped = 0
+    for found in per_window or []:
+        window_values, window_skipped = found if found is not None else ([], 0)
+        values.extend(window_values)
+        skipped += window_skipped
+    if not values:
+        return {"score": None, "frames": 0, "skipped_frames": skipped, "high": None, "threshold": BLOCKINESS_HIGH,
+                "reason": "blockdetect gave no finite frame score ({} frame(s) inf or nan)".format(skipped),
+                "samples": samples}
+    score = round(sum(values) / len(values), 4)
+    high = score >= BLOCKINESS_HIGH
+    reason = "mean blockdetect score {:.4f} over {} frame(s) in {} window(s){}: {} the {} threshold".format(
+        score, len(values), len(per_window or []),
+        "" if not skipped else ", {} inf/nan frame(s) left out".format(skipped),
+        "at or above" if high else "below", BLOCKINESS_HIGH)
+    return {"score": score, "frames": len(values), "skipped_frames": skipped, "high": high,
+            "threshold": BLOCKINESS_HIGH, "reason": reason, "samples": samples}
+
+
+def blockdetect_run(tools, path, windows, progress=None):
+    """blockdetect over each window; per-window parse_blockdetect results. Raises FfmpegError when ffmpeg fails."""
+    stream, quiet = _progress_options(progress)
+    absolute = os.path.abspath(os.fspath(path))
+    say("blockdetect over {} window(s) of '{}'".format(len(windows), _name(path)), stream)
+    results = []
+    with Progress("blockdetect window", total=len(windows), unit="items", stream=stream, quiet=quiet) as live:
+        for position, window in enumerate(windows):
+            live.update(position)
+            argv = [tools.ffmpeg, "-hide_banner", "-nostats"] + _window_args(window) + [
+                "-i", absolute, "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", BLOCKDETECT_CHAIN, "-f", "null", "-"]
+            completed = run(argv)
+            results.append(parse_blockdetect(completed.stderr))
+        live.update(len(windows))
+    return results
+
+
 # --- orchestration --------------------------------------------------------------------
 
 
@@ -1168,6 +1356,11 @@ def analyze(tools, path, probe, options=None, progress=None):
     cadence = decide_cadence(aggregate_idet(idet_windows, video.get("fps")), video, max_level)
     cadence["samples"] = [list(window) for window in windows]
 
+    if has_blockdetect(tools):
+        blockiness = decide_blockiness(blockdetect_run(tools, path, windows, progress), True, windows)
+    else:
+        blockiness = decide_blockiness(None, False, windows)
+
     durations = measure_durations(tools, path, probe, progress)
     sync = decide_sync(probe, durations, audio_offset)
     sync_by_index = {entry["index"]: entry for entry in sync["result"]}
@@ -1203,6 +1396,8 @@ def analyze(tools, path, probe, options=None, progress=None):
         "subtitles": subtitles,
         "keyframes": keyframes,
         "remux": {"eligible": eligible, "reason": eligible_reason},
+        "size_class": decide_size_class(probe),
+        "blockiness": blockiness,
         "flags": flags,
         "penalties": penalties,
         "predicted_score": predicted_score(penalties),

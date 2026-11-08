@@ -20,6 +20,9 @@ What the record carries for the later stages:
   substitute its '.part' name for the last element);
 - stages.plan.sidecars: [{'path', 'argv', 'kind'}], one argv per subtitle
   sidecar, each ending in its own output path;
+- stages.plan.size_class ({'class', 'bits_per_pixel'}) and
+  stages.plan.blockiness ({'score'}), copied from the analysis for
+  convert --refit; informational, they change no decision;
 - output.name and output.interim_name ('<stem>.vidfunnel.mp4' when the
   source is itself '<stem>.mp4'), output.sidecars (file names).
 
@@ -49,22 +52,27 @@ from pathlib import Path
 
 import vidfunnel
 from vidfunnel.analyze import (
+    BLOCKDETECT_CHAIN,
     DEFAULT_SAMPLES,
     WINDOW_SECONDS,
     aggregate_crop,
     aggregate_idet,
     analyze,
     decide_aspect,
+    decide_blockiness,
     decide_audio,
     decide_cadence,
     decide_colour,
     decide_decode,
     decide_keyframes,
     decide_pixelart,
+    decide_size_class,
     decide_subtitles,
     decide_sync,
     durations_from_packets,
+    has_blockdetect,
     needs_cropdetect,
+    parse_blockdetect,
     parse_cropdetect,
     parse_idet,
     predicted_score,
@@ -499,6 +507,20 @@ def decide_action(probe, analysis, options, capabilities):
     return ("reencode", remux.get("reason") or "not remux eligible")
 
 
+def plan_size_entries(analysis):
+    """(size_class, blockiness) for stages.plan: {'class', 'bits_per_pixel'} and {'score'}; informational.
+
+    Either is None when the analysis has no such entry (an analysis made
+    before 20261107).
+    """
+    size = (analysis or {}).get("size_class")
+    blocks = (analysis or {}).get("blockiness")
+    size_entry = None if not isinstance(size, dict) else {"class": size.get("class"),
+                                                          "bits_per_pixel": size.get("bits_per_pixel")}
+    block_entry = None if not isinstance(blocks, dict) else {"score": blocks.get("score")}
+    return size_entry, block_entry
+
+
 def _sar_changed(analysis):
     aspect = (analysis.get("aspect") or {}).get("result") or {}
     return aspect.get("source") in ("bars", "assumed") and bool(aspect.get("sar"))
@@ -773,7 +795,7 @@ def _packets_input(tools, input_args, label, stream_index, entries):
 
 def _window_pass(tools, input_args, windows, filter_text, parser, title, label, progress):
     stream, quiet = _progress_options(progress)
-    say("{} over {} window(s) of '{}'".format(filter_text.split("=")[0], len(windows), label), stream)
+    say("{} over {} window(s) of '{}'".format(filter_text.split("=")[0].split(",")[0], len(windows), label), stream)
     results = []
     with Progress(title, total=len(windows), unit="items", stream=stream, quiet=quiet) as live:
         for position, window in enumerate(windows):
@@ -853,6 +875,12 @@ def analyze_input(tools, input_args, label, probe, options=None, progress=None):
     cadence = decide_cadence(aggregate_idet(idet_windows, video.get("fps")), video, max_level)
     cadence["samples"] = [list(window) for window in windows]
 
+    if has_blockdetect(tools):
+        blockiness = decide_blockiness(_window_pass(tools, input_args, windows, BLOCKDETECT_CHAIN, parse_blockdetect,
+                                                    "blockdetect window", label, progress), True, windows)
+    else:
+        blockiness = decide_blockiness(None, False, windows)
+
     sync = decide_sync(probe, _durations_input(tools, input_args, label, probe, progress), audio_offset)
     sync_by_index = {entry["index"]: entry for entry in sync["result"]}
     colour = decide_colour(video)
@@ -890,6 +918,8 @@ def analyze_input(tools, input_args, label, probe, options=None, progress=None):
         "subtitles": subtitles,
         "keyframes": keyframes,
         "remux": {"eligible": eligible, "reason": eligible_reason},
+        "size_class": decide_size_class(probe),
+        "blockiness": blockiness,
         "flags": flags,
         "penalties": penalties,
         "predicted_score": predicted_score(penalties),
@@ -1066,7 +1096,7 @@ def _plan_one(tools, work, options, folder_sources, capabilities, progress, know
             "options": _options_dict(options), "par2": getattr(options, "par2", None),
             "plain_mp4": bool(getattr(options, "plain_mp4", False)), "dvd_title": work.dvd_title, "argv": None,
             "sidecars": [], "output": {"name": None, "interim_name": None}, "predicted_score": None,
-            "keyframes": None}
+            "keyframes": None, "size_class": None, "blockiness": None}
     input_args = input_arguments(work.inputs, work.dvd_title)
     try:
         if known_probe is not None:
@@ -1101,6 +1131,7 @@ def _plan_one(tools, work, options, folder_sources, capabilities, progress, know
             add_flag(record, "dvd-no-demuxer")
             add_penalty(record, "dvd-no-demuxer", PENALTY_DVD_NO_DEMUXER,
                         "DVD title set concatenated: this ffmpeg has no dvdvideo demuxer")
+        plan["size_class"], plan["blockiness"] = plan_size_entries(analysis)
         if analysis.get("keyframes"):
             spacing = analysis["keyframes"].get("result") or {}
             plan["keyframes"] = {key: spacing.get(key) for key in ("keyframes", "max_gap_s", "mean_gap_s",
