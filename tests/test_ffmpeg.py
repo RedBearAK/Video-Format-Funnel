@@ -342,12 +342,12 @@ class CapabilitiesCacheTests(unittest.TestCase):
         with open(self.wrapper, "w") as handle:
             handle.write("#!/bin/sh\nexec '{}' \"$@\"\n".format(current))
         self.query_counting_runs()
-        wrapper_bytes = open(self.wrapper, "rb").read()
+        wrapper_bytes = pathlib.Path(self.wrapper).read_bytes()
         clear_capabilities_cache()
         with open(current, "w") as handle:
             handle.write("#!/bin/sh\nif [ \"$1\" = -hide_banner ] && [ \"$2\" = -version ]; then\n"
                          "  '{0}' \"$@\" | sed '1s/$/ (another build)/'\n  exit 0\nfi\nexec '{0}' \"$@\"\n".format(HOST_FFMPEG))
-        self.assertEqual(open(self.wrapper, "rb").read(), wrapper_bytes, "the wrapper file is unchanged")
+        self.assertEqual(pathlib.Path(self.wrapper).read_bytes(), wrapper_bytes, "the wrapper file is unchanged")
         _found, calls = self.query_counting_runs()
         self.assertEqual(calls, QUERY_CALLS, "a new version banner behind the same wrapper means a fresh query")
         self.assertEqual(len(list(self.cache_dir.glob("*.json"))), 2)
