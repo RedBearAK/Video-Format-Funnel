@@ -7,8 +7,9 @@ same name pattern, so a pair of distrobox wrappers in a directory of their own
 works without shadowing the host's tools.
 """
 
-VERSION = "20261102"
+VERSION = "20261107"
 
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,7 @@ import shutil
 import subprocess
 import threading
 from collections import namedtuple
+from pathlib import Path
 
 from vidfunnel.progress import say
 
@@ -43,6 +45,16 @@ DecodeResult = namedtuple("DecodeResult", "returncode message_classes stderr")
 ERROR_TAIL_LINES = 5
 
 _capabilities_cache = {}
+
+# On-disk copy of the capability listings, so the seven ffmpeg calls that produce
+# them run once per ffmpeg build instead of once per run (through a distrobox
+# wrapper each call costs more than a second). Keyed by the binary's path, size,
+# mtime and the SHA-256 of its first and last MiB (a wrapper script is hashed
+# whole), so a changed or replaced ffmpeg is queried again. 'check' always
+# queries again and refreshes the cache.
+CAPABILITIES_CACHE_FORMAT = 1
+CAPABILITIES_CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or "~/.cache").expanduser() / "vidfunnel" / "capabilities"
+_SET_FIELDS = ("encoders", "decoders", "muxers", "demuxers", "filters", "bsfs")
 
 
 # --- discovery ---------------------------------------------------------------
@@ -218,16 +230,86 @@ _CAPABILITY_QUERIES = (
 )
 
 
-def capabilities(tools):
-    """What the ffmpeg in `tools` can do, parsed from its listings. Cached per ffmpeg path.
+def _binary_identity(path):
+    """What the cache key is made of: path, size, mtime_ns and the head/tail SHA-256; None when unreadable."""
+    from vidfunnel.record import cheap_fingerprint
+    try:
+        fingerprint = cheap_fingerprint(path)
+    except OSError:
+        return None
+    identity = {"path": str(path)}
+    identity.update(fingerprint)
+    return identity
+
+
+def _cache_file_for(identity):
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
+    return CAPABILITIES_CACHE_DIR / (digest[:32] + ".json")
+
+
+def _load_cached_capabilities(identity):
+    """The cached listing for this exact binary, or None (missing, stale, unreadable or malformed)."""
+    if identity is None:
+        return None
+    try:
+        with open(str(_cache_file_for(identity)), "r", encoding="utf-8") as handle:
+            stored = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(stored, dict) or stored.get("format") != CAPABILITIES_CACHE_FORMAT:
+        return None
+    if stored.get("identity") != identity or not isinstance(stored.get("capabilities"), dict):
+        return None
+    result = dict(stored["capabilities"])
+    try:
+        result["version_tuple"] = tuple(result["version_tuple"])
+        for field in _SET_FIELDS:
+            result[field] = set(result[field])
+    except (KeyError, TypeError):
+        return None
+    return result
+
+
+def _store_cached_capabilities(identity, result):
+    """Write the listing next to its identity; a failure to write is not an error."""
+    if identity is None:
+        return
+    serialisable = dict(result)
+    serialisable["version_tuple"] = list(result["version_tuple"])
+    for field in _SET_FIELDS:
+        serialisable[field] = sorted(result[field])
+    target = _cache_file_for(identity)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + ".part")
+        with open(str(temporary), "w", encoding="utf-8") as handle:
+            json.dump({"format": CAPABILITIES_CACHE_FORMAT, "identity": identity, "capabilities": serialisable},
+                      handle, indent=1, sort_keys=True)
+        os.replace(str(temporary), str(target))
+    except OSError:
+        pass
+
+
+def capabilities(tools, refresh=False):
+    """What the ffmpeg in `tools` can do, parsed from its listings.
 
     {'version': '7.1.5', 'major': 7, 'version_tuple': (7, 1, 5),
      'configuration': [...], 'encoders', 'decoders', 'muxers', 'demuxers',
      'filters', 'bsfs': sets of names}. Raises FfmpegError when ffmpeg fails.
+
+    Cached in this process per ffmpeg path and on disk per binary identity
+    (see CAPABILITIES_CACHE_DIR); `refresh` skips both caches and rewrites
+    the disk copy, which is what 'check' does.
     """
     key = tools.ffmpeg
-    if key in _capabilities_cache:
+    if not refresh and key in _capabilities_cache:
         return _capabilities_cache[key]
+    identity = _binary_identity(tools.ffmpeg)
+    if not refresh:
+        cached = _load_cached_capabilities(identity)
+        if cached is not None:
+            _capabilities_cache[key] = cached
+            return cached
     say("querying the capabilities of '{}' ({} calls)".format(tools.ffmpeg, 1 + len(_CAPABILITY_QUERIES)))
     version_output = run([tools.ffmpeg, "-hide_banner", "-version"]).stdout
     version = _version_string(version_output)
@@ -254,10 +336,12 @@ def capabilities(tools):
                 stderr="",
             )
     _capabilities_cache[key] = result
+    _store_cached_capabilities(identity, result)
     return result
 
 
 def clear_capabilities_cache():
+    """Forget the in-process copies (the on-disk cache stays; capabilities(refresh=True) rewrites it)."""
     _capabilities_cache.clear()
 
 

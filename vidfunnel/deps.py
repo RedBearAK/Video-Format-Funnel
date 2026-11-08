@@ -7,7 +7,7 @@ matter of distro build flags. `plan`, `convert` and `verify` call require()
 first and refuse with the same table and hint when a required item is missing.
 """
 
-VERSION = "20261102"
+VERSION = "20261107"
 
 import os
 import platform as platform_module
@@ -147,7 +147,7 @@ def check_dependencies(ffmpeg_path=None, platform=None):
         items.append(Item("ffmpeg", True, False, str(error)))
     if ffmpeg is not None:
         try:
-            caps = capabilities(Tools(ffmpeg, None))
+            caps = capabilities(Tools(ffmpeg, None), refresh=True)
         except (FfmpegError, ToolNotFound) as error:
             items.append(Item("ffmpeg", True, False, "'{}' could not be queried: {}".format(ffmpeg, error)))
     if caps is not None:

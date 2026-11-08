@@ -6,13 +6,20 @@ distrobox wrapper test skips when the wrapper is not installed.
 
 VERSION = "20261102"
 
+import contextlib
+import io
+import json
 import os
+import pathlib
 import shutil
 import stat
 import tempfile
 import unittest
+import unittest.mock
 
+import vidfunnel.ffmpeg
 from vidfunnel.ffmpeg import (
+    clear_capabilities_cache,
     FfmpegError,
     ToolNotFound,
     Tools,
@@ -266,6 +273,91 @@ class RunnerTests(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             run([shutil.which("python3") or "python3", "-c", script], progress=explode)
+
+
+QUERY_CALLS = 1 + len(vidfunnel.ffmpeg._CAPABILITY_QUERIES)  # -version plus the six listings
+
+
+@unittest.skipUnless(os.path.exists(HOST_FFMPEG), NO_HOST_FFMPEG)
+class CapabilitiesCacheTests(unittest.TestCase):
+    """The on-disk capabilities cache, exercised through a wrapper script around the host ffmpeg."""
+
+    def setUp(self):
+        self.folder = tempfile.mkdtemp(prefix="vidfunnel-capcache-")
+        self.addCleanup(shutil.rmtree, self.folder)
+        self.wrapper = os.path.join(self.folder, "ffmpeg")
+        with open(self.wrapper, "w") as handle:
+            handle.write("#!/bin/sh\nexec '{}' \"$@\"\n".format(HOST_FFMPEG))
+        os.chmod(self.wrapper, 0o755)
+        shutil.copyfile(HOST_FFMPEG.replace("ffmpeg", "ffprobe"), os.path.join(self.folder, "ffprobe"))
+        os.chmod(os.path.join(self.folder, "ffprobe"), 0o755)
+        self.cache_dir = pathlib.Path(self.folder) / "cache"
+        patcher = unittest.mock.patch("vidfunnel.ffmpeg.CAPABILITIES_CACHE_DIR", self.cache_dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        clear_capabilities_cache()
+        self.addCleanup(clear_capabilities_cache)
+        self.tools = Tools(self.wrapper, os.path.join(self.folder, "ffprobe"))
+
+    def query_counting_runs(self, **values):
+        real_run = vidfunnel.ffmpeg.run
+        calls = []
+
+        def counting(argv, *rest, **options):
+            calls.append(list(argv))
+            return real_run(argv, *rest, **options)
+
+        with unittest.mock.patch("vidfunnel.ffmpeg.run", side_effect=counting), \
+                contextlib.redirect_stdout(io.StringIO()):
+            found = capabilities(self.tools, **values)
+        return found, len(calls)
+
+    def test_second_process_reads_the_disk_cache_without_running_ffmpeg(self):
+        first, calls = self.query_counting_runs()
+        self.assertEqual(calls, QUERY_CALLS)
+        self.assertEqual(len(list(self.cache_dir.glob("*.json"))), 1)
+        clear_capabilities_cache()
+        second, calls = self.query_counting_runs()
+        self.assertEqual(calls, 0)
+        self.assertEqual(second, first)
+        self.assertIsInstance(second["filters"], set)
+        self.assertEqual(second["version_tuple"], first["version_tuple"])
+
+    def test_changed_binary_is_queried_again(self):
+        self.query_counting_runs()
+        clear_capabilities_cache()
+        with open(self.wrapper, "a") as handle:
+            handle.write("# a different build\n")
+        _found, calls = self.query_counting_runs()
+        self.assertEqual(calls, QUERY_CALLS)
+        self.assertEqual(len(list(self.cache_dir.glob("*.json"))), 2, "a new identity gets its own file")
+
+    def test_refresh_queries_again_and_rewrites_the_cache(self):
+        self.query_counting_runs()
+        cache_file = next(self.cache_dir.glob("*.json"))
+        before = cache_file.stat().st_mtime_ns
+        os.utime(str(cache_file), ns=(before - 10 ** 9, before - 10 ** 9))
+        _found, calls = self.query_counting_runs(refresh=True)
+        self.assertEqual(calls, QUERY_CALLS)
+        self.assertGreater(cache_file.stat().st_mtime_ns, before - 10 ** 9)
+
+    def test_malformed_or_foreign_cache_file_is_ignored(self):
+        self.query_counting_runs()
+        cache_file = next(self.cache_dir.glob("*.json"))
+        cache_file.write_text("{not json")
+        clear_capabilities_cache()
+        _found, calls = self.query_counting_runs()
+        self.assertEqual(calls, QUERY_CALLS, "a malformed file is queried past, not crashed on")
+        cache_file.write_text(json.dumps({"format": 99, "identity": {}, "capabilities": {}}))
+        clear_capabilities_cache()
+        _found, calls = self.query_counting_runs()
+        self.assertEqual(calls, QUERY_CALLS, "another format version is ignored")
+
+    def test_unwritable_cache_dir_is_not_an_error(self):
+        self.cache_dir.write_text("a file where the directory should be")
+        found, calls = self.query_counting_runs()
+        self.assertEqual(calls, QUERY_CALLS)
+        self.assertIn("libx264", found["encoders"])
 
 
 @unittest.skipUnless(os.path.exists(HOST_FFMPEG), NO_HOST_FFMPEG)

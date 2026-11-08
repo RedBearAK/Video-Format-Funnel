@@ -81,6 +81,8 @@ all required items present
 
 followed by install hints for the missing optional items. When something required is missing, `check` prints the install command for the detected platform (zypper, dnf, apt, pacman, apk or Homebrew), and `plan`, `convert` and `verify` refuse to start with the same message. `report`, `find`, `index` and `retire` work from the records and hashes alone and run without ffmpeg.
 
+The capability listings those calls produce are cached under `~/.cache/vidfunnel/capabilities/` (or `$XDG_CACHE_HOME/vidfunnel/capabilities/`), keyed by the ffmpeg binary's path, size, modification time and a hash of its first and last MiB, so every other stage starts without the seven calls; a replaced or updated ffmpeg is queried again, and `check` always queries again and refreshes the cache. Through a distrobox wrapper each call costs more than a second, which is where the cache matters most.
+
 ## A distrobox for the dvdvideo demuxer
 
 On a workstation whose distro ffmpeg lacks `dvdvideo` (Fedora, openSUSE), an Alpine distrobox provides one without replacing the host's ffmpeg:
