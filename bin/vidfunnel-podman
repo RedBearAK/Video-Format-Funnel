@@ -81,7 +81,9 @@ What the wrapper does:
   An unset or empty HOME stops the wrapper.
   The container runs with --rm, --userns=keep-id (podman) or --user uid:gid
   (docker) so files are owned by you, and --security-opt label=disable for SELinux
-  hosts. It gets a terminal (-it) only when stdin is one.
+  hosts. It gets a terminal (-it) only when both stdin and stdout are terminals;
+  piped ('| less', '| tee', '> file') it gets no terminal and no stdin at all, so
+  the pipe's reader owns the terminal and nothing is left in raw mode afterwards.
   Your supplementary groups are kept inside the container when they can be, so a
   share writable only through a group (root:media 775 on a NAS mount) stays
   writable: with podman on the crun runtime through --group-add keep-groups; with
@@ -604,7 +606,13 @@ else
     done
     set -- --user "$(id -u):$(id -g)" "$@"
 fi
-if [ -t 0 ]; then
+# A container terminal only when stdin AND stdout are terminals. With stdout a pipe
+# ('vidfunnel report | less'), -t would put the terminal into raw mode and make podman
+# forward keystrokes into the container while the pipe's reader (less) reads the same
+# terminal: the two race for every key, and podman leaves echo off on exit when its
+# stdout is not the terminal. In a pipeline nothing in vidfunnel needs stdin: its one
+# prompt (retire --destroy-originals-now) refuses without a terminal unless --yes.
+if [ -t 0 ] && [ -t 1 ]; then
     set -- -it "$@"
 fi
 set -- "${ENGINE}" run --rm "$@"

@@ -148,6 +148,37 @@ class SupplementaryGroupTests(WrapperTestCase):
         self.assert_pair(argv, "--user", "{}:{}".format(os.getuid(), os.getgid()))
 
 
+class TerminalTests(WrapperTestCase):
+    """-it only when stdin and stdout are both terminals; a piped stdout gets no terminal and no stdin."""
+
+    def run_with_terminal(self, stdin_tty, stdout_tty):
+        import pty
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        stdin = slave if stdin_tty else subprocess.DEVNULL
+        stdout = slave if stdout_tty else subprocess.PIPE
+        result = subprocess.run([SHELL_BINARY, str(WRAPPER), "check"], cwd=str(self.workdir),
+                                env=self.environment(), stdin=stdin, stdout=stdout, stderr=subprocess.PIPE,
+                                universal_newlines=True)
+        os.close(slave)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.engine_argv()
+
+    def test_terminal_on_both_sides_gets_it(self):
+        self.assertIn("-it", self.run_with_terminal(stdin_tty=True, stdout_tty=True))
+
+    def test_piped_stdout_gets_no_terminal_even_with_a_terminal_stdin(self):
+        # 'vidfunnel report | less' left Kris's terminal in raw mode and ate his keystrokes (2026-11-08).
+        argv = self.run_with_terminal(stdin_tty=True, stdout_tty=False)
+        self.assertNotIn("-it", argv)
+        self.assertNotIn("-i", argv)
+        self.assertNotIn("-t", argv)
+
+    def test_no_terminal_on_stdin_gets_none(self):
+        argv = self.run_with_terminal(stdin_tty=False, stdout_tty=True)
+        self.assertNotIn("-it", argv)
+
+
 class HomeTests(WrapperTestCase):
     def test_container_gets_home_and_its_vidfunnel_folders(self):
         code, output = self.run_wrapper("check")
