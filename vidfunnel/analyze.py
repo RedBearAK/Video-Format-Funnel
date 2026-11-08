@@ -25,8 +25,12 @@ packet-quantisation tolerance on drift, audio priming).
 Two entries are informational and carry no penalty or flag: 'size_class'
 (bits per pixel per frame of the source video and the class it falls in,
 a prediction of how a CRF re-encode will compare in size) and 'blockiness'
-(the mean of blockdetect's per-frame score over the sample windows, when
-this ffmpeg has the filter). convert --refit reads both.
+(the mean of blockdetect's per-frame score over at most four of the sample
+windows, when this ffmpeg has the filter). convert --refit reads both.
+
+The three sampled filters run as one ffmpeg process per window, one branch
+of a split graph each (window_graph); each parser picks its own lines out of
+the shared stderr.
 """
 
 VERSION = "20261107"
@@ -134,8 +138,9 @@ BPP_HEAVY_BELOW = 0.15
 BPP_NEAR_BELOW = 0.4
 BPP_SMALLER_UP_TO = 1.0
 SIZE_CLASSES = ("heavy", "near", "smaller", "much-smaller")
-# blockdetect's per-frame 'lavfi.block' score, averaged over the frames of the
-# sample windows; frames for which it reports inf or nan (flat frames) are left out.
+# blockdetect's per-frame 'lavfi.block' score, averaged over the frames of at most
+# BLOCKDETECT_WINDOWS of the sample windows; frames for which it reports inf or nan
+# (flat frames) are left out.
 # Measured with ffmpeg 7.1.5 on 2026-11-07. The test fixtures are drawn from testsrc,
 # whose hard 8-pixel-aligned edges dominate the score whatever the codec, so they do
 # not separate: xvid_avi_mp3.avi 209.9, flv1_flv_mp3.flv 210.0, wmv2_asf_wmav2.wmv
@@ -145,9 +150,18 @@ SIZE_CLASSES = ("heavy", "near", "smaller", "much-smaller")
 # 2.67, WMV2 600k 2.81, MPEG-4 300k 3.84, FLV1 200k 4.75, MPEG-4 q10 5.14, WMV2 200k
 # 5.20, MPEG-4 q20 13.0. 3.5 sits between the moderate (2.8 and below) and the
 # low-bitrate (3.8 and above) DCT encodes. Every testsrc fixture scores above it.
+# These are all single-window files. The same ladder made 90 s long (12 windows)
+# scored within 0.35 of the 12-window mean when sampled in 4 windows (x264 CRF 18
+# 1.09 and 1.08, MPEG-4 q5 2.06 and 1.99, WMV2 600k 5.88 and 5.54, MPEG-4 300k
+# 7.63 and 7.61, FLV1 200k 8.61 and 8.98, MPEG-4 q20 7.01 and 6.87), on the same
+# side of 3.5 every time (2026-11-07).
 BLOCKINESS_HIGH = 3.5
 BLOCKDETECT_FILTER = "blockdetect"
 BLOCKDETECT_CHAIN = "blockdetect,metadata=mode=print:key=lavfi.block"
+# blockdetect costs about three times idet per window and its score is informational,
+# so it runs in at most this many of the sample windows, spread evenly.
+BLOCKDETECT_WINDOWS = 4
+CROPDETECT_CHAIN = "cropdetect=limit=24:round=2:reset=0"
 
 
 # --- remux eligibility (HANDOFF 3) ----------------------------------------------------
@@ -330,28 +344,6 @@ def parse_cropdetect(stderr):
     return {"w": width, "h": height, "x": left, "y": top}
 
 
-def cropdetect_run(tools, path, windows, progress=None):
-    """cropdetect=limit=24:round=2:reset=0 over each window; per-window crop dict or None (HANDOFF 4.2 step 3).
-
-    A window in which cropdetect printed nothing (no frame decoded) is None.
-    Raises FfmpegError when ffmpeg fails.
-    """
-    stream, quiet = _progress_options(progress)
-    absolute = os.path.abspath(os.fspath(path))
-    say("cropdetect over {} window(s) of '{}'".format(len(windows), _name(path)), stream)
-    results = []
-    with Progress("cropdetect window", total=len(windows), unit="items", stream=stream, quiet=quiet) as live:
-        for position, window in enumerate(windows):
-            live.update(position)
-            argv = [tools.ffmpeg, "-hide_banner", "-nostats"] + _window_args(window) + [
-                "-i", absolute, "-map", "0:v:0", "-an", "-sn", "-dn",
-                "-vf", "cropdetect=limit=24:round=2:reset=0", "-f", "null", "-"]
-            completed = run(argv)
-            results.append(parse_cropdetect(completed.stderr))
-        live.update(len(windows))
-    return results
-
-
 def _crops_agree(first, second):
     return all(abs(first[key] - second[key]) <= CROP_AGREEMENT_PIXELS for key in ("w", "h", "x", "y"))
 
@@ -531,23 +523,6 @@ def parse_idet(stderr):
     values = repeated[-1] if repeated else ("0", "0", "0")
     counters.update(zip(("repeated_neither", "repeated_top", "repeated_bottom"), (int(value) for value in values)))
     return counters
-
-
-def idet_run(tools, path, windows, progress=None):
-    """idet over each window; per-window counters from parse_idet (None when idet saw no frame)."""
-    stream, quiet = _progress_options(progress)
-    absolute = os.path.abspath(os.fspath(path))
-    say("idet over {} window(s) of '{}'".format(len(windows), _name(path)), stream)
-    results = []
-    with Progress("idet window", total=len(windows), unit="items", stream=stream, quiet=quiet) as live:
-        for position, window in enumerate(windows):
-            live.update(position)
-            argv = [tools.ffmpeg, "-hide_banner", "-nostats"] + _window_args(window) + [
-                "-i", absolute, "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", "idet", "-f", "null", "-"]
-            completed = run(argv)
-            results.append(parse_idet(completed.stderr))
-        live.update(len(windows))
-    return results
 
 
 def classify_idet_window(counters):
@@ -1293,21 +1268,105 @@ def decide_blockiness(per_window, available=True, windows=()):
             "threshold": BLOCKINESS_HIGH, "reason": reason, "samples": samples}
 
 
-def blockdetect_run(tools, path, windows, progress=None):
-    """blockdetect over each window; per-window parse_blockdetect results. Raises FfmpegError when ffmpeg fails."""
+# --- one ffmpeg per sample window ------------------------------------------------------
+
+
+def window_graph(crop=True, block=True):
+    """(-filter_complex graph, output labels) of one sample window: idet, cropdetect and blockdetect as wanted. Pure.
+
+    The decoded video is split into one branch per filter, so each filter
+    gets the frames in the pixel format it would negotiate when run alone.
+    A plain chain ('idet,cropdetect,blockdetect') negotiates one format for
+    the whole chain: on RGB and palette sources blockdetect then measures
+    yuv444p instead of gbrp and cropdetect reads other bars (measured with
+    ffmpeg 7.1.5 on the msvideo1, msrle and qtrle fixtures). None of the
+    three filters changes a frame; each only logs or attaches metadata.
+    """
+    branches = [("idet", "idet")]
+    if crop:
+        branches.append(("crop", CROPDETECT_CHAIN))
+    if block:
+        branches.append(("block", BLOCKDETECT_CHAIN))
+    labels = ["{}_out".format(name) for name, _chain in branches]
+    if len(branches) == 1:
+        return "[0:v:0]idet[idet_out]", labels
+    inputs = "".join("[{}_in]".format(name) for name, _chain in branches)
+    parts = ["[0:v:0]split={}{}".format(len(branches), inputs)]
+    parts.extend("[{0}_in]{1}[{0}_out]".format(name, chain) for name, chain in branches)
+    return ";".join(parts), labels
+
+
+def blockdetect_positions(count, most=BLOCKDETECT_WINDOWS):
+    """Indexes of the windows blockdetect runs in: all of them up to `most`, else `most` spread evenly. Pure.
+
+    12 windows give 0, 3, 6 and 9; 3 windows give 0, 1 and 2.
+    """
+    count = max(0, int(count))
+    if count <= most:
+        return list(range(count))
+    return [position * count // most for position in range(most)]
+
+
+def window_pass(tools, input_args, windows, label, crop=True, block=True, progress=None):
+    """One ffmpeg per sample window running window_graph; the three filters' per-window results.
+
+    `input_args` are the ffmpeg input arguments ('-i', path for a plain
+    file); the window's -ss/-t go before them. Returns {'idet': [parse_idet
+    per window], 'crop': [parse_cropdetect per window] or None without
+    `crop`, 'block': [parse_blockdetect per blockdetect window] or None
+    without `block`, 'block_windows': [the windows blockdetect ran in]}.
+    Raises FfmpegError when ffmpeg fails.
+    """
     stream, quiet = _progress_options(progress)
-    absolute = os.path.abspath(os.fspath(path))
-    say("blockdetect over {} window(s) of '{}'".format(len(windows), _name(path)), stream)
-    results = []
-    with Progress("blockdetect window", total=len(windows), unit="items", stream=stream, quiet=quiet) as live:
+    block_at = set(blockdetect_positions(len(windows))) if block else set()
+    names = ["idet"] + (["cropdetect"] if crop else []) + (["blockdetect"] if block else [])
+    note = ""
+    if block and len(block_at) < len(windows):
+        note = " (blockdetect in {} of them)".format(len(block_at))
+    say("{} over {} window(s) of '{}'{}".format(", ".join(names), len(windows), label, note), stream)
+    found = {"idet": [], "crop": [] if crop else None, "block": [] if block else None, "block_windows": []}
+    with Progress("window pass", total=len(windows), unit="items", stream=stream, quiet=quiet) as live:
         for position, window in enumerate(windows):
             live.update(position)
-            argv = [tools.ffmpeg, "-hide_banner", "-nostats"] + _window_args(window) + [
-                "-i", absolute, "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", BLOCKDETECT_CHAIN, "-f", "null", "-"]
-            completed = run(argv)
-            results.append(parse_blockdetect(completed.stderr))
+            with_block = position in block_at
+            graph, labels = window_graph(crop, with_block)
+            maps = [part for label in labels for part in ("-map", "[{}]".format(label))]
+            argv = [tools.ffmpeg, "-hide_banner", "-nostats"] + _window_args(window) + list(input_args) + [
+                "-filter_complex", graph] + maps + ["-f", "null", "-"]
+            stderr = run(argv).stderr
+            found["idet"].append(parse_idet(stderr))
+            if crop:
+                found["crop"].append(parse_cropdetect(stderr))
+            if with_block:
+                found["block"].append(parse_blockdetect(stderr))
+                found["block_windows"].append(window)
         live.update(len(windows))
-    return results
+    return found
+
+
+def window_decisions(video, windows, found, assume_dar=None, max_level="4.2"):
+    """(aspect, cadence, blockiness) from window_pass results. Pure.
+
+    found['crop'] None means cropdetect was not wanted (needs_cropdetect);
+    found['block'] None means this ffmpeg has no blockdetect.
+    """
+    samples = [list(window) for window in windows]
+    if found["crop"] is not None:
+        crop = aggregate_crop(found["crop"], video.get("width"), video.get("height"))
+        aspect = decide_aspect(video, crop, assume_dar)
+        aspect["samples"] = samples
+        aspect["crop_windows"] = found["crop"]
+    else:
+        aspect = decide_aspect(video, None, assume_dar)
+        aspect["crop_windows"] = None
+    cadence = decide_cadence(aggregate_idet(found["idet"], video.get("fps")), video, max_level)
+    cadence["samples"] = samples
+    if found["block"] is not None:
+        blockiness = decide_blockiness(found["block"], True, found["block_windows"])
+    else:
+        unmeasured = [windows[index] for index in blockdetect_positions(len(windows))]
+        blockiness = decide_blockiness(None, False, unmeasured)
+    return aspect, cadence, blockiness
 
 
 # --- orchestration --------------------------------------------------------------------
@@ -1342,24 +1401,9 @@ def analyze(tools, path, probe, options=None, progress=None):
 
     decode = decide_decode(decode_run(tools, path, progress, duration))
 
-    if needs_cropdetect(video):
-        crop_windows = cropdetect_run(tools, path, windows, progress)
-        crop = aggregate_crop(crop_windows, video.get("width"), video.get("height"))
-        aspect = decide_aspect(video, crop, assume_dar)
-        aspect["samples"] = [list(window) for window in windows]
-        aspect["crop_windows"] = crop_windows
-    else:
-        aspect = decide_aspect(video, None, assume_dar)
-        aspect["crop_windows"] = None
-
-    idet_windows = idet_run(tools, path, windows, progress)
-    cadence = decide_cadence(aggregate_idet(idet_windows, video.get("fps")), video, max_level)
-    cadence["samples"] = [list(window) for window in windows]
-
-    if has_blockdetect(tools):
-        blockiness = decide_blockiness(blockdetect_run(tools, path, windows, progress), True, windows)
-    else:
-        blockiness = decide_blockiness(None, False, windows)
+    found = window_pass(tools, ["-i", os.path.abspath(os.fspath(path))], windows, _name(path),
+                        needs_cropdetect(video), has_blockdetect(tools), progress)
+    aspect, cadence, blockiness = window_decisions(video, windows, found, assume_dar, max_level)
 
     durations = measure_durations(tools, path, probe, progress)
     sync = decide_sync(probe, durations, audio_offset)

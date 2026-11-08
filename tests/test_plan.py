@@ -18,6 +18,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -41,7 +43,7 @@ from vidfunnel.plan import (
     plan_paths,
     video_filters,
 )
-from vidfunnel.record import load_record, record_path, save_record, set_status
+from vidfunnel.record import iter_records, load_record, record_path, save_record, set_status
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURE_DIR = os.path.join(REPO_ROOT, "tests", "fixtures")
@@ -416,6 +418,38 @@ class PlanSizeEntriesTest(unittest.TestCase):
 # --- names and sources on a temporary tree ---------------------------------------------
 
 
+class JobsOptionTest(unittest.TestCase):
+
+    def test_parser_accepts_jobs_and_keeps_it_out_of_the_record(self):
+        from vidfunnel import cli
+        from vidfunnel.plan import _options_dict, options_from_args
+        args = cli.build_parser().parse_args(["plan", "--jobs", "3", "somewhere"])
+        self.assertEqual(args.jobs, 3)
+        options = options_from_args(args)
+        self.assertEqual(options.jobs, 3)
+        self.assertNotIn("jobs", _options_dict(options))
+        self.assertEqual(cli.build_parser().parse_args(["plan"]).jobs, 1)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                cli.build_parser().parse_args(["plan", "--jobs", "0"])
+
+    def test_output_name_key(self):
+        from vidfunnel.plan import _output_name_key
+
+        class Item(object):
+            def __init__(self, key, stem=None, dvd_title=None):
+                self.key = Path(key)
+                self.folder = self.key.parent
+                self.stem = stem
+                self.dvd_title = dvd_title
+
+        self.assertEqual(_output_name_key(Item("/films/Movie.avi")), _output_name_key(Item("/films/movie.mkv")))
+        self.assertNotEqual(_output_name_key(Item("/films/movie.avi")), _output_name_key(Item("/other/movie.mkv")))
+        self.assertEqual(_output_name_key(Item("/films/VTS_01_1.VOB")), ("/films", "vts_01.mp4"))
+        self.assertEqual(_output_name_key(Item("/films/DISC_title01", "DISC_title01", 1)),
+                         _output_name_key(Item("/films/disc_title01.avi")))
+
+
 def touch(path, content=b""):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -642,6 +676,133 @@ class PlanRunTest(unittest.TestCase):
         self.assertEqual((second["status"], second["quarantine_reason"]), ("quarantined", "output-collision"))
         self.assertIn("'movie.mp4' is already the output of 'movie.avi'", second["stages"]["plan"]["reason"])
         self.assertEqual(load_record(self.root / "movie.avi"), first)
+
+    # --- plan --jobs ---------------------------------------------------------------------
+
+    VOLATILE_KEYS = ("id", "created", "at", "status_at", "replanned_at", "history")
+
+    def comparable_records(self, root):
+        """{relative source key: record} with ids, timestamps and history removed and the root and ids masked."""
+        found = {}
+        for folder, record in iter_records(root):
+            ids = [record["id"]]
+            text = json.dumps(record, sort_keys=True).replace(str(root), "<root>")
+            for record_id in ids:
+                text = text.replace(record_id, "<id>")
+
+            def strip(value):
+                if isinstance(value, dict):
+                    return {key: strip(item) for key, item in value.items() if key not in self.VOLATILE_KEYS}
+                if isinstance(value, list):
+                    return [strip(item) for item in value]
+                return value
+
+            relative = os.path.relpath(str(folder), str(root))
+            found[os.path.join(relative, record["source"]["name"])] = strip(json.loads(text))
+        return found
+
+    def plan_twice(self, layout):
+        """Plan the same sources with jobs=1 and jobs=3 in two copies; (records and counts of each)."""
+        results = []
+        for jobs in (1, 3):
+            self.root = Path(self.temporary.name) / "library_jobs_{}".format(jobs)
+            self.root.mkdir()
+            for name, destination in layout:
+                self.copy_fixture(name, destination)
+            progress = quiet()
+            summary = plan_paths(TOOLS, [str(self.root)], make_options(jobs=jobs), progress=progress)
+            results.append((self.comparable_records(self.root), summary.counts, progress.stream.getvalue()))
+        return results
+
+    def assert_parity(self, results):
+        (sequential, sequential_counts, _text), (parallel, parallel_counts, parallel_text) = results
+        self.assertEqual(parallel_counts, sequential_counts, parallel_text)
+        self.assertEqual(sorted(parallel), sorted(sequential))
+        for key in sorted(sequential):
+            self.assertEqual(parallel[key], sequential[key], key)
+
+    def test_jobs_three_equals_jobs_one_in_one_flat_folder(self):
+        layout = [("h264_high_mkv_aac.mkv", None), ("xvid_avi_mp3.avi", None), ("flv1_swf_mp3.swf", None),
+                  (os.path.join("collision_pair", "movie.avi"), "movie.avi"),
+                  (os.path.join("collision_pair", "movie.mkv"), "movie.mkv"),
+                  (os.path.join("vob_fragments_no_ifo", "VTS_01_1.VOB"), "VTS_01_1.VOB"),
+                  (os.path.join("vob_fragments_no_ifo", "VTS_01_2.VOB"), "VTS_01_2.VOB")]
+        results = self.plan_twice(layout)
+        self.assert_parity(results)
+        records, counts, _text = results[1]
+        self.assertEqual(counts, {"remux": 1, "re-encode": 3, "quarantine": 2, "skipped": 0, "failed": 0})
+        for name in ("movie.avi", "movie.mkv"):
+            record = records[os.path.join(".", name)]
+            self.assertEqual((record["status"], record["quarantine_reason"]), ("quarantined", "output-collision"))
+        self.assertIn("[plan 6/6]", results[1][2])
+
+    def test_jobs_three_equals_jobs_one_across_folders(self):
+        results = self.plan_twice([(name, None) for name in INTEGRATION_FIXTURES])
+        self.assert_parity(results)
+
+    def test_same_stem_items_planned_at_once_both_quarantine(self):
+        from vidfunnel.ffmpeg import capabilities as ffmpeg_capabilities
+        from vidfunnel.plan import _Work, _plan_one
+        from vidfunnel.probe import decodable_codecs
+        self.copy_collision_pair()
+        sources = [self.root / "movie.avi", self.root / "movie.mkv"]
+        capabilities = dict(ffmpeg_capabilities(TOOLS))
+        capabilities["decodable"] = decodable_codecs(TOOLS)
+        record_lock = threading.Lock()
+        outcomes = {}
+
+        def plan_source(source):
+            outcomes[source.name] = _plan_one(TOOLS, _Work(source), make_options(), sources, capabilities, quiet(),
+                                              None, record_lock)[0]
+
+        import vidfunnel.plan
+        from unittest import mock
+        unlocked_calls = []
+        real_claims = vidfunnel.plan.recorded_claims
+        real_save = vidfunnel.plan.save_record
+
+        def checked(real, name):
+            def call(*arguments, **keywords):
+                if not record_lock.locked():
+                    unlocked_calls.append(name)
+                return real(*arguments, **keywords)
+            return call
+
+        threads = [threading.Thread(target=plan_source, args=(source,)) for source in sources]
+        with mock.patch("vidfunnel.plan.recorded_claims", side_effect=checked(real_claims, "recorded_claims")), \
+                mock.patch("vidfunnel.plan.save_record", side_effect=checked(real_save, "save_record")):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(outcomes, {"movie.avi": "quarantine", "movie.mkv": "quarantine"})
+        self.assertEqual(unlocked_calls, [], "the record step ran without the folder's lock")
+        self.assertFalse(record_lock.locked())
+        for source in sources:
+            record = load_record(source)
+            self.assertEqual((record["status"], record["quarantine_reason"]), ("quarantined", "output-collision"))
+            self.assertEqual(record["stages"]["plan"]["collision"], "same-stem")
+
+    def test_jobs_puts_items_with_one_output_name_on_one_worker_in_order(self):
+        self.copy_collision_pair()
+        self.copy_fixture("xvid_avi_mp3.avi")
+        self.copy_fixture("h264_high_mkv_aac.mkv")
+        seen = []
+
+        def fake_entry(tools, work, found, options, folder_sources, capabilities, progress, stream, position, total,
+                       record_lock=None):
+            seen.append((work.source.name, threading.get_ident(), time.monotonic()))
+            if work.source.name == "movie.avi":
+                time.sleep(0.3)
+            return "failed", None
+
+        from unittest import mock
+        with mock.patch("vidfunnel.plan._plan_entry", side_effect=fake_entry):
+            plan_paths(TOOLS, [str(self.root)], make_options(jobs=3), progress=quiet())
+        by_name = {name: (thread, moment) for name, thread, moment in seen}
+        self.assertEqual(sorted(by_name), ["h264_high_mkv_aac.mkv", "movie.avi", "movie.mkv", "xvid_avi_mp3.avi"])
+        self.assertEqual(by_name["movie.avi"][0], by_name["movie.mkv"][0])
+        self.assertGreaterEqual(by_name["movie.mkv"][1] - by_name["movie.avi"][1], 0.3)
 
     def test_read_only_folder_is_skipped_without_a_traceback(self):
         if hasattr(os, "geteuid") and os.geteuid() == 0:

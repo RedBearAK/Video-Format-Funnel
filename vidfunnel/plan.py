@@ -47,21 +47,16 @@ import json
 import os
 import re
 import sys
+import threading
 import types
 from pathlib import Path
 
 import vidfunnel
 from vidfunnel.analyze import (
-    BLOCKDETECT_CHAIN,
     DEFAULT_SAMPLES,
     WINDOW_SECONDS,
-    aggregate_crop,
-    aggregate_idet,
     analyze,
-    decide_aspect,
-    decide_blockiness,
     decide_audio,
-    decide_cadence,
     decide_colour,
     decide_decode,
     decide_keyframes,
@@ -72,12 +67,11 @@ from vidfunnel.analyze import (
     durations_from_packets,
     has_blockdetect,
     needs_cropdetect,
-    parse_blockdetect,
-    parse_cropdetect,
-    parse_idet,
     predicted_score,
     remux_eligible,
     sample_windows,
+    window_decisions,
+    window_pass,
     PACKET_ENTRIES,
 )
 from vidfunnel.ffmpeg import DecodeResult, FfmpegError, classify_messages, ffprobe_json
@@ -172,13 +166,16 @@ class PlanError(Exception):
 def make_options(**values):
     """The plan options as a namespace, defaults filled in (what run() builds from the CLI args)."""
     defaults = dict(samples=None, full_analysis=False, assume_dar=None, audio_offset=None, audio_strict_aac=False,
-                    reencode_video=False, max_level="4.2", plain_mp4=False, par2=None, replan=False)
+                    reencode_video=False, max_level="4.2", plain_mp4=False, par2=None, replan=False, jobs=1)
     defaults.update(values)
     return types.SimpleNamespace(**defaults)
 
 
 def options_from_args(args):
-    return make_options(**{name: getattr(args, name) for name in PLAN_OPTION_NAMES if hasattr(args, name)})
+    """make_options from the CLI args; 'jobs' is how the run is done, not a decision, so it is not recorded."""
+    values = {name: getattr(args, name) for name in PLAN_OPTION_NAMES if hasattr(args, name)}
+    values["jobs"] = getattr(args, "jobs", 1) or 1
+    return make_options(**values)
 
 
 def _options_dict(options):
@@ -198,6 +195,9 @@ def _extension(path):
     return Path(path).suffix.lower().lstrip(".")
 
 
+_identity_lock = threading.Lock()
+
+
 def read_identity(tools, path):
     """The parsed 'vidfunnel' format tag of a file, or None. Cached per (path, size, mtime) for the run.
 
@@ -210,8 +210,9 @@ def read_identity(tools, path):
     except OSError:
         return None
     key = (absolute, status.st_size, status.st_mtime_ns)
-    if key in _identity_cache:
-        return _identity_cache[key]
+    with _identity_lock:
+        if key in _identity_cache:
+            return _identity_cache[key]
     tag = None
     try:
         raw = ffprobe_json(tools, absolute)
@@ -226,7 +227,8 @@ def read_identity(tools, path):
             if isinstance(parsed, dict) and parsed.get("tool") == IDENTITY_KEY:
                 tag = parsed
             break
-    _identity_cache[key] = tag
+    with _identity_lock:
+        _identity_cache[key] = tag
     return tag
 
 
@@ -759,15 +761,6 @@ def build_sidecar_argvs(tools, source_inputs, output_path, analysis, dvd_title=N
 # --- analysis of inputs given as ffmpeg arguments (VOB groups, DVD titles) ------------
 
 
-def _window_args(window):
-    start, length = window
-    if length is not None:
-        return ["-ss", "{:.3f}".format(start), "-t", "{:.3f}".format(length)]
-    if start:
-        return ["-ss", "{:.3f}".format(start)]
-    return []
-
-
 def _ffprobe_json_input(tools, arguments, label):
     argv = [tools.ffprobe, "-v", "error", "-print_format", "json"] + arguments
     completed = run_tool(argv, check=False)
@@ -791,20 +784,6 @@ def _packets_input(tools, input_args, label, stream_index, entries):
     raw = _ffprobe_json_input(tools, ["-select_streams", str(stream_index), "-show_entries", "packet=" + entries]
                               + input_args, label)
     return raw.get("packets", [])
-
-
-def _window_pass(tools, input_args, windows, filter_text, parser, title, label, progress):
-    stream, quiet = _progress_options(progress)
-    say("{} over {} window(s) of '{}'".format(filter_text.split("=")[0].split(",")[0], len(windows), label), stream)
-    results = []
-    with Progress(title, total=len(windows), unit="items", stream=stream, quiet=quiet) as live:
-        for position, window in enumerate(windows):
-            live.update(position)
-            argv = [tools.ffmpeg, "-hide_banner", "-nostats"] + _window_args(window) + input_args + [
-                "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", filter_text, "-f", "null", "-"]
-            results.append(parser(run_tool(argv).stderr))
-        live.update(len(windows))
-    return results
 
 
 def _durations_input(tools, input_args, label, probe, progress):
@@ -836,9 +815,9 @@ def analyze_input(tools, input_args, label, probe, options=None, progress=None):
     """analyze() for an input given as ffmpeg input arguments; the same dict, plus 'input': label.
 
     The passes are those of vidfunnel.analyze.analyze (full decode check,
-    sampled cropdetect and idet, packet timing, keyframe scan for remux
-    candidates) with `input_args` in place of '-i PATH'; every decision comes
-    from analyze's own decide_* rules. `probe` must keep its 'raw' JSON.
+    vidfunnel.analyze.window_pass over the sample windows, packet timing,
+    keyframe scan for remux candidates) with `input_args` in place of
+    '-i PATH'; every decision comes from analyze's own decide_* rules. `probe` must keep its 'raw' JSON.
     """
     video = probe.get("video")
     if video is None:
@@ -860,26 +839,8 @@ def analyze_input(tools, input_args, label, probe, options=None, progress=None):
         completed = run_tool(argv, progress=ffmpeg_progress_callback(live, duration), check=False)
     decode = decide_decode(DecodeResult(completed.returncode, classify_messages(completed.stderr), completed.stderr))
 
-    if needs_cropdetect(video):
-        crop_windows = _window_pass(tools, input_args, windows, "cropdetect=limit=24:round=2:reset=0",
-                                    parse_cropdetect, "cropdetect window", label, progress)
-        aspect = decide_aspect(video, aggregate_crop(crop_windows, video.get("width"), video.get("height")),
-                               assume_dar)
-        aspect["samples"] = [list(window) for window in windows]
-        aspect["crop_windows"] = crop_windows
-    else:
-        aspect = decide_aspect(video, None, assume_dar)
-        aspect["crop_windows"] = None
-
-    idet_windows = _window_pass(tools, input_args, windows, "idet", parse_idet, "idet window", label, progress)
-    cadence = decide_cadence(aggregate_idet(idet_windows, video.get("fps")), video, max_level)
-    cadence["samples"] = [list(window) for window in windows]
-
-    if has_blockdetect(tools):
-        blockiness = decide_blockiness(_window_pass(tools, input_args, windows, BLOCKDETECT_CHAIN, parse_blockdetect,
-                                                    "blockdetect window", label, progress), True, windows)
-    else:
-        blockiness = decide_blockiness(None, False, windows)
+    found = window_pass(tools, input_args, windows, label, needs_cropdetect(video), has_blockdetect(tools), progress)
+    aspect, cadence, blockiness = window_decisions(video, windows, found, assume_dar, max_level)
 
     sync = decide_sync(probe, _durations_input(tools, input_args, label, probe, progress), audio_offset)
     sync_by_index = {entry["index"]: entry for entry in sync["result"]}
@@ -1067,30 +1028,77 @@ def _new_record_for(work):
     return record
 
 
-def _plan_one(tools, work, options, folder_sources, capabilities, progress, known_probe=None):
-    """(outcome, record) for one work item. Saves the record unless the item was skipped."""
+def _attach_history(record, existing, fingerprint, members):
+    """Move the source's existing record into the new record's history (marked re-planned or source-changed)."""
+    if existing is None:
+        return
+    history = list(existing.pop("history", None) or [])
+    if _unchanged(existing, fingerprint, members):
+        existing["replanned_at"] = now_iso()
+    else:
+        set_status(existing, "source-changed")
+    history.append(existing)
+    record["history"] = history
+
+
+def _plan_one(tools, work, options, folder_sources, capabilities, progress, known_probe=None, record_lock=None):
+    """(outcome, record) for one work item. Saves the record unless the item was skipped.
+
+    `record_lock` (plan --jobs: the folder's threading.Lock) is held from the
+    reread of this source's record through the collision check against the
+    folder's other records to the last save; the probe, the hash, the
+    analysis and the output-name check run before it is taken.
+    """
     stream, _quiet = _progress_options(progress)
+    held = []
+    try:
+        return _plan_one_locked(tools, work, options, folder_sources, capabilities, progress, known_probe,
+                                record_lock, held, stream)
+    finally:
+        if held:
+            record_lock.release()
+
+
+def _plan_one_locked(tools, work, options, folder_sources, capabilities, progress, known_probe, record_lock, held,
+                     stream):
+    def take_lock():
+        if record_lock is not None and not held:
+            record_lock.acquire()
+            held.append(True)
+
     existing = load_record(work.key)
     fingerprint = cheap_fingerprint(work.hashed[0])
     members = _member_fingerprints(work.members) if work.members is not None else None
     replan = bool(getattr(options, "replan", False))
     if existing is not None and _unchanged(existing, fingerprint, members) and not replan:
-        return "skipped", existing
+        take_lock()
+        return "skipped", load_record(work.key) or existing
 
     record = _new_record_for(work)
     if existing is not None:
-        history = list(existing.pop("history", None) or [])
-        if _unchanged(existing, fingerprint, members):
-            existing["replanned_at"] = now_iso()
-        else:
-            set_status(existing, "source-changed")
+        if not _unchanged(existing, fingerprint, members):
             say("'{}' changed since record {} was planned; re-planning under a new record".format(
                 work.label, existing.get("id")), stream)
-        history.append(existing)
-        record["history"] = history
         old_sha = (existing.get("source") or {}).get("sha256")
         if old_sha and _unchanged(existing, fingerprint, members):
             record["source"]["sha256"] = old_sha
+    settled = []
+
+    def settle():
+        """Take the folder's record lock, then the history from this source's record as it is now on disk.
+
+        With --jobs the items that share this output name run before this
+        one on the same worker, so the reread sees what a sequential run sees;
+        another item's collision check changes only a record's status, flags
+        and plan, never the fingerprint or the hash used above.
+        """
+        if settled:
+            return settled[0]
+        take_lock()
+        current = load_record(work.key) if existing is not None else None
+        _attach_history(record, current, fingerprint, members)
+        settled.append(current)
+        return current
 
     plan = {"inputs": list(work.inputs), "profile": PLAIN_PROFILE if getattr(options, "plain_mp4", False) else PROFILE,
             "options": _options_dict(options), "par2": getattr(options, "par2", None),
@@ -1113,6 +1121,7 @@ def _plan_one(tools, work, options, folder_sources, capabilities, progress, know
             record["source"]["sha256"] = _sha256_paths(work.hashed, work.label, progress)
         if kind != "video":
             plan.update(action="quarantine", reason=kind_reason, analysis="skipped: {}".format(kind))
+            settle()
             return _finish_quarantine(work, record, plan, kind)
 
         if work.dvd_title is None and len(work.inputs) == 1:
@@ -1141,6 +1150,7 @@ def _plan_one(tools, work, options, folder_sources, capabilities, progress, know
         if action == "quarantine":
             decode_reason = (analysis.get("decode") or {}).get("reason")
             plan.update(action="quarantine", reason="{}: {}".format(reason, decode_reason))
+            settle()
             return _finish_quarantine(work, record, plan, reason)
 
         if work.dvd_title is not None:
@@ -1152,7 +1162,7 @@ def _plan_one(tools, work, options, folder_sources, capabilities, progress, know
         record["output"]["interim_name"] = names["interim_name"]
         final_path = work.folder / names["name"]
         sidecars = build_sidecar_argvs(tools, work.inputs, final_path, analysis, work.dvd_title)
-        ours = _own_sidecar_names(existing)
+        ours = _own_sidecar_names(settle())
         sidecars, skipped_sidecars = _drop_foreign_text_sidecars(sidecars, ours)
         for name in skipped_sidecars:
             add_flag(record, "sidecar-exists")
@@ -1193,6 +1203,7 @@ def _plan_one(tools, work, options, folder_sources, capabilities, progress, know
     except (FfmpegError, PlanError, OSError) as error:
         plan.update(action=None, error=str(error), stderr=getattr(error, "stderr", None),
                     failed_argv=getattr(error, "argv", None))
+        settle()
         if "plan" not in record["stages"]:
             add_stage(record, "plan", plan)
         set_status(record, "failed")
@@ -1323,8 +1334,25 @@ def plan_paths(tools, paths, options, progress=None):
     created (a read-only folder), is skipped and counted as 'skipped'; the
     second kind is also listed in the summary's `lock_errors` (folder names),
     which makes run() exit with EXIT_ERROR.
+
+    options.jobs above 1 plans that many items at once, also within one
+    folder, through a thread pool; counts, rows and the folder file are
+    handled on the calling thread from the values the workers return, and
+    lines go through one line stream, as in convert --jobs. A threading.Lock
+    per folder is held around each item's record step (reread its record,
+    find the folder's records claiming the same output name, decide, save,
+    quarantine a claiming record); the probe, hash, analysis and output-name
+    check run outside it and touch no record. Items whose output names match
+    can affect each other's records only through that step, so they go to
+    one worker in list order; every other pair reads and writes disjoint
+    records, which is why the records equal those of a sequential run.
     """
-    stream, _quiet = _progress_options(progress)
+    from vidfunnel.encode import _LineStream
+    stream, quiet = _progress_options(progress)
+    jobs = max(1, int(getattr(options, "jobs", 1) or 1))
+    if jobs > 1:
+        stream = _LineStream(stream if stream is not None else sys.stdout)
+        progress = types.SimpleNamespace(stream=stream, quiet=quiet)
     summary = StageSummary("plan", OUTCOMES)
     summary.lock_errors = []
     capabilities = dict(ffmpeg_capabilities(tools))
@@ -1344,49 +1372,141 @@ def plan_paths(tools, paths, options, progress=None):
     for source in sources:
         siblings.setdefault(str(source.parent), []).append(source)
     total = len(items)
-    position = 0
-    rows = []
-    for folder in folders:
-        entries = by_folder[folder]
-        lock = FolderLock(folder, warn=lambda message: say(message, stream))
-        try:
-            lock.acquire()
-        except LockHeld as error:
-            position += len(entries)
-            say("skipping folder '{}': {}".format(folder, error), stream)
-            summary.add("skipped", len(entries))
-            continue
-        except OSError as error:
-            position += len(entries)
-            say("skipping folder '{}': cannot take its lock: {}".format(folder, error), stream)
-            summary.add("skipped", len(entries))
-            summary.lock_errors.append(folder)
-            continue
-        try:
-            for work, found in entries:
-                position += 1
-                say("[plan {}/{}] probing '{}'".format(position, total, work.label), stream)
-                try:
-                    outcome, record = _plan_one(tools, work, options, siblings.get(folder, []), capabilities,
-                                                progress, found)
-                except RecordError as error:
-                    say("failed: '{}': {}".format(work.label, error), stream)
-                    summary.add("failed")
-                    continue
-                summary.add(outcome)
-                rows.append(_table_row(outcome, record))
-                if outcome == "skipped":
-                    say("  skipped: record {} is '{}' and the source is unchanged (--replan to plan again)".format(
-                        record.get("id"), record.get("status")), stream)
-            _update_folder_file(folder, [work for work, _found in entries])
-        finally:
-            lock.release()
+    if jobs > 1:
+        rows = _plan_parallel(tools, options, progress, stream, summary, capabilities, folders, by_folder, siblings,
+                              total, jobs)
+    else:
+        rows = _plan_sequential(tools, options, progress, stream, summary, capabilities, folders, by_folder,
+                                siblings, total)
     if rows:
         say("  {:<34} {:>5} {:>10}  {}  {}".format("action", "score", "size", "source", "flags"), stream)
         for row in rows:
             say(row, stream)
     say(summary.format("'{}/' under each folder".format(RECORD_DIR)), stream)
     return summary
+
+
+def _take_folder_lock(folder, entries, summary, stream):
+    """The acquired FolderLock of `folder`, or None after saying why and counting its entries as skipped."""
+    lock = FolderLock(folder, warn=lambda message: say(message, stream))
+    try:
+        lock.acquire()
+    except LockHeld as error:
+        say("skipping folder '{}': {}".format(folder, error), stream)
+        summary.add("skipped", len(entries))
+        return None
+    except OSError as error:
+        say("skipping folder '{}': cannot take its lock: {}".format(folder, error), stream)
+        summary.add("skipped", len(entries))
+        summary.lock_errors.append(folder)
+        return None
+    return lock
+
+
+def _plan_entry(tools, work, found, options, folder_sources, capabilities, progress, stream, position, total,
+                record_lock=None):
+    """(outcome, record or None) for one work item, with its start line and its skip line."""
+    say("[plan {}/{}] probing '{}'".format(position, total, work.label), stream)
+    try:
+        outcome, record = _plan_one(tools, work, options, folder_sources, capabilities, progress, found,
+                                    record_lock)
+    except RecordError as error:
+        say("failed: '{}': {}".format(work.label, error), stream)
+        return "failed", None
+    if outcome == "skipped":
+        say("  skipped: record {} is '{}' and the source is unchanged (--replan to plan again)".format(
+            record.get("id"), record.get("status")), stream)
+    return outcome, record
+
+
+def _plan_sequential(tools, options, progress, stream, summary, capabilities, folders, by_folder, siblings, total):
+    """One folder after another, one item after another; returns the table rows."""
+    position = 0
+    rows = []
+    for folder in folders:
+        entries = by_folder[folder]
+        lock = _take_folder_lock(folder, entries, summary, stream)
+        if lock is None:
+            position += len(entries)
+            continue
+        try:
+            for work, found in entries:
+                position += 1
+                outcome, record = _plan_entry(tools, work, found, options, siblings.get(folder, []), capabilities,
+                                              progress, stream, position, total)
+                summary.add(outcome)
+                if record is not None:
+                    rows.append(_table_row(outcome, record))
+            _update_folder_file(folder, [work for work, _found in entries])
+        finally:
+            lock.release()
+    return rows
+
+
+def _output_name_key(work):
+    """(folder, output name casefolded): items sharing it may claim each other's output, and are planned together."""
+    stem = work.stem if work.dvd_title is not None else output_stem(work.key)
+    return str(work.folder), (stem + ".mp4").casefold()
+
+
+def _plan_parallel(tools, options, progress, stream, summary, capabilities, folders, by_folder, siblings, total,
+                   jobs):
+    """The items of every locked folder through a pool of `jobs` threads; returns the rows in list order.
+
+    One future per item, except that items with the same output name in one
+    folder share a future and run one after another in list order.
+    """
+    import concurrent.futures
+    folder_locks = []
+    groups = {}
+    order = []
+    position = 0
+    try:
+        for folder in folders:
+            entries = by_folder[folder]
+            lock = _take_folder_lock(folder, entries, summary, stream)
+            if lock is None:
+                position += len(entries)
+                continue
+            folder_locks.append((folder, lock))
+            for work, found in entries:
+                position += 1
+                key = _output_name_key(work)
+                if key not in groups:
+                    groups[key] = []
+                    order.append(key)
+                groups[key].append((folder, work, found, position))
+        record_locks = {folder: threading.Lock() for folder, _lock in folder_locks}
+
+        def plan_group(members):
+            results = []
+            for folder, work, found, number in members:
+                results.append((number, _plan_entry(tools, work, found, options, siblings.get(folder, []),
+                                                    capabilities, progress, stream, number, total,
+                                                    record_locks[folder])))
+            return results
+
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = [pool.submit(plan_group, groups[key]) for key in order]
+            try:
+                for future in futures:
+                    results.extend(future.result())
+            except KeyboardInterrupt:
+                for future in futures:
+                    future.cancel()
+                raise
+        rows = []
+        for _number, (outcome, record) in sorted(results, key=lambda entry: entry[0]):
+            summary.add(outcome)
+            if record is not None:
+                rows.append(_table_row(outcome, record))
+        for folder, _lock in folder_locks:
+            _update_folder_file(folder, [work for work, _found in by_folder[folder]])
+        return rows
+    finally:
+        for _folder, lock in folder_locks:
+            lock.release()
 
 
 def _update_folder_file(folder, works):
@@ -1429,6 +1549,8 @@ def add_arguments(parser):
     parser.add_argument("--par2", type=_positive_int, default=None, metavar="N",
                         help="record that convert should write PAR2 with N %% redundancy")
     parser.add_argument("--replan", action="store_true", help="plan again sources whose records still match")
+    parser.add_argument("--jobs", type=_positive_int, default=1, metavar="N",
+                        help="files planned at once, also within one folder (default 1)")
     return parser
 
 

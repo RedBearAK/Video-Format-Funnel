@@ -88,7 +88,7 @@ HandBrake's "Web optimized" checkbox is `-movflags +faststart` (moov atom moved 
 
 ## 4. Analysis rules
 
-All analysis is sampled, not full-length, and every result is recorded with the sample positions so it can be reproduced. Default sampling: 12 windows of 3 s, evenly spaced, skipping the first and last 3 % of the duration (titles, credits, black). Files shorter than 60 s are analysed in full automatically (the windows would overlap). `--samples N` and `--full-analysis` override.
+All analysis is sampled, not full-length, and every result is recorded with the sample positions so it can be reproduced. Default sampling: 12 windows of 3 s, evenly spaced, skipping the first and last 3 % of the duration (titles, credits, black). Files shorter than 60 s are analysed in full automatically (the windows would overlap). `--samples N` and `--full-analysis` override. Each window is read by one ffmpeg process whose filter graph chains `idet` (first, since it reads the field structure), `cropdetect` when §4.2 needs bar evidence, and `blockdetect` in at most 4 of the windows, spread evenly (of 12: the 1st, 4th, 7th and 10th); the three results are parsed from that one run's stderr.
 
 ### 4.1 Decode check
 
@@ -165,7 +165,7 @@ Each converted file gets a score from 100 minus the penalties above, plus post-c
 | Identity tag missing or naming another record or source | −100 |
 | Optional sampled SSIM against source below threshold (`--ssim-check`, default off, threshold 0.97 on luma) | −25 |
 | Quarantined for any reason | 0 |
-| Size class (`stages.analyze.size_class`: bits per pixel per frame, classes `heavy` < 0.15, `near` to 0.4, `smaller` to 1.0, `much-smaller` above) and blockiness (`stages.analyze.blockiness`: mean blockdetect score over the sample windows, "not measured" without the filter) | 0, informational; read by `convert --refit` |
+| Size class (`stages.analyze.size_class`: bits per pixel per frame, classes `heavy` < 0.15, `near` to 0.4, `smaller` to 1.0, `much-smaller` above) and blockiness (`stages.analyze.blockiness`: mean blockdetect score over at most 4 of the sample windows, listed under its `samples`, "not measured" without the filter) | 0, informational; read by `convert --refit` |
 | Refit replaced the output (flag `refitted`) | 0, informational; the replaced output is verified and scored again |
 | Refit kept the existing output (flag `fit-capped`) | 0, informational; the record keeps `output-larger` and `retire` still needs `--allow-larger` |
 
@@ -177,7 +177,7 @@ Every stage is a separate subcommand, idempotent, and resumable. State lives in 
 
 ```
 vidfunnel check
-vidfunnel plan   [--samples N] [--full-analysis] [--assume-dar R] [--audio-offset S] [--audio-strict-aac] [--reencode-video] [--max-level 4.1|4.2] [--plain-mp4] [--par2 N] [--replan] [PATH...]
+vidfunnel plan   [--samples N] [--full-analysis] [--assume-dar R] [--audio-offset S] [--audio-strict-aac] [--reencode-video] [--max-level 4.1|4.2] [--plain-mp4] [--par2 N] [--replan] [--jobs N] [PATH...]
 vidfunnel convert [--par2 N] [--jobs N] [--dry-run] [--refit] [PATH...]
 vidfunnel verify [PATH...]
 vidfunnel report [--format md|json|csv] [--min-score N] [--reveal] [--with-logs] PATH...
@@ -199,7 +199,7 @@ Dependency table for this machine: ffmpeg/ffprobe version, `libx264`, native `aa
 
 ### 6.2 `plan`
 
-Probe + analysis (§4), writes the JSON record with the full decision list, the reasons, the sample positions, and the exact ffmpeg command that `convert` will run. Prints a summary table: action (remux / re-encode / quarantine), flags, predicted confidence, source size. `plan` never writes media. Re-running `plan` on a planned file is a no-op unless `--replan`.
+Probe + analysis (§4), writes the JSON record with the full decision list, the reasons, the sample positions, and the exact ffmpeg command that `convert` will run. Prints a summary table: action (remux / re-encode / quarantine), flags, predicted confidence, source size. `plan` never writes media. Re-running `plan` on a planned file is a no-op unless `--replan`. `--jobs N` plans N files at once, also within one folder: the ffmpeg and ffprobe passes run in parallel, while each file's record step (reading its record and the folder's records that claim the same output name, deciding the collision, saving) runs under a per-folder lock, and files that would share an output name are planned one after another in list order, so the records equal those of a sequential run.
 
 ### 6.3 `convert`
 
@@ -275,7 +275,7 @@ The repo's `bin/vidfunnel` is the one launcher: a POSIX `sh` script that resolve
 Standing rule: nothing the tool does that may take more than one second of wall-clock time runs silently. A user should never have to wonder whether it is working.
 
 - Before any operation that may take a second or more, print one line saying what is about to happen and to which file (`[plan 12/340] probing C_____ N___.avi`), redacted the same way as reports when the terminal output is being captured with `--log FILE`, revealed on the terminal.
-- Long operations show live progress. ffmpeg is run with `-nostats -progress pipe:1`, which emits `out_time`, `frame`, `fps` and `speed` every half second; these render as one updating line: `[re-encode] 00:12:34 / 01:32:10  13.6 %  212 fps  8.1x  eta 00:09:48`. Hashing and copying report bytes and MB/s the same way. Sampled analysis shows the window counter (`idet window 7/12`). Operations with no measurable length show an elapsed-time counter, not a spinner.
+- Long operations show live progress. ffmpeg is run with `-nostats -progress pipe:1`, which emits `out_time`, `frame`, `fps` and `speed` every half second; these render as one updating line: `[re-encode] 00:12:34 / 01:32:10  13.6 %  212 fps  8.1x  eta 00:09:48`. Hashing and copying report bytes and MB/s the same way. Sampled analysis shows the window counter (`window pass 7/12`). Operations with no measurable length show an elapsed-time counter, not a spinner.
 - On a TTY the line updates in place (`\r`, no ANSI beyond that, `NO_COLOR` respected, plain ASCII). When stdout is not a TTY (log file, CI, `--jobs` with interleaved output) the same information is written as a new line at most every 30 seconds, so logs stay readable and nothing is lost.
 - `--quiet` keeps per-file start lines and errors only; `--verbose` adds the ffmpeg argv before each run. There is no mode that is silent while working. The `--log FILE` option described above is not implemented in the first build (open question 8).
 - Each stage ends with a one-line summary: counts per outcome, total time, and where the records went.

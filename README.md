@@ -141,8 +141,8 @@ vidfunnel plan "Home Videos"
 [plan 6/6] probing 'movie.mkv'
 decode check of 'movie.mkv'
 [decode] 00:00:05 / 00:00:05  100.0 %  0 fps  136.0x  eta 00:00:00
-idet over 1 window(s) of 'movie.mkv'
-[idet window] 1/1  100.0 %
+idet, blockdetect over 1 window(s) of 'movie.mkv'
+[window pass] 1/1  100.0 %
 reading packet timing of 2 stream(s) of 'movie.mkv'
 measuring keyframe spacing of 'movie.mkv'
 [keyframes] elapsed 00:00:00  1 keyframes in 125 packets
@@ -160,7 +160,8 @@ plan: 3 remux, 1 re-encode, 2 quarantine, 0 skipped, 0 failed in 00:00:08; recor
 
 The main options:
 
-- `--samples N` sets the number of sample windows for `idet` and `cropdetect` (default 12 windows of 3 s, skipping the first and last 3 %); `--full-analysis` analyses the whole file. Files shorter than 60 s are always analysed in full.
+- `--samples N` sets the number of sample windows for `idet` and `cropdetect` (default 12 windows of 3 s, skipping the first and last 3 %); `--full-analysis` analyses the whole file. Files shorter than 60 s are always analysed in full. Each window is decoded once, by one ffmpeg running `idet`, `cropdetect` (when the aspect rule needs bar evidence) and `blockdetect` together; `blockdetect` runs in at most 4 of the windows, spread evenly.
+- `--jobs N` plans N files at once (default 1), also within one folder. On a four-core machine, four copies of a 3-minute MPEG-2 clip planned in 21 s with `--jobs 4` and in 39 s with `--jobs 1`. The records are the same as with `--jobs 1`; files that would get the same output name are planned one after another.
 - `--assume-dar 4:3|16:9` resolves an SD frame whose aspect cannot be told from the pixels.
 - `--audio-offset S` replaces the measured audio start offset.
 - `--audio-strict-aac` re-encodes MP3 to AAC instead of copying it.
@@ -378,6 +379,14 @@ The profile aims at transparency and playability, not at shrinking, so the resul
 Audio moves the same way: AAC and MP3 are byte-identical copies; AC-3 stereo becomes AAC 192k, a modest saving; PCM at 1.5 Mb/s becomes 192k, a large one on DV and camera clips; AC-3 5.1 at 448k becomes AAC at the 448k cap, about the same. The closed 2 s GOP costs roughly 5 to 15 % against x264's default GOP; it is the price of bounding decode damage to two seconds.
 
 The DivX and WMV row is the reason the size rule exists (see `convert`): on a library of 2000s rips a good share of re-encodes will come out larger than their sources. That is the correct result for the stated goal, since a lower quality setting would visibly degrade already poor material, but it means the tool does not shrink that class by default. `convert --refit` (see `convert`) re-encodes such outputs once more at a CRF chosen from how much larger they came out, up to 23 for SD and 24 for HD, and keeps the result only when it is smaller. `--par2 N` adds roughly N % of the output size plus a small index file; the `.subs.mkv` sidecar for DVD bitmap subtitles is a few megabytes at most.
+
+### Why nothing here uses a GPU
+
+Nothing in the pipeline uses a GPU, by ffmpeg's defaults and by choice. The output is made by libx264, which runs on the CPU. ffmpeg's hardware H.264 encoders (NVENC, Quick Sync, VAAPI, VideoToolbox) are many times faster, but they are built for real-time work: at the same file size their picture quality is clearly below x264 at `-preset slower`, they have no equivalent of x264's slow rate-distortion search, and their rate control has no true constant-quality mode comparable to CRF. For an archive whose point is a transparent re-encode of lossy sources that trade is the wrong one, so the tool does not use them even when they are present; ffmpeg never switches to them on its own.
+
+Decoding is the same story. ffmpeg uses a hardware decoder only when asked with `-hwaccel`, and most of the formats this tool exists for have none: Xvid and DivX, WMV, FLV1, Sorenson, Cinepak, MS Video 1, RLE, DV. MPEG-2 and H.264 do, but the analysis filters (idet, cropdetect, blockdetect, bwdif) run on the CPU, so every decoded frame would be copied back from the GPU, which on standard-definition material costs about what it saves.
+
+The time goes into x264 during `convert`, which scales across CPU cores, and into single-threaded legacy decoders during `plan`, which `--jobs` spreads across files. A machine with a strong GPU and a weak CPU gains nothing here; one with more cores gains in both stages.
 
 ## Records and identity
 

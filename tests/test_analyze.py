@@ -29,9 +29,8 @@ from vidfunnel.analyze import (
     aggregate_idet,
     analyze,
     bits_per_pixel,
-    blockdetect_run,
+    blockdetect_positions,
     classify_idet_window,
-    cropdetect_run,
     decide_aspect,
     decide_audio,
     decide_blockiness,
@@ -44,7 +43,6 @@ from vidfunnel.analyze import (
     decide_subtitles,
     decide_sync,
     durations_from_packets,
-    idet_run,
     measure_durations,
     needs_cropdetect,
     parse_blockdetect,
@@ -55,6 +53,9 @@ from vidfunnel.analyze import (
     sample_windows,
     size_class,
     video_bitrate,
+    window_decisions,
+    window_graph,
+    window_pass,
 )
 from vidfunnel.ffmpeg import DecodeResult, ToolNotFound, find_tools
 
@@ -727,6 +728,11 @@ elif not FIXTURES:
         FIXTURE_DIR)
 
 
+def crop_windows(path, windows):
+    """Per-window cropdetect results of window_pass, without blockdetect."""
+    return window_pass(TOOLS, ["-i", path], windows, os.path.basename(path), True, False, quiet_progress())["crop"]
+
+
 @unittest.skipIf(SKIP_REASON is not None, SKIP_REASON or "")
 class FixtureTests(unittest.TestCase):
     def fixture(self, relative):
@@ -740,7 +746,7 @@ class FixtureTests(unittest.TestCase):
         path = self.fixture(relative)
         probe = probe_file(TOOLS, path)
         windows = sample_windows(probe["format"]["duration"])
-        per_window = idet_run(TOOLS, path, windows, quiet_progress())
+        per_window = window_pass(TOOLS, ["-i", path], windows, relative, False, False, quiet_progress())["idet"]
         return aggregate_idet(per_window, probe["video"]["fps"])
 
     def test_idet_interlaced(self):
@@ -760,12 +766,12 @@ class FixtureTests(unittest.TestCase):
 
     def test_cropdetect_letterbox(self):
         path = self.fixture("letterbox_720x480_sar_1x1.mkv")
-        per_window = cropdetect_run(TOOLS, path, [(0.0, None)], quiet_progress())
+        per_window = crop_windows(path, [(0.0, None)])
         self.assertEqual(aggregate_crop(per_window, 720, 480), {"w": 720, "h": 360, "x": 0, "y": 60})
 
     def test_cropdetect_sampled_windows(self):
         path = self.fixture("letterbox_720x480_sar_1x1.mkv")
-        per_window = cropdetect_run(TOOLS, path, [(0.5, 1.0), (2.0, 1.0), (3.5, 1.0)], quiet_progress())
+        per_window = crop_windows(path, [(0.5, 1.0), (2.0, 1.0), (3.5, 1.0)])
         letterbox = {"w": 720, "h": 360, "x": 0, "y": 60}
         # The test pattern's left 90 columns stay dark through the third second, so the last window alone
         # reads 630x360 at 90,60: two windows of three agree, under 75 %, so no bars are reported.
@@ -776,7 +782,7 @@ class FixtureTests(unittest.TestCase):
 
     def test_cropdetect_no_bars(self):
         path = self.fixture("h264_high_mkv_aac.mkv")
-        per_window = cropdetect_run(TOOLS, path, [(0.0, None)], quiet_progress())
+        per_window = crop_windows(path, [(0.0, None)])
         self.assertIsNone(aggregate_crop(per_window, 320, 240))
 
     def test_measure_drift(self):
@@ -835,7 +841,7 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(result["keyframes"]["result"]["keyframes"], 1)
         self.assertEqual(result["windows"], [[0.0, None]])
         self.assertEqual(result["audio"][0]["result"]["action"], "copy")
-        self.assertIn("idet over 1 window(s) of 'h264_high_mkv_aac.mkv'", progress.stream.getvalue())
+        self.assertIn("idet, blockdetect over 1 window(s) of 'h264_high_mkv_aac.mkv'", progress.stream.getvalue())
 
     def test_analyze_interlaced_mpeg2(self):
         from vidfunnel.probe import probe_file
@@ -858,24 +864,53 @@ class FixtureTests(unittest.TestCase):
         # testsrc's hard edges score about 210 whatever the codec (see BLOCKINESS_HIGH).
         self.assertGreater(blockiness["score"], BLOCKINESS_HIGH)
         self.assertEqual(blockiness["samples"], [[0.0, None]])
-        self.assertIn("blockdetect over 1 window(s) of 'xvid_avi_mp3.avi'", progress.stream.getvalue())
+        self.assertIn("idet, blockdetect over 1 window(s) of 'xvid_avi_mp3.avi'", progress.stream.getvalue())
         self.assertEqual(result["flags"], [])
         self.assertEqual(result["predicted_score"], 100)
 
-    def test_blockdetect_run_on_a_window(self):
+    def test_blockdetect_on_a_window(self):
         path = self.fixture("dv_avi_ntsc_pcm.avi")
-        per_window = blockdetect_run(TOOLS, path, [(1.0, 1.0)], quiet_progress())
+        found = window_pass(TOOLS, ["-i", path], [(1.0, 1.0)], "dv", False, True, quiet_progress())
+        per_window = found["block"]
         self.assertEqual(len(per_window), 1)
+        self.assertEqual(found["block_windows"], [(1.0, 1.0)])
         values, skipped = per_window[0]
         self.assertAlmostEqual(len(values) + skipped, 30, delta=1)
+
+    def test_window_pass_equals_each_filter_run_alone_on_rgb_and_palette_sources(self):
+        # Chained in one -vf, the three filters share one pixel format, and on these sources blockdetect and
+        # cropdetect then read other values than when each runs alone; the split graph keeps them equal.
+        from vidfunnel.analyze import BLOCKDETECT_CHAIN, CROPDETECT_CHAIN
+        from vidfunnel.ffmpeg import run
+        for relative in ("qtrle_mov_rgb24_320x240.mov", "palette_msrle_avi_160x120.avi"):
+            path = self.fixture(relative)
+
+            def alone(graph):
+                return run([TOOLS.ffmpeg, "-hide_banner", "-nostats", "-i", path, "-map", "0:v:0", "-an", "-sn",
+                            "-dn", "-vf", graph, "-f", "null", "-"]).stderr
+
+            found = window_pass(TOOLS, ["-i", path], [(0.0, None)], relative, True, True, quiet_progress())
+            self.assertEqual(found["idet"], [parse_idet(alone("idet"))], relative)
+            self.assertEqual(found["crop"], [parse_cropdetect(alone(CROPDETECT_CHAIN))], relative)
+            self.assertEqual(found["block"], [parse_blockdetect(alone(BLOCKDETECT_CHAIN))], relative)
 
     def test_analyze_without_blockdetect_records_why(self):
         from unittest import mock
         from vidfunnel.probe import probe_file
         path = self.fixture("h264_high_mkv_aac.mkv")
+        import vidfunnel.analyze
+        graphs = []
+        real_run = vidfunnel.analyze.run
+
+        def recording_run(argv, *arguments, **keywords):
+            if "-filter_complex" in argv:
+                graphs.append(argv[argv.index("-filter_complex") + 1])
+            return real_run(argv, *arguments, **keywords)
+
         with mock.patch("vidfunnel.analyze.has_blockdetect", return_value=False):
-            with mock.patch("vidfunnel.analyze.blockdetect_run", side_effect=AssertionError("must not run")):
+            with mock.patch("vidfunnel.analyze.run", side_effect=recording_run):
                 result = analyze(TOOLS, path, probe_file(TOOLS, path), options(), quiet_progress())
+        self.assertEqual(graphs, ["[0:v:0]idet[idet_out]"])
         self.assertIsNone(result["blockiness"]["score"])
         self.assertEqual(result["blockiness"]["reason"], "blockdetect filter not in this ffmpeg")
 
@@ -984,6 +1019,117 @@ class BlockinessTests(unittest.TestCase):
         decision = decide_blockiness([([], 5)])
         self.assertIsNone(decision["score"])
         self.assertIn("5 frame(s) inf or nan", decision["reason"])
+
+
+# --- one ffmpeg per sample window ------------------------------------------------------------
+
+# stderr of one window run with window_graph() (ffmpeg 7.1.5, a 75 s letterboxed 720x480 MPEG-4 test clip,
+# three frames; addresses shortened): the three branches' lines arrive interleaved, and blockdetect adds a
+# 'block mean' summary line of its own that is not a per-frame score.
+MIXED_WINDOW_STDERR = (
+    "[Parsed_idet_1 @ 0x1] Repeated Fields: Neither:     0 Top:     0 Bottom:     0\n"
+    "[Parsed_idet_1 @ 0x1] Single frame detection: TFF:     0 BFF:     0 Progressive:     0 Undetermined:     0\n"
+    "[Parsed_idet_1 @ 0x1] Multi frame detection: TFF:     0 BFF:     0 Progressive:     0 Undetermined:     0\n"
+    "[Parsed_metadata_4 @ 0x2] frame:0    pts:0       pts_time:0\n"
+    "[Parsed_metadata_4 @ 0x2] lavfi.block=91.420944\n"
+    "[Parsed_metadata_4 @ 0x2] frame:1    pts:1       pts_time:0.0333667\n"
+    "[Parsed_metadata_4 @ 0x2] lavfi.block=91.771133\n"
+    "[Parsed_metadata_4 @ 0x2] frame:2    pts:2       pts_time:0.0667333\n"
+    "[Parsed_metadata_4 @ 0x2] lavfi.block=91.720978\n"
+    "[Parsed_cropdetect_2 @ 0x3] x1:90 x2:719 y1:60 y2:419 w:630 h:360 x:90 y:60 pts:2 t:0.066733 "
+    "limit:24.000000 crop=630:360:90:60\n"
+    "[Parsed_blockdetect_3 @ 0x4] block mean: 91.6376851\n"
+    "[Parsed_idet_1 @ 0x1] Repeated Fields: Neither:     3 Top:     0 Bottom:     0\n"
+    "[Parsed_idet_1 @ 0x1] Single frame detection: TFF:     0 BFF:     0 Progressive:     0 Undetermined:     3\n"
+    "[Parsed_idet_1 @ 0x1] Multi frame detection: TFF:     0 BFF:     0 Progressive:     0 Undetermined:     3\n"
+    "[out#0/null @ 0x5] video:4KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB "
+    "muxing overhead: unknown\n"
+)
+
+
+def lines_of(text, marker):
+    return "".join(line for line in text.splitlines(True) if marker in line)
+
+
+class WindowPassTests(unittest.TestCase):
+    def test_idet_parser_with_the_other_filters_interleaved(self):
+        expected = {"tff": 0, "bff": 0, "progressive": 0, "undetermined": 3, "single_tff": 0, "single_bff": 0,
+                    "single_progressive": 0, "single_undetermined": 3, "repeated_neither": 3, "repeated_top": 0,
+                    "repeated_bottom": 0}
+        self.assertEqual(parse_idet(MIXED_WINDOW_STDERR), expected)
+        self.assertEqual(parse_idet(lines_of(MIXED_WINDOW_STDERR, "Parsed_idet")), expected)
+
+    def test_cropdetect_parser_with_the_other_filters_interleaved(self):
+        expected = {"w": 630, "h": 360, "x": 90, "y": 60}
+        self.assertEqual(parse_cropdetect(MIXED_WINDOW_STDERR), expected)
+        self.assertEqual(parse_cropdetect(lines_of(MIXED_WINDOW_STDERR, "Parsed_cropdetect")), expected)
+
+    def test_blockdetect_parser_with_the_other_filters_interleaved(self):
+        expected = ([91.420944, 91.771133, 91.720978], 0)
+        self.assertEqual(parse_blockdetect(MIXED_WINDOW_STDERR), expected)
+        self.assertEqual(parse_blockdetect(lines_of(MIXED_WINDOW_STDERR, "lavfi.block")), expected)
+
+    def test_graph_gives_each_filter_its_own_branch(self):
+        self.assertEqual(window_graph(True, True), (
+            "[0:v:0]split=3[idet_in][crop_in][block_in];[idet_in]idet[idet_out];"
+            "[crop_in]cropdetect=limit=24:round=2:reset=0[crop_out];"
+            "[block_in]blockdetect,metadata=mode=print:key=lavfi.block[block_out]",
+            ["idet_out", "crop_out", "block_out"]))
+        self.assertEqual(window_graph(False, True), (
+            "[0:v:0]split=2[idet_in][block_in];[idet_in]idet[idet_out];"
+            "[block_in]blockdetect,metadata=mode=print:key=lavfi.block[block_out]", ["idet_out", "block_out"]))
+        self.assertEqual(window_graph(True, False), (
+            "[0:v:0]split=2[idet_in][crop_in];[idet_in]idet[idet_out];"
+            "[crop_in]cropdetect=limit=24:round=2:reset=0[crop_out]", ["idet_out", "crop_out"]))
+        self.assertEqual(window_graph(False, False), ("[0:v:0]idet[idet_out]", ["idet_out"]))
+
+    def test_blockdetect_window_selection(self):
+        self.assertEqual(blockdetect_positions(12), [0, 3, 6, 9])
+        self.assertEqual(blockdetect_positions(4), [0, 1, 2, 3])
+        self.assertEqual(blockdetect_positions(3), [0, 1, 2])
+        self.assertEqual(blockdetect_positions(1), [0])
+        self.assertEqual(blockdetect_positions(0), [])
+
+    def run_pass(self, windows, crop, block):
+        from unittest import mock
+        graphs = []
+
+        def fake_run(argv, *arguments, **keywords):
+            graphs.append(argv[argv.index("-filter_complex") + 1])
+            return types.SimpleNamespace(stderr=MIXED_WINDOW_STDERR)
+
+        with mock.patch("vidfunnel.analyze.run", side_effect=fake_run):
+            found = window_pass(types.SimpleNamespace(ffmpeg="ffmpeg"), ["-i", "clip.mpg"], windows, "clip.mpg",
+                                crop, block, quiet_progress())
+        return graphs, found
+
+    def test_one_process_per_window_blockdetect_in_four(self):
+        windows = sample_windows(180.0)
+        graphs, found = self.run_pass(windows, True, True)
+        self.assertEqual(len(graphs), 12)
+        with_block = [position for position, graph in enumerate(graphs) if "blockdetect" in graph]
+        self.assertEqual(with_block, [0, 3, 6, 9])
+        self.assertTrue(all("[crop_in]cropdetect=" in graph for graph in graphs))
+        self.assertEqual(len(found["idet"]), 12)
+        self.assertEqual(len(found["crop"]), 12)
+        self.assertEqual(len(found["block"]), 4)
+        self.assertEqual(found["block_windows"], [windows[position] for position in (0, 3, 6, 9)])
+        aspect, cadence, blockiness = window_decisions(video_stream(sar="1:1"), windows, found)
+        self.assertEqual(blockiness["samples"], [list(windows[position]) for position in (0, 3, 6, 9)])
+        self.assertEqual(blockiness["frames"], 12)
+        self.assertEqual(blockiness["skipped_frames"], 0)
+        self.assertEqual(len(cadence["samples"]), 12)
+        self.assertEqual(len(aspect["crop_windows"]), 12)
+
+    def test_graph_without_cropdetect_or_blockdetect(self):
+        graphs, found = self.run_pass(sample_windows(180.0, samples=3), False, False)
+        self.assertEqual(graphs, ["[0:v:0]idet[idet_out]"] * 3)
+        self.assertIsNone(found["crop"])
+        self.assertIsNone(found["block"])
+        aspect, _cadence, blockiness = window_decisions(video_stream(), sample_windows(180.0, samples=3), found)
+        self.assertIsNone(aspect["crop_windows"])
+        self.assertIsNone(blockiness["score"])
+        self.assertEqual(blockiness["reason"], "blockdetect filter not in this ffmpeg")
 
 
 # --- capture ---------------------------------------------------------------------------------
