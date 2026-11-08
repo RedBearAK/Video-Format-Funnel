@@ -43,7 +43,8 @@ from vidfunnel.encode import (
     skip_reason,
     write_par2,
 )
-from vidfunnel.ffmpeg import ToolNotFound, find_tools
+from vidfunnel.ffmpeg import FfmpegError, ToolNotFound, find_tools
+from vidfunnel.ffmpeg import run as ffmpeg_run
 from vidfunnel.plan import make_options, plan_paths
 from vidfunnel.record import cheap_fingerprint, load_record, record_path, save_record, set_status
 
@@ -829,6 +830,211 @@ class RefitRunTest(unittest.TestCase):
         (self.root / REFIT_OUTPUT).unlink()
         outcome, reason = refit_one(TOOLS, self.root / REFIT_SOURCE, record, convert_options(), quiet())
         self.assertEqual((outcome, reason), ("skipped", "output '{}' is missing".format(REFIT_OUTPUT)))
+
+    def run_with_changed_argv(self, change):
+        """A --refit run whose ffmpeg argv goes through change(argv) first; the real ffmpeg then runs it."""
+        def changed_run(argv, *rest, **values):
+            return ffmpeg_run(change(list(argv)), *rest, **values)
+        with unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=changed_run):
+            return self.refit()
+
+    def assert_kept_with_reason(self, summary, text, output_hash, reason_start):
+        self.assertEqual(summary.counts["kept"], 1, text)
+        self.assertEqual(summary.counts["refitted"], 0, text)
+        self.assertEqual(sha256_of(self.root / REFIT_OUTPUT), output_hash)
+        self.assertEqual(self.leftover_parts(), [])
+        saved = load_record(self.root / REFIT_SOURCE)
+        stage = saved["stages"]["refit"]
+        self.assertEqual(stage["outcome"], "kept-existing")
+        self.assertTrue(stage["reason"].startswith(reason_start), stage["reason"])
+        self.assertIn("fit-capped", saved["flags"])
+        self.assertNotIn("refitted", saved["flags"])
+        return saved
+
+    def test_refit_output_without_the_identity_tag_is_kept_existing(self):
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
+        output_hash = sha256_of(self.root / REFIT_OUTPUT)
+
+        def without_tag(argv):
+            at = argv.index("-metadata")
+            self.assertTrue(argv[at + 1].startswith("vidfunnel="), argv)
+            return argv[:at] + argv[at + 2:]
+        summary, text = self.run_with_changed_argv(without_tag)
+        saved = self.assert_kept_with_reason(summary, text, output_hash, "identity tag: ")
+        self.assertIn("no readable 'vidfunnel' tag", saved["stages"]["refit"]["reason"])
+
+    def test_refit_output_without_its_audio_stream_is_kept_existing(self):
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
+        output_hash = sha256_of(self.root / REFIT_OUTPUT)
+
+        def without_audio(argv):
+            at = argv.index("-f")
+            return argv[:at] + ["-an"] + argv[at:]
+        summary, text = self.run_with_changed_argv(without_audio)
+        saved = self.assert_kept_with_reason(summary, text, output_hash, "streams ")
+        self.assertIn("'audio': 0", saved["stages"]["refit"]["reason"])
+
+    def test_duration_no_worse_than_the_previous_verify_passes(self):
+        # Constructed: the source's measured video duration is moved 0.3 s plus one tolerance
+        # earlier, so the existing output (read here as the refit output) misses it by more than
+        # the tolerance. With the previous verify's delta set to that same miss the check passes;
+        # with the verify's real, smaller delta it refuses.
+        from vidfunnel.encode import refit_checks
+        record = self.plan_and_convert(REFIT_SOURCE, reencode_video=True)[REFIT_SOURCE]
+        earlier = record["stages"]["verify"]["duration"]
+        self.assertTrue(earlier["ok"], earlier)
+        shift = 0.3 + earlier["tolerance"]
+        video = record["stages"]["analyze"]["sync"]["durations"]["video"]
+        video["duration"] = earlier["source"] - shift
+        output = self.root / REFIT_OUTPUT
+        refused = refit_checks(TOOLS, record, output)
+        self.assertIsNotNone(refused)
+        self.assertTrue(refused.startswith("video duration "), refused)
+        earlier["delta"] = round(earlier["delta"] + shift, 6)
+        earlier["ok"] = False
+        self.assertIsNone(refit_checks(TOOLS, record, output))
+        earlier["delta"] = round(earlier["delta"] - 0.01, 6)
+        self.assertIsNotNone(refit_checks(TOOLS, record, output), "a miss worse than the last verify's is refused")
+
+    def test_refit_not_larger_than_the_source_drops_the_flag_and_retire_accepts_it(self):
+        # Constructed: the planned CRF is raised to 22, so the refit runs at the SD cap 23 and comes
+        # out smaller than the source.
+        record = self.plan_and_convert(REFIT_SOURCE, reencode_video=True)[REFIT_SOURCE]
+        argv = record["stages"]["plan"]["argv"]
+        argv[argv.index("-crf") + 1] = "22"
+        save_record(self.root / REFIT_SOURCE, record)
+        source_size = (self.root / REFIT_SOURCE).stat().st_size
+        summary, text = self.refit()
+        self.assertEqual(summary.counts["refitted"], 1, text)
+        saved = load_record(self.root / REFIT_SOURCE)
+        self.assertEqual(saved["stages"]["refit"]["attempt"]["crf"], 23)
+        self.assertLessEqual((self.root / REFIT_OUTPUT).stat().st_size, source_size,
+                             "the CRF 23 refit no longer comes out smaller than the source; pick another CRF")
+        self.assertIn("refitted", saved["flags"])
+        self.assertNotIn("output-larger", saved["flags"])
+        self.assertEqual(saved["status"], "verified", text)
+        from vidfunnel.retire import check_eligible
+        self.assertFalse(check_eligible(self.root / REFIT_SOURCE, saved, quiet=True)["larger"])
+
+    def test_failed_attempt_moves_to_refit_history(self):
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
+        with unittest.mock.patch("vidfunnel.encode.run_tool",
+                                 side_effect=FfmpegError("made-up ffmpeg failure", stderr="made-up stderr")):
+            summary, text = self.refit()
+        self.assertEqual(summary.counts["failed"], 1, text)
+        summary, text = self.refit()
+        self.assertEqual(summary.counts["refitted"], 1, text)
+        saved = load_record(self.root / REFIT_SOURCE)
+        self.assertEqual(saved["stages"]["refit"]["outcome"], "replaced")
+        history = saved["stages"]["refit_history"]
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["outcome"], "failed")
+        self.assertEqual(history[0]["error"], "made-up ffmpeg failure")
+
+    def test_replaced_output_carries_the_source_mtime(self):
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
+        summary, text = self.refit()
+        self.assertEqual(summary.counts["refitted"], 1, text)
+        self.assertEqual((self.root / REFIT_OUTPUT).stat().st_mtime_ns, (self.root / REFIT_SOURCE).stat().st_mtime_ns)
+        self.assertNotIn("mtime-not-set", load_record(self.root / REFIT_SOURCE)["flags"])
+
+    def test_replaced_output_fingerprint_is_recorded(self):
+        # verify writes output.fingerprint again when it passes; it is left out here so the record shows
+        # what the refit itself saved (what an interrupt or a failed verify leaves behind).
+        before = self.plan_and_convert(REFIT_SOURCE, reencode_video=True)[REFIT_SOURCE]["output"]["fingerprint"]
+        with unittest.mock.patch("vidfunnel.encode._verify", side_effect=lambda tools, key, record, *rest: record):
+            summary, text = self.refit()
+        self.assertEqual(summary.counts["refitted"], 1, text)
+        saved = load_record(self.root / REFIT_SOURCE)
+        self.assertEqual(saved["output"]["fingerprint"], cheap_fingerprint(self.root / REFIT_OUTPUT))
+        self.assertNotEqual(saved["output"]["fingerprint"], before)
+
+    def test_denoise_goes_after_the_records_cadence_filter_in_the_plan(self):
+        # Constructed: the captured analysis of an interlaced MPEG-2 fixture gives the cadence result;
+        # its filter goes at the start of the planned chain, as plan puts it there.
+        from vidfunnel.encode import refit_plan
+        with open(os.path.join(REPO_ROOT, "tests", "analysis_json", "mpeg2_ps_interlaced_tff_ac3.mpg.json")) as handle:
+            cadence = json.load(handle)["cadence"]["result"]
+        cadence_filter = cadence["filter"]
+        self.assertTrue(cadence_filter.startswith("bwdif="), cadence_filter)
+        record = self.plan_and_convert(REFIT_SOURCE, reencode_video=True)[REFIT_SOURCE]
+        record["stages"]["analyze"]["cadence"]["result"] = cadence
+        argv = record["stages"]["plan"]["argv"]
+        chain = argv[argv.index("-vf") + 1]
+        argv[argv.index("-vf") + 1] = cadence_filter + "," + chain
+        plan, reason = refit_plan(record, self.root)
+        self.assertIsNone(reason)
+        self.assertTrue(plan["denoise"], plan["denoise_reason"])
+        expected = cadence_filter + "," + REFIT_DENOISE + "," + chain
+        self.assertEqual(plan["filters"], expected)
+        self.assertEqual(plan["argv"][plan["argv"].index("-vf") + 1], expected)
+
+    def test_plan_writing_another_output_is_skipped_with_its_reason(self):
+        record = self.plan_and_convert(REFIT_SOURCE, reencode_video=True)[REFIT_SOURCE]
+        elsewhere = str(self.root / "somewhere else.mp4")
+        record["stages"]["plan"]["argv"][-1] = elsewhere
+        save_record(self.root / REFIT_SOURCE, record)
+        record_bytes = record_path(self.root / REFIT_SOURCE).read_bytes()
+        output_hash = sha256_of(self.root / REFIT_OUTPUT)
+        outcome, reason = refit_one(TOOLS, self.root / REFIT_SOURCE, record, convert_options(), quiet())
+        self.assertEqual((outcome, reason), ("skipped", "the planned command writes '{}', not '{}'".format(
+            elsewhere, self.root / REFIT_OUTPUT)))
+        self.assertEqual(record_path(self.root / REFIT_SOURCE).read_bytes(), record_bytes)
+        self.assertEqual(sha256_of(self.root / REFIT_OUTPUT), output_hash)
+        self.assertFalse(os.path.exists(elsewhere))
+
+    def test_output_with_the_same_size_and_other_bytes_is_skipped(self):
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
+        output = self.root / REFIT_OUTPUT
+        status = output.stat()
+        content = bytearray(output.read_bytes())
+        middle = len(content) // 2
+        content[middle] ^= 0xFF
+        output.write_bytes(bytes(content))
+        os.utime(str(output), ns=(status.st_atime_ns, status.st_mtime_ns))
+        self.assertEqual(output.stat().st_size, status.st_size)
+        self.assertEqual(output.stat().st_mtime_ns, status.st_mtime_ns)
+        record = load_record(self.root / REFIT_SOURCE)
+        record_bytes = record_path(self.root / REFIT_SOURCE).read_bytes()
+        outcome, reason = refit_one(TOOLS, self.root / REFIT_SOURCE, record, convert_options(), quiet())
+        self.assertEqual((outcome, reason),
+                         ("skipped", "output '{}' no longer matches its recorded fingerprint".format(REFIT_OUTPUT)))
+        self.assertEqual(record_path(self.root / REFIT_SOURCE).read_bytes(), record_bytes)
+
+    def test_source_changed_after_plan_is_skipped(self):
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
+        source = self.root / REFIT_SOURCE
+        with open(str(source), "ab") as handle:
+            handle.write(b"x")
+        os.utime(str(source))
+        record = load_record(source)
+        record_bytes = record_path(source).read_bytes()
+        output_hash = sha256_of(self.root / REFIT_OUTPUT)
+        outcome, reason = refit_one(TOOLS, source, record, convert_options(), quiet())
+        self.assertEqual((outcome, reason), ("skipped", "source changed since plan: '{}' no longer matches the "
+                                                        "fingerprint taken at plan".format(REFIT_SOURCE)))
+        self.assertEqual(record_path(source).read_bytes(), record_bytes)
+        self.assertEqual(sha256_of(self.root / REFIT_OUTPUT), output_hash)
+
+    def test_failed_ffmpeg_run_is_recorded_and_tried_again(self):
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
+        output_hash = sha256_of(self.root / REFIT_OUTPUT)
+        with unittest.mock.patch("vidfunnel.encode.run_tool",
+                                 side_effect=FfmpegError("made-up ffmpeg failure", stderr="made-up stderr")):
+            summary, text = self.refit()
+        self.assertEqual(summary.counts["failed"], 1, text)
+        self.assertEqual(summary.counts["refitted"] + summary.counts["kept"], 0, text)
+        self.assertEqual(sha256_of(self.root / REFIT_OUTPUT), output_hash)
+        self.assertEqual(self.leftover_parts(), [])
+        saved = load_record(self.root / REFIT_SOURCE)
+        stage = saved["stages"]["refit"]
+        self.assertEqual(stage["outcome"], "failed")
+        self.assertEqual(stage["error"], "made-up ffmpeg failure")
+        self.assertNotIn("fit-capped", saved["flags"])
+        self.assertIn("output-larger", saved["flags"])
+        summary, text = self.refit(dry_run=True)
+        self.assertIn("would refit '{}'".format(REFIT_SOURCE), text)
+        self.assertEqual(summary.skip_reasons, {}, text)
 
     def test_refit_option_parses(self):
         from vidfunnel import cli
