@@ -220,6 +220,37 @@ class ChildRegistryTests(unittest.TestCase):
     def test_terminate_children_stops_a_sleeping_child_read_for_progress(self):
         self.stop_sleeping_child(lambda block: None)
 
+    def test_terminate_children_stops_a_running_par2(self):
+        """encode.write_par2 registers its child: a stand-in par2 that sleeps is stopped by terminate_children."""
+        with tempfile.TemporaryDirectory() as temporary:
+            fake_bin = Path(temporary) / "bin"
+            fake_bin.mkdir()
+            write_script(fake_bin / "par2", "exec {} 30\n".format(self.sleeper))
+            output = Path(temporary) / "output.mp4"
+            output.write_bytes(b"y" * 4096)
+            outcome = []
+
+            def worker():
+                try:
+                    vidfunnel.encode.write_par2(output, 5, quiet())
+                except BaseException as error:  # recorded for the assertions below
+                    outcome.append(error)
+
+            with unittest.mock.patch.dict(os.environ, {"PATH": "{}:{}".format(fake_bin, os.environ.get("PATH", ""))}):
+                thread = threading.Thread(target=worker)
+                started = time.monotonic()
+                thread.start()
+                self.wait_for_children(1)
+                interrupted.set()
+                self.assertEqual(vidfunnel.ffmpeg.terminate_children(), 1)
+                thread.join(10)
+            self.assertFalse(thread.is_alive())
+            self.assertLess(time.monotonic() - started, 5)
+            self.assertEqual(len(outcome), 1)
+            self.assertIsInstance(outcome[0], Interrupted)
+            with vidfunnel.ffmpeg._children_lock:
+                self.assertEqual(vidfunnel.ffmpeg._children, set())
+
     def test_a_child_registered_after_the_event_was_set_is_terminated(self):
         process = subprocess.Popen([self.sleeper, "30"])
         self.addCleanup(process.wait)
@@ -456,15 +487,18 @@ def _make_long_clip(path):
                     "-shortest", str(path)], check=True)
 
 
-def _interrupt_command(arguments, trigger, settle, signum=signal.SIGINT, group=True, groups=None):
+def _interrupt_command(arguments, trigger, settle, signum=signal.SIGINT, group=True, groups=None,
+                       again_after=None, environment=None):
     """Run vidfunnel with `arguments`, SIGINT its process group `settle` s after a stdout line holding `trigger`.
 
     With group=False, `signum` goes to the Python process alone, as 'kill'
-    or 'podman stop' sends it, so no child receives it from outside. The
-    process group id (the child's pid) is appended to `groups` when given.
-    Returns (returncode, stdout, stderr, seconds from the signal to exit).
+    or 'podman stop' sends it, so no child receives it from outside. With
+    again_after, the same signal is sent a second time that many seconds
+    after the first. The process group id (the child's pid) is appended to
+    `groups` when given. `environment` adds variables to the child's.
+    Returns (returncode, stdout, stderr, seconds from the first signal to exit).
     """
-    environment = dict(os.environ, PYTHONPATH=REPO_ROOT)
+    environment = dict(os.environ, PYTHONPATH=REPO_ROOT, **(environment or {}))
     process = subprocess.Popen([sys.executable, "-m", "vidfunnel"] + arguments, cwd=REPO_ROOT, env=environment,
                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                universal_newlines=True, start_new_session=True,
@@ -482,11 +516,15 @@ def _interrupt_command(arguments, trigger, settle, signum=signal.SIGINT, group=T
             raise AssertionError("'{}' never appeared; output:\n{}".format(trigger, "".join(lines)))
         # The trigger line is printed just before the ffmpeg run it announces starts.
         time.sleep(settle)
-        if group:
-            os.killpg(process.pid, signum)
-        else:
-            os.kill(process.pid, signum)
+        send = (lambda: os.killpg(process.pid, signum)) if group else (lambda: os.kill(process.pid, signum))
+        send()
         sent = time.monotonic()
+        if again_after is not None:
+            time.sleep(again_after)
+            try:
+                send()
+            except ProcessLookupError:
+                pass
         rest, errors = process.communicate(timeout=60)
         return process.returncode, "".join(lines) + rest, errors, time.monotonic() - sent
     finally:
@@ -533,7 +571,31 @@ class InterruptIntegrationTests(unittest.TestCase):
     def lock_files(self):
         return sorted(glob.glob(str(self.root / "**" / RECORD_DIR / "lock"), recursive=True))
 
-    def terminate(self, arguments, trigger, settle):
+    def slow_window_ffmpeg(self):
+        """--ffmpeg arguments for a stand-in that runs the real ffmpeg, except in its idet window pass.
+
+        There it sleeps 30 s, so a run stopped in that pass can only exit in
+        time if vidfunnel stops the child itself, and it takes 0.5 s to end
+        after a SIGTERM (exit status 143), so a second SIGTERM sent soon
+        after the first arrives while the run is still waiting for it.
+        Its capability cache goes to a temporary XDG_CACHE_HOME.
+        """
+        fake_bin = Path(self.temporary.name) / "slow-bin"
+        fake_bin.mkdir()
+        window = fake_bin / "slow_window.py"
+        window.write_text("import signal, sys, time\n"
+                          "def stop(signum, frame):\n"
+                          "    time.sleep(0.5)\n"
+                          "    sys.exit(143)\n"
+                          "signal.signal(signal.SIGTERM, stop)\n"
+                          "time.sleep(30)\n")
+        write_script(fake_bin / "ffmpeg", 'case " $* " in *idet*) exec {} {} ;; esac\nexec {} "$@"\n'.format(
+            sys.executable, window, TOOLS.ffmpeg))
+        os.symlink(TOOLS.ffprobe, str(fake_bin / "ffprobe"))
+        self.extra_environment = {"XDG_CACHE_HOME": str(Path(self.temporary.name) / "cache")}
+        return ["--ffmpeg", str(fake_bin / "ffmpeg")]
+
+    def terminate(self, arguments, trigger, settle, again_after=None):
         groups = []
 
         def kill_leftovers():
@@ -544,7 +606,8 @@ class InterruptIntegrationTests(unittest.TestCase):
                     pass
 
         self.addCleanup(kill_leftovers)
-        result = _interrupt_command(arguments, trigger, settle, signal.SIGTERM, group=False, groups=groups)
+        result = _interrupt_command(arguments, trigger, settle, signal.SIGTERM, group=False, groups=groups,
+                                    again_after=again_after, environment=getattr(self, "extra_environment", None))
         return result + (groups[0],)
 
     def assert_terminated(self, code, output, errors, seconds, group_id):
@@ -557,10 +620,12 @@ class InterruptIntegrationTests(unittest.TestCase):
         with self.assertRaises(ProcessLookupError, msg="a child of the terminated run is still running"):
             os.killpg(group_id, 0)
 
-    def test_plan_with_jobs_terminated_by_sigterm(self):
-        code, output, errors, seconds, group_id = self.terminate(["plan", "--jobs", "2", str(self.root)],
-                                                                 "idet, cropdetect", 0.3)
-        sys.stderr.write("\n  plan --jobs 2: exit {:.2f} s after SIGTERM ".format(seconds))
+    def plan_terminated(self, jobs, again_after=None):
+        arguments = self.slow_window_ffmpeg() + ["plan"] + (["--jobs", str(jobs)] if jobs else []) + [str(self.root)]
+        code, output, errors, seconds, group_id = self.terminate(arguments, "idet, cropdetect", 0.3,
+                                                                 again_after=again_after)
+        sys.stderr.write("\n  plan{}{}: exit {:.2f} s after SIGTERM ".format(
+            " --jobs {}".format(jobs) if jobs else "", ", SIGTERM twice" if again_after else "", seconds))
         self.assert_terminated(code, output, errors, seconds, group_id)
         records = self.records()
         self.assertLess(len(records), len(COPY_NAMES), "every item finished; nothing was terminated")
@@ -568,12 +633,31 @@ class InterruptIntegrationTests(unittest.TestCase):
             self.assertEqual(record["status"], "planned", name)
             self.assertNotIn("decode-failed", record.get("flags") or [], name)
 
+    def test_plan_with_jobs_terminated_by_sigterm(self):
+        self.plan_terminated(2)
+
+    def test_plan_with_jobs_terminated_by_two_sigterms(self):
+        """The second SIGTERM, 50 ms after the first, does not cut the cleanup short (no 'failed' records)."""
+        self.plan_terminated(2, again_after=0.05)
+
+    def test_plan_without_jobs_terminated_by_sigterm(self):
+        """The main thread's own ffmpeg child is killed and reaped before the run exits."""
+        self.plan_terminated(None)
+
     def test_convert_with_jobs_terminated_by_sigterm(self):
+        self.convert_terminated()
+
+    def test_convert_with_jobs_terminated_by_two_sigterms(self):
+        """The second SIGTERM, 50 ms after the first, does not cut the cleanup short (no 'failed' records)."""
+        self.convert_terminated(again_after=0.05)
+
+    def convert_terminated(self, again_after=None):
         vidfunnel.plan.plan_paths(TOOLS, [str(self.root)], vidfunnel.plan.make_options(jobs=4), progress=quiet())
         planned = self.records()
         code, output, errors, seconds, group_id = self.terminate(["convert", "--jobs", "2", str(self.root)],
-                                                                 "[convert ", 1.0)
-        sys.stderr.write("\n  convert --jobs 2: exit {:.2f} s after SIGTERM ".format(seconds))
+                                                                 "[convert ", 1.0, again_after=again_after)
+        sys.stderr.write("\n  convert --jobs 2{}: exit {:.2f} s after SIGTERM ".format(
+            ", SIGTERM twice" if again_after else "", seconds))
         self.assert_terminated(code, output, errors, seconds, group_id)
         records = self.records()
         unchanged = 0

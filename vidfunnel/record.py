@@ -8,6 +8,7 @@ Records are the authority; every write is atomic (temp file, then os.replace).
 
 VERSION = "20261107"
 
+import contextlib
 import datetime
 import hashlib
 import json
@@ -17,6 +18,11 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # not on Windows, which vidfunnel does not support; the takeover is then unserialised
+    fcntl = None
 
 import vidfunnel
 from vidfunnel.interrupt import check as check_interrupted
@@ -350,7 +356,9 @@ def pid_alive(pid):
     """True when a process with this pid exists here, False when none does, None when that cannot be told.
 
     os.kill(pid, 0) sends no signal; PermissionError means the process
-    exists under another user. A pid that is not a positive int gives None.
+    exists under another user. A pid that is not a positive int gives None,
+    and so does one os.kill cannot take (OverflowError for a pid of 2**31 or
+    more, from a crafted or corrupt lock file).
     """
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         return None
@@ -360,7 +368,7 @@ def pid_alive(pid):
         return False
     except PermissionError:
         return True
-    except OSError:
+    except (OSError, OverflowError, ValueError):
         return None
     return True
 
@@ -369,7 +377,7 @@ def _whole_seconds(age):
     return "{:.0f}".format(age) if age is not None else "an unknown number of"
 
 
-def _unjudged_reason(host, holder_in_container, ours):
+def _unjudged_reason(host, holder_in_container, ours, pid):
     """Why a lock's pid could not be checked, for the LockHeld message."""
     if holder_in_container:
         return "held by a container run, whose pid cannot be checked from here; taken over once 24 h old"
@@ -377,6 +385,8 @@ def _unjudged_reason(host, holder_in_container, ours):
         return "written on another host name, whose pid cannot be checked from here; taken over once 24 h old"
     if ours["container"]:
         return "written outside this container, whose pid cannot be checked from here; taken over once 24 h old"
+    if pid == ours["pid"]:
+        return "its pid is this process's own, so it cannot be checked; taken over once 24 h old"
     return "its pid cannot be checked; taken over once 24 h old"
 
 
@@ -385,19 +395,33 @@ class FolderLock:
 
     The lock file holds host (socket.gethostname()), pid, started (ISO time)
     and container (True when this run is inside a container: '/run/.containerenv'
-    or '/.dockerenv' exists). An existing lock written on this host is judged
-    by its pid: a holder that no longer runs (os.kill(pid, 0) raises
-    ProcessLookupError) is taken over at once with a message naming the dead
-    pid and the lock's age; a live one (or one we may not signal,
-    PermissionError) raises LockHeld. A lock from another host name is judged
-    by age alone, since its pid means nothing here: a container run shows
-    the container id as its host name and has a pid namespace of its own.
-    Such a lock raises LockHeld while it is younger than 24 h and is taken
-    over with a warning after that. A lock with the same host name written
-    by a run inside a container is also judged by age (the container's pid
-    namespace differs from ours), and so is a lock written on the host when
-    this run is inside a container. The lock file is removed on exit,
-    including on exception, if it is still ours.
+    or '/.dockerenv' exists). Every lock is taken over, with a warning, once
+    it is 24 h old (stale_seconds); younger ones raise LockHeld. The pid
+    can only shorten that wait, never lengthen it: when the lock was written
+    on this host name and on the same side of the container boundary, a
+    holder that no longer runs (os.kill(pid, 0) raises ProcessLookupError)
+    is taken over at once with a message naming the dead pid and the lock's
+    age. A live pid (or one we may not signal, PermissionError) is
+    respected until the lock is stale, like any other; after 24 h it is
+    taken for a reused pid. Our own pid, or one that cannot be checked,
+    counts as unknown, and the lock is judged by age alone. A lock from
+    another host name is judged by age alone too, since its pid means
+    nothing here: a container run shows the container id as its host name
+    and has a pid namespace of its own; so is a lock with the same host
+    name written by a run inside a container, and a lock written on the
+    host when this run is inside a container.
+
+    The lock file is only ever created with O_CREAT | O_EXCL, so of several
+    runs that find no lock, one creates it and the others raise LockHeld
+    naming it. Takeovers are serialised by flock() on the '.vidfunnel'
+    directory, which the kernel releases when its holder exits: inside it a
+    run reads and judges the lock, checks that the file is still the one it
+    judged (inode, mtime, size and content), unlinks it and creates its own
+    with O_EXCL; a run that gets the flock after it then judges the new,
+    live lock and raises LockHeld. Where the file system refuses flock() on
+    a directory (some network file systems), the takeover runs without it
+    and only that check and the O_EXCL create guard it. The lock file is
+    removed on exit, including on exception, if it is still ours.
     """
 
     def __init__(self, folder, warn=None, stale_seconds=LOCK_STALE_SECONDS):
@@ -431,46 +455,108 @@ class FolderLock:
                 return None, None
         return data, age
 
+    def _identity(self):
+        """(inode, mtime in ns, size) of the lock file, or None when it does not exist."""
+        try:
+            status = os.stat(str(self.path))
+        except FileNotFoundError:
+            return None
+        return (status.st_ino, status.st_mtime_ns, status.st_size)
+
+    @contextlib.contextmanager
+    def _takeover_guard(self):
+        """Hold flock(LOCK_EX) on the record directory while one takeover runs; see the class docstring."""
+        handle = None
+        if fcntl is not None:
+            try:
+                handle = os.open(str(record_dir(self.folder)), os.O_RDONLY)
+                fcntl.flock(handle, fcntl.LOCK_EX)
+            except OSError:
+                if handle is not None:
+                    os.close(handle)
+                handle = None
+        try:
+            yield
+        finally:
+            if handle is not None:
+                os.close(handle)  # closing the descriptor releases the flock
+
+    def _create(self, content):
+        """Create the lock file with our entry; FileExistsError when any lock file exists."""
+        handle = os.open(str(self.path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(_dump_json(content))
+
+    def _held(self, holder, age, why):
+        host = holder.get("host")
+        holder_words = "a container run on host" if holder.get("container") is True else "host"
+        return LockHeld(
+            "folder '{}' is locked by {} '{}' pid {} since {} ({:.0f} s ago; {}); lock file '{}'".format(
+                self.folder, holder_words, host, holder.get("pid"), holder.get("started"), age, why, self.path),
+            host=host, pid=holder.get("pid"), age_seconds=age)
+
+    def _lost_race(self):
+        """LockHeld for the run that created the lock file while we were taking it over."""
+        holder, age = self._holder()
+        if holder is None:
+            holder, age = {}, 0.0
+        return self._held(holder, age, "it took the lock over at the same time and got it first")
+
     def acquire(self):
         record_dir(self.folder).mkdir(parents=True, exist_ok=True)
         content = {"host": socket.gethostname(), "pid": os.getpid(), "started": now_iso(),
                    "container": in_container()}
-        text = _dump_json(content)
         try:
-            handle = os.open(str(self.path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            self._create(content)
         except FileExistsError:
+            with self._takeover_guard():
+                self._take_over(content)
+        self.content = content
+        return self
+
+    def _take_over(self, content):
+        """Judge the existing lock; take it over (unlink, then O_EXCL create) or raise LockHeld."""
+        while True:
+            judged = self._identity()
             holder, age = self._holder()
-            if holder is None:
-                return self.acquire()
+            if holder is None or judged is None:  # released meanwhile: create it, or judge the next one
+                try:
+                    self._create(content)
+                    return
+                except FileExistsError:
+                    continue
             host = holder.get("host")
             pid = holder.get("pid")
             holder_in_container = holder.get("container") is True
             holder_words = "a container run on host" if holder_in_container else "host"
             liveness = None
-            if host == content["host"] and holder_in_container == content["container"]:
+            if host == content["host"] and holder_in_container == content["container"] and pid != content["pid"]:
                 liveness = pid_alive(pid)
             if liveness is False:
-                self.warn("warning: taking over lock '{}': its holder, host '{}' pid {}, no longer runs "
-                          "(lock written {} s ago)".format(self.path, host, pid, _whole_seconds(age)))
-                _write_json_atomic(self.path, content)
-            elif liveness is True or age < self.stale_seconds:
+                warning = ("warning: taking over lock '{}': its holder, host '{}' pid {}, no longer runs "
+                           "(lock written {} s ago)".format(self.path, host, pid, _whole_seconds(age)))
+            elif age < self.stale_seconds:
                 if liveness is True:
-                    why = "the process is still running"
+                    why = "its pid {} is running here; taken over once 24 h old".format(pid)
                 else:
-                    why = _unjudged_reason(host, holder_in_container, content)
-                raise LockHeld(
-                    "folder '{}' is locked by {} '{}' pid {} since {} ({:.0f} s ago; {}); lock file '{}'".format(
-                        self.folder, holder_words, host, pid, holder.get("started"), age, why, self.path),
-                    host=host, pid=pid, age_seconds=age)
+                    why = _unjudged_reason(host, holder_in_container, content, pid)
+                raise self._held(holder, age, why)
             else:
-                self.warn("warning: taking over stale lock '{}' held by {} '{}' pid {} since {} ({:.1f} h ago)".format(
-                    self.path, holder_words, host, pid, holder.get("started"), age / 3600.0))
-                _write_json_atomic(self.path, content)
-        else:
-            with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
-                stream.write(text)
-        self.content = content
-        return self
+                warning = "warning: taking over stale lock '{}' held by {} '{}' pid {} since {} ({:.1f} h ago{})".format(
+                    self.path, holder_words, host, pid, holder.get("started"), age / 3600.0,
+                    "; its pid is running here, taken for a reused one" if liveness is True else "")
+            if self._identity() != judged or self._holder()[0] != holder:
+                raise self._lost_race()
+            try:
+                os.unlink(str(self.path))
+            except FileNotFoundError:
+                pass
+            try:
+                self._create(content)
+            except FileExistsError:
+                raise self._lost_race()
+            self.warn(warning)
+            return
 
     def release(self):
         if self.content is None:

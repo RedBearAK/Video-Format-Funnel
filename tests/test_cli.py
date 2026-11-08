@@ -9,6 +9,7 @@ import pathlib
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -160,8 +161,95 @@ class SigtermTests(unittest.TestCase):
         self.assertIn("vidfunnel: terminated", err)
         self.assertNotIn("interrupted", err)
         self.assertFalse(vidfunnel.interrupt.interrupted.is_set(), "the event outlived the terminated command")
-        self.assertFalse(cli._terminating.is_set())
+        self.assertFalse(cli._terminating)
         self.assertIs(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+
+    def test_the_handler_takes_no_lock(self):
+        """The handler body touches no Event or Flag and calls no terminate_children; it only raises."""
+        self.addCleanup(setattr, cli, "_terminating", False)
+        refuse = unittest.mock.Mock(side_effect=AssertionError("the SIGTERM handler took a lock"))
+        with unittest.mock.patch.object(threading.Event, "set", refuse), \
+                unittest.mock.patch.object(threading.Event, "clear", refuse), \
+                unittest.mock.patch.object(threading.Event, "wait", refuse), \
+                unittest.mock.patch.object(vidfunnel.interrupt.Flag, "set", refuse), \
+                unittest.mock.patch.object(vidfunnel.interrupt.Flag, "clear", refuse), \
+                unittest.mock.patch("vidfunnel.ffmpeg.terminate_children", refuse):
+            with self.assertRaises(cli.Terminated):
+                cli._on_sigterm(signal.SIGTERM, None)
+        self.assertTrue(cli._terminating)
+        refuse.assert_not_called()
+
+    def test_only_the_first_sigterm_raises(self):
+        self.addCleanup(setattr, cli, "_terminating", False)
+        with self.assertRaises(cli.Terminated):
+            cli._on_sigterm(signal.SIGTERM, None)
+        self.assertIsNone(cli._on_sigterm(signal.SIGTERM, None))
+        self.assertTrue(cli._terminating)
+
+    def test_a_sigterm_after_ctrl_c_still_ends_with_the_message(self):
+        """A Terminated raised while a Ctrl+C is being handled is caught, and the steps run again."""
+        calls = []
+
+        def stop_workers():
+            calls.append("stop")
+            if len(calls) == 1:
+                raise cli.Terminated()
+
+        def dispatch(args):
+            cli._terminating = True
+            raise KeyboardInterrupt()
+
+        with unittest.mock.patch("vidfunnel.interrupt.stop_workers", side_effect=stop_workers):
+            code, _out, err = self.run_with_dispatch(dispatch)
+        self.assertEqual(code, cli.EXIT_ERROR)
+        self.assertEqual(calls, ["stop", "stop"])
+        self.assertEqual(err.count("vidfunnel: terminated"), 1, err)
+
+    def test_sigterm_pairs_never_hang(self):
+        """SIGTERM pairs 0 to 300 microseconds apart, while the main thread loops on clear() and set()."""
+        child_code = (
+            "import sys\n"
+            "from vidfunnel import cli\n"
+            "from vidfunnel.interrupt import interrupted\n"
+            "def busy(args):\n"
+            "    sys.stdout.write('ready\\n'); sys.stdout.flush()\n"
+            "    while True:\n"
+            "        interrupted.clear(); interrupted.set()\n"
+            "cli.dispatch = busy\n"
+            "sys.exit(cli.main(['check']))\n"
+        )
+        env = dict(os.environ, PYTHONPATH=str(REPO_ROOT))
+        trials = 300
+        failures = []
+        for trial in range(trials):
+            gap = (trial % 31) * 10e-6
+            child = subprocess.Popen([sys.executable, "-c", child_code], stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, env=env, text=True)
+            try:
+                self.assertEqual(child.stdout.readline(), "ready\n")
+                os.kill(child.pid, signal.SIGTERM)
+                until = time.perf_counter() + gap
+                while time.perf_counter() < until:
+                    pass
+                os.kill(child.pid, signal.SIGTERM)
+                try:
+                    _out, err = child.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.communicate()
+                    failures.append("trial {}: gap {:.0f} us: no exit within 5 s".format(trial, gap * 1e6))
+                    continue
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
+                child.stdout.close()
+                child.stderr.close()
+            # A second SIGTERM that lands after main() put SIG_DFL back ends the process by the signal.
+            if "vidfunnel: terminated" not in err or child.returncode not in (cli.EXIT_ERROR, -signal.SIGTERM):
+                failures.append("trial {}: gap {:.0f} us: status {}, stderr {!r}".format(
+                    trial, gap * 1e6, child.returncode, err[-300:]))
+        self.assertEqual(failures, [], "{} of {} trials failed".format(len(failures), trials))
 
     def test_ctrl_c_is_still_reported_as_interrupted(self):
         def dispatch(args):

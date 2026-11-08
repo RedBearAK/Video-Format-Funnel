@@ -5,6 +5,7 @@ VERSION = "20261107"
 import datetime
 import hashlib
 import json
+import multiprocessing
 import os
 import socket
 import subprocess
@@ -22,6 +23,8 @@ from vidfunnel.record import (
     FolderLock,
     LockHeld,
     RecordError,
+    in_container,
+    pid_alive,
     add_flag,
     add_penalty,
     add_stage,
@@ -307,6 +310,20 @@ class IterRecordsTests(TempDirCase):
         self.assertEqual(problems, ["bad.avi.json"])
 
 
+def race_for_lock(folder, barrier, results):
+    """One racer of test_racers_for_a_dead_lock_get_it_once: wait at the barrier, try the lock, hold it 0.5 s."""
+    import time
+    barrier.wait()
+    try:
+        with FolderLock(folder, warn=lambda message: None):
+            results.put("ACQUIRED")
+            time.sleep(0.5)
+    except LockHeld:
+        results.put("HELD")
+    except BaseException as error:
+        results.put("ERROR {!r}".format(error))
+
+
 class FolderLockTests(TempDirCase):
     def lock_file(self):
         return self.base / RECORD_DIR / LOCK_NAME
@@ -384,22 +401,177 @@ class FolderLockTests(TempDirCase):
         self.assertEqual(len(warnings), 1, warnings)
         self.assertIn("pid {}".format(dead), warnings[0])
 
+    def live_pid(self):
+        """The pid of a running child that is not this process; it is stopped at cleanup."""
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        return child.pid
+
     def test_live_holder_on_this_host_is_respected(self):
+        live = self.live_pid()
+        held = self.write_lock(socket.gethostname(), live, 0.5, container=False)
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with self.assertRaises(LockHeld) as caught:
+                with FolderLock(self.base, warn=self.fail):
+                    pass
+        self.assertIn("its pid {} is running here".format(live), str(caught.exception))
+        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), held)
+
+    def test_live_holder_on_this_host_is_taken_over_once_stale(self):
+        """A live pid cannot lengthen the wait: after 24 h it is taken for a reused pid."""
+        live = self.live_pid()
+        self.write_lock(socket.gethostname(), live, 25, container=False)
+        warnings = []
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with FolderLock(self.base, warn=warnings.append):
+                content = json.loads(self.lock_file().read_text(encoding="utf-8"))
+                self.assertEqual(content["pid"], os.getpid())
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("stale lock", warnings[0])
+        self.assertIn("pid {}".format(live), warnings[0])
+        self.assertIn("reused", warnings[0])
+        self.assertNotIn("its pid {} is running here".format(live), warnings[0])
+
+    def test_our_own_pid_counts_as_unknown(self):
+        """A lock naming this process (a container's PID 1, a reused pid) is judged by age alone."""
         held = self.write_lock(socket.gethostname(), os.getpid(), 0.5, container=False)
         with mock.patch("vidfunnel.record.in_container", return_value=False):
             with self.assertRaises(LockHeld) as caught:
                 with FolderLock(self.base, warn=self.fail):
                     pass
-        self.assertIn("still running", str(caught.exception))
+        self.assertIn("this process's own", str(caught.exception))
+        self.assertNotIn("is running here", str(caught.exception))
         self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), held)
-
-    def test_live_holder_on_this_host_is_respected_even_when_old(self):
-        held = self.write_lock(socket.gethostname(), os.getpid(), 30, container=False)
+        self.write_lock(socket.gethostname(), os.getpid(), 25, container=False)
+        warnings = []
         with mock.patch("vidfunnel.record.in_container", return_value=False):
-            with self.assertRaises(LockHeld):
+            with FolderLock(self.base, warn=warnings.append):
+                pass
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("stale lock", warnings[0])
+
+    def test_pids_os_kill_cannot_take_are_unknown(self):
+        for pid in (99999999999999, 2 ** 31, 10 ** 30, "4242", 0, -5, True, None, 1.5):
+            with self.subTest(pid=pid):
+                self.assertIsNone(pid_alive(pid))
+
+    def test_an_oversized_pid_in_a_lock_falls_back_to_the_age_rule(self):
+        for pid in (99999999999999, 2 ** 31, 10 ** 30, "4242"):
+            with self.subTest(pid=pid), mock.patch("vidfunnel.record.in_container", return_value=False):
+                held = self.write_lock(socket.gethostname(), pid, 0.5, container=False)
+                with self.assertRaises(LockHeld) as caught:
+                    with FolderLock(self.base, warn=self.fail):
+                        pass
+                self.assertIn("cannot be checked", str(caught.exception))
+                self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), held)
+                self.write_lock(socket.gethostname(), pid, 25, container=False)
+                warnings = []
+                with FolderLock(self.base, warn=warnings.append):
+                    pass
+                self.assertEqual(len(warnings), 1, warnings)
+                self.assertIn("stale lock", warnings[0])
+
+    def test_racers_for_a_dead_lock_get_it_once(self):
+        """Four processes take over the same dead holder's lock at one instant, 20 times; one gets it each time."""
+        context = multiprocessing.get_context("spawn")
+        racers = 4
+        for round_number in range(20):
+            with self.subTest(round=round_number):
+                self.write_lock(socket.gethostname(), self.finished_pid(), 0.5, container=in_container())
+                barrier = context.Barrier(racers)
+                results = context.Queue()
+                processes = [context.Process(target=race_for_lock, args=(str(self.base), barrier, results))
+                             for _number in range(racers)]
+                for process in processes:
+                    process.start()
+                outcomes = sorted(results.get(timeout=60) for _number in range(racers))
+                for process in processes:
+                    process.join(60)
+                self.assertEqual(outcomes, ["ACQUIRED"] + ["HELD"] * (racers - 1))
+                self.assertFalse(self.lock_file().exists())
+
+    def test_losing_the_create_after_a_takeover_names_the_winner(self):
+        dead = self.finished_pid()
+        self.write_lock(socket.gethostname(), dead, 0.5, container=False)
+        winner = {"host": "winnerhost", "pid": 777, "started": "2026-11-07T12:00:00Z", "container": False}
+        real_open = os.open
+        calls = []
+
+        def racing_open(path, flags, *args):
+            if path != str(self.lock_file()):
+                return real_open(path, flags, *args)
+            calls.append(path)
+            if len(calls) == 2:
+                write_bytes(path, json.dumps(winner).encode("utf-8"))
+            return real_open(path, flags, *args)
+
+        with mock.patch("vidfunnel.record.in_container", return_value=False), \
+                mock.patch("vidfunnel.record.os.open", side_effect=racing_open):
+            with self.assertRaises(LockHeld) as caught:
                 with FolderLock(self.base, warn=self.fail):
                     pass
-        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), held)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual((caught.exception.host, caught.exception.pid), ("winnerhost", 777))
+        self.assertIn("got it first", str(caught.exception))
+        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), winner)
+
+    @unittest.skipIf(sys.platform == "win32", "flock is POSIX")
+    def test_a_takeover_is_judged_under_the_directory_flock(self):
+        import fcntl
+        dead = self.finished_pid()
+        self.write_lock(socket.gethostname(), dead, 0.5, container=False)
+        real_alive = pid_alive
+        seen = []
+
+        def probe_flock(pid):
+            handle = os.open(str(self.base / RECORD_DIR), os.O_RDONLY)
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                seen.append("free")
+            except BlockingIOError:
+                seen.append("held")
+            finally:
+                os.close(handle)
+            return real_alive(pid)
+
+        with mock.patch("vidfunnel.record.in_container", return_value=False), \
+                mock.patch("vidfunnel.record.pid_alive", side_effect=probe_flock):
+            with FolderLock(self.base, warn=lambda message: None):
+                pass
+        self.assertEqual(seen, ["held"])
+
+    def test_a_file_system_without_directory_flock_still_takes_over(self):
+        dead = self.finished_pid()
+        self.write_lock(socket.gethostname(), dead, 0.5, container=False)
+        warnings = []
+        with mock.patch("vidfunnel.record.in_container", return_value=False), \
+                mock.patch("fcntl.flock", side_effect=OSError(95, "Operation not supported")):
+            with FolderLock(self.base, warn=warnings.append):
+                content = json.loads(self.lock_file().read_text(encoding="utf-8"))
+                self.assertEqual(content["pid"], os.getpid())
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("no longer runs", warnings[0])
+
+    def test_a_lock_replaced_after_it_was_judged_is_not_unlinked(self):
+        dead = self.finished_pid()
+        self.write_lock(socket.gethostname(), dead, 0.5, container=False)
+        winner = {"host": "winnerhost", "pid": 778, "started": "2026-11-07T12:00:00Z", "container": False}
+        real_alive = pid_alive
+
+        def judged_then_replaced(pid):
+            result = real_alive(pid)
+            self.lock_file().unlink()
+            write_bytes(self.lock_file(), json.dumps(winner).encode("utf-8"))
+            return result
+
+        with mock.patch("vidfunnel.record.in_container", return_value=False), \
+                mock.patch("vidfunnel.record.pid_alive", side_effect=judged_then_replaced):
+            with self.assertRaises(LockHeld) as caught:
+                with FolderLock(self.base, warn=self.fail):
+                    pass
+        self.assertEqual(caught.exception.pid, 778)
+        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), winner)
 
     def test_holder_we_may_not_signal_counts_as_alive(self):
         held = self.write_lock(socket.gethostname(), 4242, 0.5, container=False)

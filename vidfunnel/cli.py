@@ -7,12 +7,16 @@ shows up as a stub that says so and exits with EXIT_ERROR, never silently.
 
 SIGTERM (kill, or 'podman stop', where vidfunnel runs as the container's
 PID 1 and would otherwise ignore it) is handled like Ctrl+C: the handler
-sets vidfunnel.interrupt.interrupted, sends SIGTERM to the ffmpeg and par2
-children that vidfunnel.ffmpeg has registered (a signal to the Python
-process alone does not reach them, unlike Ctrl+C to a terminal's process
-group), and raises Terminated, a KeyboardInterrupt, so the same finally
-blocks release folder locks and remove part files. main() then prints
-'vidfunnel: terminated' and returns EXIT_ERROR.
+notes it in a plain module flag and raises Terminated, a KeyboardInterrupt,
+on the main thread, so the same finally blocks release folder locks and
+remove part files. It takes no lock (see _on_sigterm). The main thread then
+does the rest in its except paths (vidfunnel.interrupt.stop_workers, from
+run_pool() and from main()): it sets vidfunnel.interrupt.interrupted and
+sends SIGTERM to the ffmpeg and par2 children that vidfunnel.ffmpeg has
+registered (a signal to the Python process alone does not reach them,
+unlike Ctrl+C to a terminal's process group). main() then prints
+'vidfunnel: terminated' and returns EXIT_ERROR. Only the first SIGTERM
+raises; later ones do nothing, so they cannot cut that cleanup short.
 """
 
 VERSION = "20261107"
@@ -174,9 +178,9 @@ def dispatch(args):
     return EXIT_USAGE
 
 
-# Set by the first SIGTERM; a second one only signals the children again, so it cannot cut the
-# cleanup that the first one started (finally blocks releasing locks, removing part files) short.
-_terminating = threading.Event()
+# Set by the first SIGTERM, cleared by main() on its way out. A plain bool, not a
+# threading.Event: the handler may take no lock (see _on_sigterm).
+_terminating = False
 
 
 class Terminated(KeyboardInterrupt):
@@ -184,15 +188,22 @@ class Terminated(KeyboardInterrupt):
 
 
 def _on_sigterm(signum, frame):
-    """Set the interrupt event, pass SIGTERM to the registered children, raise Terminated (once)."""
-    from vidfunnel.ffmpeg import terminate_children
-    from vidfunnel.interrupt import interrupted
-    first = not _terminating.is_set()
-    _terminating.set()
-    interrupted.set()
-    terminate_children()
-    if first:
-        raise Terminated()
+    """On the first SIGTERM, set _terminating and raise Terminated; on later ones, do nothing.
+
+    Python may run this handler nested inside another run of it, or inside
+    main-thread code that holds a lock, and a handler that waited for such a
+    lock would wait forever. So it takes none: it reads and assigns a module
+    global, and everything that locks (signalling the children) runs in the
+    except paths on the main thread. Raising only once means a second
+    SIGTERM cannot interrupt the finally blocks and except paths the first
+    one started; two handler runs nested in each other raise at most twice,
+    and the outer exception replaces the inner one.
+    """
+    global _terminating
+    if _terminating:
+        return
+    _terminating = True
+    raise Terminated()
 
 
 def install_sigterm_handler():
@@ -204,7 +215,7 @@ def install_sigterm_handler():
     """
     if threading.current_thread() is not threading.main_thread():
         return None
-    import vidfunnel.ffmpeg  # imported here, not inside the handler, which must not wait on an import lock
+    import vidfunnel.ffmpeg  # imported now, so the except paths after a SIGTERM wait on no import lock
     previous = signal.getsignal(signal.SIGTERM)
     if previous is not signal.SIG_DFL:
         return None
@@ -228,15 +239,37 @@ def main(argv=None):
     try:
         return dispatch(args)
     except KeyboardInterrupt as error:
-        terminated = isinstance(error, Terminated) or _terminating.is_set()
-        print("\nvidfunnel: {}".format("terminated" if terminated else "interrupted"), file=sys.stderr)
-        return EXIT_ERROR
+        return _report_interrupt(error)
     finally:
         if previous is not None:
             signal.signal(signal.SIGTERM, previous)
-            if _terminating.is_set():
-                from vidfunnel.interrupt import interrupted
-                interrupted.clear()
-                _terminating.clear()
+            _reset_after_sigterm()
+
+
+def _report_interrupt(error):
+    """After Ctrl+C or SIGTERM: stop the workers' children (SIGTERM only), print, return EXIT_ERROR.
+
+    A SIGTERM after a Ctrl+C raises Terminated in here; it is caught and the
+    steps are run again, so the run still ends with the message and the exit code.
+    """
+    from vidfunnel.interrupt import stop_workers
+    while True:
+        try:
+            terminated = isinstance(error, Terminated) or _terminating
+            if terminated:
+                stop_workers()
+            print("\nvidfunnel: {}".format("terminated" if terminated else "interrupted"), file=sys.stderr)
+            return EXIT_ERROR
+        except Terminated as nested:
+            error = nested
+
+
+def _reset_after_sigterm():
+    """Clear _terminating and the interrupt event a SIGTERM left set, so a later main() in this process starts clean."""
+    global _terminating
+    if _terminating:
+        from vidfunnel.interrupt import interrupted
+        interrupted.clear()
+        _terminating = False
 
 # End of File #

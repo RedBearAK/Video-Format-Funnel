@@ -207,6 +207,19 @@ class PlanFfmpegTest(unittest.TestCase):
         self.assertIn(recorded["configuration_sha256"][:12], problem)
         self.assertIn("plan again with --replan on this machine", problem)
 
+    def test_two_records_naming_one_ffmpeg_ask_it_once(self):
+        calls = self.ffmpeg.parent / "calls"
+        self.ffmpeg.write_text("#!/bin/sh\necho call >> '{}'\n"
+                               "echo 'ffmpeg version 7.1.5 Copyright (c) 2000-2026 the FFmpeg developers'\n"
+                               "echo 'configuration: --enable-gpl'\n".format(calls))
+        self.ffmpeg.chmod(self.ffmpeg.stat().st_mode | stat.S_IXUSR)
+        recorded = plan_identity(self.ffmpeg, {"version": "7.1.5", "configuration": ["--enable-gpl"]})
+        self.assertIsNone(plan_ffmpeg_problem(self.record(recorded)))
+        self.assertIsNone(plan_ffmpeg_problem(self.record(recorded)))
+        self.assertEqual(calls.read_text().splitlines(), ["call"])
+        self.banner("8.1.3", "--enable-gpl")
+        self.assertIn("here is ffmpeg 8.1.3", plan_ffmpeg_problem(self.record(recorded)))
+
     def test_record_without_the_field_runs_as_before(self):
         self.banner("7.1.5", "--disable-gpl")
         self.assertIsNone(plan_ffmpeg_problem(self.record(None)))

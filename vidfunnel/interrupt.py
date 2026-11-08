@@ -5,7 +5,8 @@ ffprobe and par2 child dies, but only the main thread receives
 KeyboardInterrupt. A worker would see its dead child as an ordinary failed
 run and write that into a record. The contract instead:
 
-- `interrupted` is a threading.Event. run_pool() clears it before the pool
+- `interrupted` is a Flag, a threading.Event without its lock (see
+  Flag for why). run_pool() clears it before the pool
   starts and again once no worker is alive; it sets it on the main thread,
   as the first thing it does when KeyboardInterrupt arrives there.
 - The subprocess entry points (vidfunnel.ffmpeg.run, encode.write_par2) and
@@ -20,19 +21,60 @@ run and write that into a record. The contract instead:
   vidfunnel.cli.main prints 'vidfunnel: interrupted'.
 
 SIGTERM goes to the Python process alone, so its children do not see it.
-vidfunnel.cli installs a handler that sets `interrupted` itself, sends
-SIGTERM to the children registered in vidfunnel.ffmpeg (which then end
-the way child_interrupted() expects), and raises a KeyboardInterrupt on
-the main thread; the contract above then applies unchanged.
+vidfunnel.cli installs a handler that raises Terminated, a
+KeyboardInterrupt, on the main thread at the first SIGTERM and takes no
+lock. The contract above then applies, with one
+addition: run_pool() calls stop_workers(), which sets `interrupted` and
+sends SIGTERM to the children registered in vidfunnel.ffmpeg (which then
+end the way child_interrupted() expects); vidfunnel.cli.main calls it
+again after a SIGTERM, for the case without a pool.
 """
 
 VERSION = "20261107"
 
 import queue
 import threading
+import time
 
-# Set only by run_pool() on the main thread while a pool is running; see the module docstring.
-interrupted = threading.Event()
+
+class Flag:
+    """threading.Event's set/clear/is_set/wait without its lock.
+
+    A KeyboardInterrupt or Terminated can be raised on the main thread at
+    almost any bytecode, including inside Event.set() while the Event's
+    Condition lock is held; that lock then stays held and the next set()
+    waits forever (34 of 300 test runs that sent SIGTERM to a loop of
+    Event.clear() and Event.set() hung that way). Here set(), clear() and
+    is_set() are a single attribute store or read, which no exception can
+    leave half done, and wait() polls the attribute every POLL_SECONDS.
+    """
+
+    POLL_SECONDS = 0.01
+
+    def __init__(self):
+        self._value = False
+
+    def set(self):
+        self._value = True
+
+    def clear(self):
+        self._value = False
+
+    def is_set(self):
+        return self._value
+
+    def wait(self, timeout=None):
+        """True as soon as the flag is set, False when `timeout` seconds pass first (None: no limit)."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not self._value:
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            time.sleep(self.POLL_SECONDS)
+        return True
+
+
+# Set only on the main thread: by run_pool() while a pool runs, and by stop_workers(); see the module docstring.
+interrupted = Flag()
 
 # A worker whose child died the way a Ctrl+C kills it waits this long for the main
 # thread to set `interrupted`, so the child's death and the main thread's
@@ -74,6 +116,24 @@ def child_interrupted(returncode):
     return False
 
 
+def stop_workers():
+    """Set `interrupted` and send SIGTERM to the registered children; on the main thread, never in a signal handler.
+
+    A KeyboardInterrupt (a further Ctrl+C, or a SIGTERM after a Ctrl+C) raised while it runs
+    is dropped and the steps run again, so both are done when it returns;
+    the caller is already handling the first interrupt. Sending SIGTERM to
+    children a Ctrl+C has already stopped is harmless.
+    """
+    from vidfunnel.ffmpeg import terminate_children  # here: vidfunnel.ffmpeg imports this module
+    while True:
+        try:
+            interrupted.set()
+            terminate_children()
+            return
+        except KeyboardInterrupt:
+            continue
+
+
 def run_pool(jobs, tasks, on_done):
     """Run each task (a callable without arguments) on `jobs` threads; on_done(index, value) on this thread.
 
@@ -84,7 +144,8 @@ def run_pool(jobs, tasks, on_done):
     raises, so no task outlives it. A worker takes no further task once
     `interrupted` (or, after any other exception here, the local `stop`) is
     set. On KeyboardInterrupt on this thread (or a task that raised
-    Interrupted): `interrupted` is set, the running tasks are waited for,
+    Interrupted): stop_workers() sets `interrupted` and sends SIGTERM to
+    the registered children, the running tasks are waited for,
     and KeyboardInterrupt is raised; a task that ended with Interrupted is
     never passed to on_done. Another exception from a task is raised here
     after the running tasks have ended.
@@ -120,7 +181,7 @@ def run_pool(jobs, tasks, on_done):
                     raise value
                 on_done(index, value)
         except (KeyboardInterrupt, Interrupted) as error:
-            interrupted.set()
+            stop_workers()
             if isinstance(error, Interrupted):
                 raise KeyboardInterrupt() from error
             raise

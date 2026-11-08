@@ -222,10 +222,11 @@ def skip_reason(record, output_path):
 def plan_ffmpeg_problem(record):
     """Why the ffmpeg at stages.plan.argv[0] is not the build the plan was made with, or None.
 
-    Compares its version and configuration hash now (one '-version' call,
-    vidfunnel.ffmpeg.current_identity) with stages.plan.ffmpeg. A record
-    planned before plan wrote that field (20261107) gives None and runs as
-    before. Call it once argv[0] is known to be an executable file.
+    Compares its version and configuration hash now (one '-version' call
+    per ffmpeg build per process, vidfunnel.ffmpeg.current_identity) with
+    stages.plan.ffmpeg. A record planned before plan wrote that field gives
+    None and runs as before. Call it once argv[0] is known to be an
+    executable file.
     """
     plan = (record.get("stages") or {}).get("plan") or {}
     if "ffmpeg" not in plan:
@@ -250,7 +251,7 @@ def plan_ffmpeg_problem(record):
 
 
 def _refusal(record, folder, output_path):
-    """Why a record cannot be converted as it stands, or None. Writes nothing; runs 'ffmpeg -version' once."""
+    """Why a record cannot be converted as it stands, or None. Writes nothing; may run 'ffmpeg -version' once."""
     status = record.get("status")
     if status != "planned":
         if status in DONE_STATUSES:

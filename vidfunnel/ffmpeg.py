@@ -373,14 +373,32 @@ def plan_identity(path, caps):
             "configuration_sha256": configuration_sha256((caps or {}).get("configuration"))}
 
 
-def current_identity(path):
-    """plan_identity() of the ffmpeg at `path` as it is now, from one `-version` call.
+# current_identity() results for this process, keyed by (path, size, mtime in ns) of the file at path.
+_identity_cache = {}
 
-    Raises FfmpegError or ToolNotFound when it does not run.
+
+def current_identity(path):
+    """plan_identity() of the ffmpeg at `path` as it is now, from one `-version` call per build.
+
+    The result is kept for the rest of the process under the path, size and
+    mtime of the file at `path` (os.stat, which follows symlinks), so 500
+    records naming one ffmpeg cost one call, and a file replaced meanwhile
+    is asked again. A path os.stat cannot read is not cached. Failures are
+    not cached either. Raises FfmpegError or ToolNotFound when it does not run.
     """
+    try:
+        status = os.stat(path)
+        key = (str(path), status.st_size, status.st_mtime_ns)
+    except OSError:
+        key = None
+    if key is not None and key in _identity_cache:
+        return dict(_identity_cache[key])
     output = run([path, "-hide_banner", "-version"]).stdout
-    return {"path": str(path), "version": _version_string(output),
-            "configuration_sha256": configuration_sha256(_parse_configuration(output))}
+    identity = {"path": str(path), "version": _version_string(output),
+                "configuration_sha256": configuration_sha256(_parse_configuration(output))}
+    if key is not None:
+        _identity_cache[key] = identity
+    return dict(identity)
 
 
 def clear_capabilities_cache():
@@ -392,7 +410,7 @@ def clear_capabilities_cache():
 
 # Every child started by run() (and encode.write_par2) while it runs, so a SIGTERM to vidfunnel alone,
 # which unlike Ctrl+C in a terminal does not reach the children, can pass it on (terminate_children).
-# Reentrant: the SIGTERM handler runs on the main thread, possibly while that thread holds the lock.
+# Reentrant, which costs nothing; the SIGTERM handler itself no longer takes it (see vidfunnel.cli._on_sigterm).
 _children = set()
 _children_lock = threading.RLock()
 
@@ -498,9 +516,21 @@ def _error_message(argv, returncode, stderr):
 
 
 def _collect(process, progress):
-    """(stdout, stderr) of a started child, feeding -progress blocks to `progress` when given (see run)."""
+    """(stdout, stderr) of a started child, feeding -progress blocks to `progress` when given (see run).
+
+    On any exception (Ctrl+C, SIGTERM's Terminated, a failing callback) the
+    child is killed and reaped before the exception propagates, so the run
+    never exits while its child still runs.
+    """
     if progress is None:
-        return process.communicate()
+        try:
+            return process.communicate()
+        except BaseException:
+            process.kill()
+            process.wait()
+            for stream in (process.stdout, process.stderr):
+                stream.close()
+            raise
     stderr_parts = []
     reader = threading.Thread(target=lambda: stderr_parts.append(process.stderr.read()), daemon=True)
     reader.start()

@@ -249,6 +249,14 @@ class InstallWithoutHostPythonTests(WrapperTestCase):
         self.assertIn("sudo ln -s '{}' '/usr/local/bin/vidfunnel'".format(WRAPPER), output)
         self.assertFalse(self.engine_log.exists())
 
+    def test_sh_install_takes_sys_for_system(self):
+        if os.access("/usr/local/bin", os.W_OK):
+            self.skipTest("'/usr/local/bin' is writable here; a system install would really happen")
+        code, output = self.run_wrapper("--install-command", "--sys")
+        self.assertNotEqual(code, 0)
+        self.assertIn("sudo ln -s '{}' '/usr/local/bin/vidfunnel'".format(WRAPPER), output)
+        self.assertFalse(os.path.lexists(str(self.user_link)))
+
     def test_sh_install_accepts_abbreviations(self):
         code, output = self.run_wrapper("--y", "--us", "--inst")
         self.assertEqual(code, 0, output)
@@ -282,6 +290,15 @@ class InstallScanTests(WrapperTestCase):
         code, output = self.run_wrapper("--inst")
         self.assertEqual(code, 0, output)
         self.assertFalse(self.engine_log.exists())
+        self.assertEqual(os.readlink(str(self.user_link)), str(WRAPPER))
+
+    def test_too_short_uninstall_prefix_goes_to_the_container(self):
+        """'--u' is shorter than the shortest accepted '--un', so it starts no uninstall."""
+        self.user_link.parent.mkdir(parents=True)
+        os.symlink(str(WRAPPER), str(self.user_link))
+        code, output = self.run_wrapper("--u")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.engine_argv()[-1], "--u")
         self.assertEqual(os.readlink(str(self.user_link)), str(WRAPPER))
 
     def test_install_option_after_the_subcommand_goes_to_the_container(self):
@@ -449,6 +466,30 @@ class PhysicalPathTests(WrapperTestCase):
         self.assertIn("refusing to mount '/'", output)
         self.assertFalse(self.engine_log.exists())
 
+    def test_bracketed_folder_name_is_not_a_glob(self):
+        """'Movie[s]' is mounted itself, not the sibling 'Movies' its name would match as a pattern."""
+        bracketed = self.elsewhere / "Movie[s]"
+        bracketed.mkdir()
+        (self.elsewhere / "Movies").mkdir()
+        (bracketed / "clip.mkv").write_bytes(b"")
+        code, output = self.run_wrapper("plan", str(bracketed / "clip.mkv"))
+        self.assertEqual(code, 0, output)
+        self.assert_mounted(bracketed)
+        self.assertNotIn("{0}:{0}".format(self.elsewhere / "Movies"), self.mounts())
+
+    def test_cdpath_does_not_redirect_a_relative_folder(self):
+        """With CDPATH naming a folder that has a same-named subfolder, 'media' is still ./media."""
+        cdpath_folder = self.elsewhere / "cdpath-folder"
+        (cdpath_folder / "media").mkdir(parents=True)
+        (self.workdir / "media").mkdir()
+        result = subprocess.run(
+            [SHELL_BINARY, str(WRAPPER), "plan", "media"], cwd=str(self.workdir),
+            env=dict(self.environment(), CDPATH=str(cdpath_folder)), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(sorted(self.mounts()), sorted("{0}:{0}".format(path) for path in (
+            self.workdir, self.state_dir, self.cache_dir)))
+
     def test_home_folders_behind_symlinks_are_mounted_physically(self):
         self.home = self.workdir / "inner-home"
         self.home.mkdir()
@@ -494,6 +535,14 @@ class PathOptionTests(WrapperTestCase):
         self.assert_db_prepared("index", "--d=DBPATH")
         self.assert_db_prepared("find", "someid", "--d=DBPATH")
         self.assert_db_prepared("report", "--d", "DBPATH")
+
+    def test_double_dash_after_index_is_not_a_database(self):
+        """'--' is a prefix of '--db' but shorter than the shortest accepted '--d'."""
+        not_a_database = self.elsewhere / "not-a-database-folder" / "index.sqlite"
+        code, output = self.run_wrapper("index", "--", str(not_a_database))
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.engine_argv()[-3:], ["index", "--", str(not_a_database)])
+        self.assertFalse(not_a_database.parent.exists())
 
     def test_short_d_after_retire_is_not_a_database(self):
         source = self.workdir / "folder"

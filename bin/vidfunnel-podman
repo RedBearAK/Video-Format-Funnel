@@ -12,6 +12,7 @@
 VERSION="20261107"
 
 set -eu
+set -f
 unset CDPATH
 
 VIDFUNNEL_IMAGE_DIGEST=""
@@ -73,7 +74,8 @@ What the wrapper does:
   current directory by way of '~'. Without -e HOME, the passwd entry that
   --userns=keep-id adds gives a home that is not usable ('/' on one host, the
   working directory on another). Inside the container HOME's own directory is
-  root-owned and not writable; only the two mounted folders are, and vidfunnel
+  root-owned and not writable unless HOME is under the working directory, which
+  is mounted whole; otherwise only the two mounted folders are, and vidfunnel
   writes nothing else under HOME. Both folders are also mounted at their
   physical path when ~/.cache or ~/.local/state is a symlink to another disk.
   An unset or empty HOME stops the wrapper.
