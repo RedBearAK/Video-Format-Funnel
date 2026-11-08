@@ -82,6 +82,12 @@ What the wrapper does:
   The container runs with --rm, --userns=keep-id (podman) or --user uid:gid
   (docker) so files are owned by you, and --security-opt label=disable for SELinux
   hosts. It gets a terminal (-it) only when stdin is one.
+  Your supplementary groups are kept inside the container when they can be, so a
+  share writable only through a group (root:media 775 on a NAS mount) stays
+  writable: with podman on the crun runtime through --group-add keep-groups; with
+  docker through --group-add for each of your group ids. podman on runc cannot
+  keep them (runc ignores keep-groups, and numeric ids map to subordinate gids
+  under keep-id); the wrapper then prints a warning when you have such groups.
 
 Installing the command:
   --install-command and --uninstall-command (or an abbreviation argparse
@@ -568,9 +574,34 @@ IFS="$oldifs"
 set -- --workdir "${CWD}" "$@"
 set -- -e "HOME=${HOME}" "$@"
 set -- --security-opt label=disable "$@"
+# Supplementary groups: a share writable only through a group the user belongs to
+# (root:media 775 on a NAS mount) is read-only inside the container unless the
+# container process keeps those groups. Under --userns=keep-id the group ids inside
+# the namespace map to subordinate gids, not to the host's, so adding them by number
+# cannot work; crun's 'keep-groups' keeps the host's own groups. runc has no such
+# option and ignores it silently. Docker uses no user namespace here, so the numeric
+# ids are the host's and --group-add by number works.
+supplementary_gids() {
+    primary=$(id -g)
+    for gid in $(id -G); do
+        [ "${gid}" = "${primary}" ] || printf '%s\n' "${gid}"
+    done
+}
 if [ "${ENGINE}" = "podman" ]; then
+    runtime=$(podman info --format '{{.Host.OCIRuntime.Name}}' 2>/dev/null || true)
+    case "${runtime}" in
+        crun|*/crun) set -- --group-add keep-groups "$@" ;;
+        *)
+            if [ -n "$(supplementary_gids)" ]; then
+                say "vidfunnel-podman: the OCI runtime '${runtime:-unknown}' cannot keep your supplementary groups inside the container (only crun can, with --group-add keep-groups); a folder writable only through a group will be read-only there" >&2
+            fi
+            ;;
+    esac
     set -- --userns=keep-id "$@"
 else
+    for gid in $(supplementary_gids); do
+        set -- --group-add "${gid}" "$@"
+    done
     set -- --user "$(id -u):$(id -g)" "$@"
 fi
 if [ -t 0 ]; then

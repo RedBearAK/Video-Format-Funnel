@@ -21,6 +21,7 @@ PLAIN_LAUNCHER = REPO_ROOT / "bin" / "vidfunnel"
 SHELL_BINARY = shutil.which("sh")
 
 FAKE_ENGINE = """#!/bin/sh
+if [ "$1" = info ]; then printf '%s\\n' "${FAKE_RUNTIME:-crun}"; exit 0; fi
 for argument in "$@"; do printf '%s\\n' "$argument"; done > "$FAKE_ENGINE_LOG"
 exit 0
 """
@@ -84,6 +85,67 @@ class WrapperTestCase(unittest.TestCase):
     def assert_pair(self, argv, first, second):
         pairs = list(zip(argv, argv[1:]))
         self.assertIn((first, second), pairs, "argv was: {}".format(argv))
+
+
+class SupplementaryGroupTests(WrapperTestCase):
+    """A share writable only through a group stays writable inside the container where the engine allows it."""
+
+    def environment(self, home=True, shell="/bin/sh", runtime="crun"):
+        env = super().environment(home=home, shell=shell)
+        env["FAKE_RUNTIME"] = runtime
+        return env
+
+    def run_with_runtime(self, runtime, *arguments):
+        result = subprocess.run(
+            [SHELL_BINARY, str(WRAPPER)] + list(arguments), cwd=str(self.workdir),
+            env=self.environment(runtime=runtime), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        return result.returncode, result.stdout + result.stderr
+
+    def host_supplementary_gids(self):
+        primary = os.getgid()
+        return [str(gid) for gid in os.getgroups() if gid != primary]
+
+    def test_podman_on_crun_keeps_the_host_groups(self):
+        code, output = self.run_with_runtime("crun", "check")
+        self.assertEqual(code, 0, output)
+        argv = self.engine_argv()
+        self.assert_pair(argv, "--group-add", "keep-groups")
+        self.assertNotIn("cannot keep your supplementary groups", output)
+
+    def test_podman_on_runc_adds_no_groups_and_warns_when_the_user_has_some(self):
+        code, output = self.run_with_runtime("runc", "check")
+        self.assertEqual(code, 0, output)
+        argv = self.engine_argv()
+        self.assertNotIn("--group-add", argv)
+        if self.host_supplementary_gids():
+            self.assertIn("'runc' cannot keep your supplementary groups", output)
+        else:
+            self.assertNotIn("cannot keep your supplementary groups", output)
+
+    def test_docker_adds_each_supplementary_group_by_number(self):
+        # The PATH must not reach the real podman once the fake one is gone, so it holds only the
+        # fake docker and the tools the wrapper needs.
+        os.unlink(str(self.fake_bin / "podman"))
+        self.write_script("docker", FAKE_ENGINE)
+        tool_bin = self.fake_bin.parent / "tools-for-docker"
+        tool_bin.mkdir()
+        for tool in ("env", "dirname", "basename", "readlink", "mkdir", "rm", "ln", "mv", "uname", "id", "cat"):
+            found = shutil.which(tool, path="/usr/bin:/bin")
+            if found is None:
+                self.skipTest("'{}' is not in /usr/bin or /bin".format(tool))
+            os.symlink(found, str(tool_bin / tool))
+        env = dict(self.environment(runtime="runc"), PATH="{}:{}".format(self.fake_bin, tool_bin))
+        result = subprocess.run([SHELL_BINARY, str(WRAPPER), "check"], cwd=str(self.workdir), env=env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                universal_newlines=True)
+        code, output = result.returncode, result.stdout + result.stderr
+        self.assertEqual(code, 0, output)
+        argv = self.engine_argv()
+        for gid in self.host_supplementary_gids():
+            self.assert_pair(argv, "--group-add", gid)
+        self.assertNotIn("keep-groups", argv)
+        self.assert_pair(argv, "--user", "{}:{}".format(os.getuid(), os.getgid()))
 
 
 class HomeTests(WrapperTestCase):
