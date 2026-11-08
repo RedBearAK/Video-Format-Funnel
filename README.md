@@ -125,6 +125,16 @@ bin/vidfunnel-podman plan /srv/media/Home\ Videos
 
 Every argument that is an existing file or folder on the host is bind-mounted read-write at the same path inside the container, and the current directory is mounted too and used as the working directory. The container runs with `--userns=keep-id` under podman (`--user uid:gid` under docker) so that records and outputs are owned by you, and with `--security-opt label=disable` for SELinux hosts. `VIDFUNNEL_NICE` runs the command under `nice -n VALUE` and `VIDFUNNEL_IONICE_CLASS` under `ionice -c VALUE`, which is worth setting on a server that does other work. `--image` or `VIDFUNNEL_IMAGE` choose another image; setting `VIDFUNNEL_IMAGE_DIGEST` near the top of the script pins the image by digest so it changes only when that line is edited.
 
+The container gets your `HOME` (`-e HOME=$HOME`): inside it your uid has no passwd entry, so without this every `~` would resolve into the current directory. The wrapper creates `~/.local/state/vidfunnel` (where the index database lives by default) and `~/.cache/vidfunnel` (the ffmpeg capability cache) on the host and mounts both at the same path, so they persist from one run to the next and are owned by you. If `HOME` is unset or empty, the wrapper stops instead of guessing.
+
+To run the container as plain `vidfunnel`, put the wrapper on PATH:
+
+```
+bin/vidfunnel-podman --install-command
+```
+
+This runs on the host, not in the container, and makes `~/.local/bin/vidfunnel` (or `/usr/local/bin/vidfunnel` with `--system`) a symlink to the wrapper; `--uninstall-command` removes it. When the host has Python 3.9 or newer, the repo's own installer does this, as with `bin/vidfunnel --install-command`, including the offer to add `~/.local/bin` to PATH. Without Python the wrapper does it itself: it replaces only a symlink to the wrapper or to `bin/vidfunnel`, refuses anything else at that path, and prints the PATH line for your shell's startup file instead of editing it; for `--system` it needs `/usr/local/bin` to be writable and otherwise prints the `sudo ln -s` command to run.
+
 ## Usage
 
 The pipeline is five separate subcommands, run in order. Each one is idempotent and resumable: run it again on the same folder and it picks up where it left off. Folders are walked recursively. `plan`, `convert`, `verify` and `index` work on the current directory when no PATH is given and print the resolved folder first; `retire`, the only stage that moves originals, always needs an explicit PATH. Global options (`--ffmpeg`, `--quiet`, `--verbose`, `--yes`) go before the subcommand name; `--ffmpeg` defaults to the `VIDFUNNEL_FFMPEG` environment variable when set.

@@ -3,9 +3,12 @@
 # is an existing path on the host is bind-mounted read-write at the same absolute
 # path inside the container, as is the current directory (the container's working
 # directory), and the container runs as the invoking uid/gid. --quarantine and --db
-# targets are created on the host first and mounted. See HANDOFF.md section 8.
+# targets are created on the host first and mounted. HOME is passed in, with its
+# vidfunnel state and cache folders mounted. --install-command and
+# --uninstall-command run on the host and link 'vidfunnel' to this wrapper.
+# See HANDOFF.md section 8.
 
-VERSION="20261102"
+VERSION="20261107"
 
 set -eu
 
@@ -45,9 +48,29 @@ What the wrapper does:
                                          the host (mkdir -p) and mounted
   A --quarantine directory that cannot be created or is still not under a
   mounted path stops the wrapper before the container starts.
+  The container gets your HOME (-e HOME=\$HOME), and the wrapper creates
+  \$HOME/.local/state/vidfunnel (the index database) and \$HOME/.cache/vidfunnel
+  (the ffmpeg capability cache) on the host and mounts both at the same path,
+  so they persist between runs, are owned by you, and nothing reaches the
+  current directory by way of '~'. An unset or empty HOME stops the wrapper.
   The container runs with --rm, --userns=keep-id (podman) or --user uid:gid
   (docker) so files are owned by you, and --security-opt label=disable for SELinux
   hosts. It gets a terminal (-it) only when stdin is one.
+
+Installing the command:
+  --install-command and --uninstall-command, as the first vidfunnel argument
+  (after other options such as --yes), run on the host instead of in the
+  container: they make or remove a symlink 'vidfunnel' in ~/.local/bin (or
+  /usr/local/bin with --system) pointing at this wrapper, so that 'vidfunnel'
+  runs the container. With a python3 of 3.9 or newer on the host, the repo's
+  own installer does it (with --launcher set to this wrapper), including the
+  offer to add ~/.local/bin to PATH. Without one, the wrapper does it itself:
+  it replaces only a symlink to this wrapper or to bin/vidfunnel, refuses
+  anything else, prints the PATH line to add instead of editing any file, and
+  for --system needs /usr/local/bin to be writable (otherwise it prints the
+  sudo ln -s command to run); its --uninstall-command removes only a symlink
+  to this wrapper or to bin/vidfunnel. The repo's installer removes only a
+  symlink to this wrapper.
 
 Environment:
   VIDFUNNEL_IMAGE          image name, overridden by --image
@@ -83,6 +106,14 @@ while [ -L "$self" ]; do
 done
 bindir=$(cd "$(dirname "$self")" && pwd -P)
 root=$(dirname "$bindir")
+wrapper="${bindir}/vidfunnel-podman"
+plain_launcher="${bindir}/vidfunnel"
+
+[ -n "${HOME:-}" ] || die "HOME is not set (or is empty); it is needed for the container's HOME and for --install-command"
+case "${HOME}" in
+    /*) ;;
+    *) die "HOME is '${HOME}', not an absolute path; refusing to guess where the container's HOME should be" ;;
+esac
 
 install_hint() {
     if [ "$(uname -s)" = "Darwin" ]; then
@@ -124,6 +155,129 @@ if [ "${BUILD}" -eq 1 ]; then
     fi
 fi
 
+install_mode=""
+for arg in "$@"; do
+    case "${arg}" in
+        --install-command) install_mode="install"; break ;;
+        --uninstall-command) install_mode="uninstall"; break ;;
+        -*) ;;
+        *) break ;;
+    esac
+done
+
+host_python_ok() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null
+}
+
+link_is_ours() {
+    raw=$(readlink "$1") || return 1
+    case "${raw}" in
+        /*) ;;
+        *) raw="$(dirname "$1")/${raw}" ;;
+    esac
+    if [ -e "${raw}" ]; then
+        raw="$(cd "$(dirname "${raw}")" && pwd -P)/$(basename "${raw}")"
+    fi
+    [ "${raw}" = "${wrapper}" ] || [ "${raw}" = "${plain_launcher}" ]
+}
+
+describe_target() {
+    if [ -L "$1" ]; then
+        printf "a symlink to '%s'" "$(readlink "$1")"
+    elif [ -d "$1" ]; then
+        printf 'a directory'
+    else
+        printf 'a file that is not a symlink'
+    fi
+}
+
+path_advice() {
+    user_bin="${HOME}/.local/bin"
+    case ":${PATH:-}:" in
+        *":${user_bin}:"*|*":${user_bin}/:"*) return 0 ;;
+    esac
+    say "'${user_bin}' is not on PATH."
+    shell_name=$(basename "${SHELL:-}")
+    case "${shell_name}" in
+        bash)
+            say "For bash, add this line to '~/.bashrc':"
+            say '    export PATH="$HOME/.local/bin:$PATH"' ;;
+        zsh)
+            say "For zsh, add this line to '~/.zprofile':"
+            say '    export PATH="$HOME/.local/bin:$PATH"' ;;
+        fish)
+            say "For fish, add this line to '~/.config/fish/config.fish':"
+            say '    fish_add_path -g $HOME/.local/bin' ;;
+        *)
+            say "Add this line, or its equivalent, to your shell's startup file:"
+            say '    export PATH="$HOME/.local/bin:$PATH"' ;;
+    esac
+    say "This wrapper edits no file; until then, 'vidfunnel' is found only by its full path."
+}
+
+sh_install_command() {
+    scope="user"
+    for arg in "$@"; do
+        case "${arg}" in
+            --install-command|--uninstall-command|--yes) ;;
+            --user) scope="user" ;;
+            --system) scope="system" ;;
+            *) die "'${arg}' is not understood by the wrapper's own installer (it takes --user, --system and --yes)" ;;
+        esac
+    done
+    if [ "${scope}" = "system" ]; then
+        link_dir="/usr/local/bin"
+    else
+        link_dir="${HOME}/.local/bin"
+    fi
+    link="${link_dir}/vidfunnel"
+    if [ "${install_mode}" = "uninstall" ]; then
+        if [ ! -e "${link}" ] && [ ! -L "${link}" ]; then
+            say "Nothing installed at '${link}'."
+            return 0
+        fi
+        link_is_ours "${link}" || die "'${link}' is $(describe_target "${link}"), not a symlink to '${wrapper}' or '${plain_launcher}'; leaving it alone"
+        if [ "${scope}" = "system" ] && [ ! -w "${link_dir}" ]; then
+            die "'${link_dir}' is not writable; remove the link by hand with: sudo rm '${link}'"
+        fi
+        rm -f -- "${link}" || die "could not remove '${link}'"
+        { [ -e "${link}" ] || [ -L "${link}" ]; } && die "'${link}' is still there after removing it"
+        say "Removed '${link}'."
+        return 0
+    fi
+    if [ "${scope}" = "system" ] && [ ! -w "${link_dir}" ]; then
+        die "'${link_dir}' is not writable; make the link by hand with: sudo ln -s '${wrapper}' '${link}'"
+    fi
+    if [ -e "${link}" ] || [ -L "${link}" ]; then
+        link_is_ours "${link}" || die "'${link}' already exists and is $(describe_target "${link}"); not overwriting it. Remove it yourself if it should be replaced."
+    fi
+    mkdir -p -- "${link_dir}" || die "cannot create '${link_dir}'"
+    temp_link="${link}.vidfunnel-tmp"
+    rm -f -- "${temp_link}"
+    ln -s -- "${wrapper}" "${temp_link}" || die "could not create '${temp_link}'"
+    mv -f -- "${temp_link}" "${link}" || die "could not move '${temp_link}' to '${link}'"
+    [ -L "${link}" ] && [ "$(readlink "${link}")" = "${wrapper}" ] || die "'${link}' is not a symlink to '${wrapper}' after installing"
+    say "Installed '${link}' -> '${wrapper}'."
+    if [ "${scope}" = "user" ]; then
+        path_advice
+    fi
+    return 0
+}
+
+if [ -n "${install_mode}" ]; then
+    [ -f "${root}/vidfunnel/installer.py" ] || die "the repo's installer '${root}/vidfunnel/installer.py' is missing"
+    if host_python_ok; then
+        exec env PYTHONPATH="${root}${PYTHONPATH:+:$PYTHONPATH}" python3 -m vidfunnel "$@" --launcher "${wrapper}"
+    fi
+    say "No python3 of 3.9 or newer on the host; using the wrapper's own installer (it edits no shell startup file)."
+    sh_install_command "$@"
+    exit 0
+fi
+
+state_dir="${HOME}/.local/state/vidfunnel"
+cache_dir="${HOME}/.cache/vidfunnel"
+
 RUN_IMAGE="${IMAGE}"
 [ -n "${VIDFUNNEL_IMAGE_DIGEST}" ] && RUN_IMAGE="${IMAGE}@${VIDFUNNEL_IMAGE_DIGEST}"
 
@@ -163,6 +317,11 @@ add_mount() {
 
 CWD=$(pwd)
 add_mount "${CWD}"
+
+for home_dir in "${state_dir}" "${cache_dir}"; do
+    mkdir -p -- "${home_dir}" || die "cannot create '${home_dir}' on the host for the container's HOME"
+    add_mount "$(abs_path "${home_dir}")"
+done
 
 QUARANTINES=""
 
@@ -252,6 +411,7 @@ done
 IFS="$oldifs"
 
 set -- --workdir "${CWD}" "$@"
+set -- -e "HOME=${HOME}" "$@"
 set -- --security-opt label=disable "$@"
 if [ "${ENGINE}" = "podman" ]; then
     set -- --userns=keep-id "$@"

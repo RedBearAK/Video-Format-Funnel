@@ -12,9 +12,15 @@ appending it, and marks the line with '# vidfunnel' so that
 
 --uninstall-command removes the symlink only when it points at this launcher,
 and the marked PATH line from whichever rc files contain it. Nothing else.
+
+--launcher PATH links to PATH instead of bin/vidfunnel; bin/vidfunnel-podman
+passes itself, so that 'vidfunnel' on the host runs the container. A symlink
+to the repo's other launcher (bin/vidfunnel when installing the wrapper, or
+the reverse) is this tool's own and is replaced with a message on install;
+uninstall leaves it alone, since it is not the launcher being removed.
 """
 
-VERSION = "20261102"
+VERSION = "20261107"
 
 import os
 import platform
@@ -30,6 +36,7 @@ EXIT_USAGE = 2
 
 MARKER = "# vidfunnel"
 COMMAND_NAME = "vidfunnel"
+PODMAN_WRAPPER_NAME = "vidfunnel-podman"
 USER_BIN = Path(".local") / "bin"
 SYSTEM_BIN = Path("/usr/local/bin")
 
@@ -56,6 +63,16 @@ MARKED_LINES = (_marked(POSIX_PATH_LINE), _marked(FISH_PATH_LINE))
 def launcher_path():
     """Return the repo's bin/vidfunnel, found from this module's own location."""
     return Path(__file__).resolve().parent.parent / "bin" / COMMAND_NAME
+
+
+def podman_wrapper_path():
+    """Return the repo's bin/vidfunnel-podman, next to bin/vidfunnel."""
+    return launcher_path().parent / PODMAN_WRAPPER_NAME
+
+
+def _repo_launchers():
+    """Both launchers this repo ships, as real paths."""
+    return [os.path.realpath(str(launcher_path())), os.path.realpath(str(podman_wrapper_path()))]
 
 
 def target_path(scope, home=None):
@@ -171,7 +188,8 @@ def _inspect_target(target, launcher):
     """Classify what is at target.
 
     Returns (state, description): state is 'absent', 'ours', 'stale' (dangling
-    symlink to an old bin/vidfunnel), or 'foreign'.
+    symlink to an old bin/vidfunnel or bin/vidfunnel-podman), 'other' (a symlink
+    to this repo's other launcher), or 'foreign'.
     """
     target = Path(target)
     if not os.path.lexists(str(target)):
@@ -180,8 +198,11 @@ def _inspect_target(target, launcher):
         pointed = _link_text(target)
         if os.path.realpath(pointed) == os.path.realpath(str(launcher)):
             return "ours", "a symlink to '{}'".format(pointed)
+        if os.path.exists(pointed) and os.path.realpath(pointed) in _repo_launchers():
+            return "other", "a symlink to '{}'".format(pointed)
         parts = Path(pointed).parts
-        if not os.path.exists(pointed) and parts[-2:] == ("bin", COMMAND_NAME):
+        if not os.path.exists(pointed) and parts[-2:] in (
+                ("bin", COMMAND_NAME), ("bin", PODMAN_WRAPPER_NAME)):
             return "stale", "a dangling symlink to '{}'".format(pointed)
         if os.path.exists(pointed):
             return "foreign", "a symlink to '{}'".format(pointed)
@@ -296,10 +317,18 @@ def _offer_path_line(home, environ, yes, stdin, stdout):
     return EXIT_OK
 
 
+def _chosen_launcher(launcher):
+    """The given launcher as an absolute path, or the repo's bin/vidfunnel."""
+    if launcher is None:
+        return launcher_path()
+    return Path(os.path.abspath(os.path.expanduser(str(launcher))))
+
+
 def install(scope="user", yes=False, home=None, stdin=None, stdout=None,
-            bin_dir=None, environ=None, platform_name=None, runner=None):
+            bin_dir=None, environ=None, platform_name=None, runner=None, launcher=None):
     """Symlink the launcher into the bin directory for scope. Returns an exit code.
 
+    launcher replaces bin/vidfunnel as the symlink's target (--launcher).
     bin_dir, environ, platform_name and runner exist for tests: they replace the
     target directory, os.environ, platform.system() and the sudo runner.
     """
@@ -308,7 +337,7 @@ def install(scope="user", yes=False, home=None, stdin=None, stdout=None,
     environ = environ if environ is not None else os.environ
     runner = runner if runner is not None else _default_runner
     home = Path(home) if home is not None else Path.home()
-    launcher = launcher_path()
+    launcher = _chosen_launcher(launcher)
     if not launcher.is_file():
         _say(stdout, "vidfunnel: the launcher '{}' is missing; cannot install.".format(launcher))
         return EXIT_ERROR
@@ -324,6 +353,9 @@ def install(scope="user", yes=False, home=None, stdin=None, stdout=None,
     else:
         if state == "stale":
             _say(stdout, "Replacing {} at '{}' (the repo was moved).".format(description, target))
+        elif state == "other":
+            _say(stdout, "Replacing {} at '{}' (this tool's other launcher) with a symlink "
+                 "to '{}'.".format(description, target, launcher))
         code = _install_link(launcher, target, scope, stdout, platform_name, runner)
         if code != EXIT_OK:
             return code
@@ -353,16 +385,19 @@ def _install_link(launcher, target, scope, stdout, platform_name, runner):
 
 
 def uninstall(scope="user", home=None, stdout=None, bin_dir=None, platform_name=None,
-              runner=None):
-    """Remove the symlink if it points at this launcher, and the marked PATH lines."""
+              runner=None, launcher=None):
+    """Remove the symlink if it points at this launcher, and the marked PATH lines.
+
+    launcher replaces bin/vidfunnel as the launcher the symlink must point at.
+    """
     stdout = stdout if stdout is not None else sys.stdout
     runner = runner if runner is not None else _default_runner
     home = Path(home) if home is not None else Path.home()
-    launcher = launcher_path()
+    launcher = _chosen_launcher(launcher)
     target = Path(bin_dir) / COMMAND_NAME if bin_dir is not None else target_path(scope, home)
 
     state, description = _inspect_target(target, launcher)
-    if state in ("foreign", "stale"):
+    if state in ("foreign", "stale", "other"):
         _say(stdout, "vidfunnel: '{}' is {}, not a symlink to '{}'; leaving it alone.".format(
             target, description, launcher))
         return EXIT_ERROR
@@ -394,7 +429,7 @@ def uninstall(scope="user", home=None, stdout=None, bin_dir=None, platform_name=
 
 
 def add_arguments(parser):
-    """Add --install-command, --uninstall-command, --user and --system to parser."""
+    """Add --install-command, --uninstall-command, --user, --system and --launcher."""
     group = parser.add_argument_group("installing the command")
     actions = group.add_mutually_exclusive_group()
     actions.add_argument(
@@ -410,16 +445,20 @@ def add_arguments(parser):
     scopes.add_argument(
         "--system", dest="scope", action="store_const", const="system",
         help="install into /usr/local/bin (sudo on Linux when that is not writable)")
+    group.add_argument(
+        "--launcher", metavar="PATH", default=None,
+        help="the launcher to link to instead of bin/vidfunnel; used by bin/vidfunnel-podman")
     parser.set_defaults(scope="user")
 
 
 def run(args):
     """Dispatch --install-command / --uninstall-command. Returns an exit code."""
     scope = getattr(args, "scope", None) or "user"
+    launcher = getattr(args, "launcher", None)
     if getattr(args, "install_command", False):
-        return install(scope=scope, yes=bool(getattr(args, "yes", False)))
+        return install(scope=scope, yes=bool(getattr(args, "yes", False)), launcher=launcher)
     if getattr(args, "uninstall_command", False):
-        return uninstall(scope=scope)
+        return uninstall(scope=scope, launcher=launcher)
     sys.stderr.write("vidfunnel: installer.run called without --install-command or "
                      "--uninstall-command\n")
     return EXIT_USAGE

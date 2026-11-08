@@ -4,7 +4,7 @@ Every test works on a temporary HOME and temporary bin directories; nothing
 here reads or writes the real ~/.local/bin, /usr/local/bin or any real rc file.
 """
 
-VERSION = "20261102"
+VERSION = "20261107"
 
 import argparse
 import contextlib
@@ -144,6 +144,86 @@ class InstallTests(InstallerTestCase):
         self.assertEqual(os.readlink(str(other_bin / "vidfunnel")), str(self.launcher))
         self.assertNotIn("Append", output)
         self.assertFalse((self.home / ".bashrc").exists())
+
+
+class LauncherOptionTests(InstallerTestCase):
+    def setUp(self):
+        super().setUp()
+        self.wrapper = installer.podman_wrapper_path()
+
+    def test_wrapper_path_is_next_to_the_launcher(self):
+        self.assertEqual(self.wrapper, self.launcher.parent / "vidfunnel-podman")
+        self.assertTrue(self.wrapper.is_file())
+
+    def test_install_links_to_the_given_launcher(self):
+        code, output = self.do_install(path_env=str(self.user_bin), launcher=self.wrapper)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(os.readlink(str(self.target)), str(self.wrapper))
+        code, output = self.do_install(path_env=str(self.user_bin), launcher=self.wrapper)
+        self.assertEqual(code, 0, output)
+        self.assertIn("already installed", output)
+
+    def test_missing_given_launcher_is_refused(self):
+        missing = Path(self.workspace.name) / "no-such-launcher"
+        code, output = self.do_install(launcher=missing)
+        self.assertEqual(code, 1)
+        self.assertIn("'{}'".format(missing), output)
+        self.assertFalse(os.path.lexists(str(self.target)))
+
+    def test_link_to_plain_launcher_is_replaced_when_installing_the_wrapper(self):
+        self.user_bin.mkdir(parents=True)
+        os.symlink(str(self.launcher), str(self.target))
+        code, output = self.do_install(path_env=str(self.user_bin), launcher=self.wrapper)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(os.readlink(str(self.target)), str(self.wrapper))
+        self.assertIn("other launcher", output)
+
+    def test_link_to_wrapper_is_replaced_when_installing_the_plain_launcher(self):
+        self.user_bin.mkdir(parents=True)
+        os.symlink(str(self.wrapper), str(self.target))
+        code, output = self.do_install(path_env=str(self.user_bin))
+        self.assertEqual(code, 0, output)
+        self.assertEqual(os.readlink(str(self.target)), str(self.launcher))
+        self.assertIn("other launcher", output)
+
+    def test_dangling_link_to_an_old_wrapper_is_replaced(self):
+        self.user_bin.mkdir(parents=True)
+        old_wrapper = Path(self.workspace.name) / "moved-away-repo" / "bin" / "vidfunnel-podman"
+        os.symlink(str(old_wrapper), str(self.target))
+        code, output = self.do_install(path_env=str(self.user_bin), launcher=self.wrapper)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(os.readlink(str(self.target)), str(self.wrapper))
+        self.assertIn("'{}'".format(old_wrapper), output)
+
+    def test_uninstall_removes_only_a_link_to_the_given_launcher(self):
+        self.user_bin.mkdir(parents=True)
+        os.symlink(str(self.launcher), str(self.target))
+        code, output = self.do_uninstall(launcher=self.wrapper)
+        self.assertEqual(code, 1)
+        self.assertIn("leaving it alone", output)
+        self.assertEqual(os.readlink(str(self.target)), str(self.launcher))
+        os.unlink(str(self.target))
+        os.symlink(str(self.wrapper), str(self.target))
+        code, output = self.do_uninstall()
+        self.assertEqual(code, 1)
+        self.assertEqual(os.readlink(str(self.target)), str(self.wrapper))
+        code, output = self.do_uninstall(launcher=self.wrapper)
+        self.assertEqual(code, 0, output)
+        self.assertFalse(os.path.lexists(str(self.target)))
+
+    def test_run_passes_the_launcher_through(self):
+        parser = argparse.ArgumentParser()
+        installer.add_arguments(parser)
+        parser.add_argument("--yes", action="store_true")
+        args = parser.parse_args(["--install-command", "--yes", "--launcher", str(self.wrapper)])
+        calls = []
+        original = installer.install
+        installer.install = lambda **keywords: calls.append(keywords) or 0
+        try:
+            self.assertEqual(installer.run(args), 0)
+        finally:
+            installer.install = original
+        self.assertEqual(calls, [{"scope": "user", "yes": True, "launcher": str(self.wrapper)}])
 
 
 class SystemScopeTests(InstallerTestCase):
@@ -303,6 +383,9 @@ class ArgumentTests(unittest.TestCase):
         self.assertFalse(args.uninstall_command)
         self.assertEqual(args.scope, "user")
         self.assertEqual(self.parse(["--uninstall-command", "--system"]).scope, "system")
+        self.assertIsNone(args.launcher)
+        self.assertEqual(self.parse(["--install-command", "--launcher", "/opt/wrapper"]).launcher,
+                         "/opt/wrapper")
 
     def test_conflicting_options_are_rejected(self):
         with open(os.devnull, "w") as quiet:
