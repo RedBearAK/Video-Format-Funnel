@@ -21,8 +21,8 @@ What the record carries for the later stages:
 - stages.plan.sidecars: [{'path', 'argv', 'kind'}], one argv per subtitle
   sidecar, each ending in its own output path;
 - stages.plan.size_class ({'class', 'bits_per_pixel'}) and
-  stages.plan.blockiness ({'score'}), copied from the analysis for
-  convert --refit; informational, they change no decision;
+  stages.plan.blockiness ({'score'}), an informational copy of the
+  analysis values (convert --refit reads stages.analyze, not these);
 - output.name and output.interim_name ('<stem>.vidfunnel.mp4' when the
   source is itself '<stem>.mp4'), output.sidecars (file names).
 

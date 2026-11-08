@@ -33,6 +33,20 @@
       "samples": []
     }
   ],
+  "blockiness": {
+    "frames": 125,
+    "high": true,
+    "reason": "mean blockdetect score 173.8731 over 125 frame(s) in 1 window(s): at or above the 3.5 threshold",
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ],
+    "score": 173.8731,
+    "skipped_frames": 0,
+    "threshold": 3.5
+  },
   "cadence": {
     "flags": [],
     "idet": {
@@ -163,11 +177,16 @@
     "eligible": true,
     "reason": "H.264 High level 1.3, yuv420p, progressive"
   },
+  "size_class": {
+    "bits_per_pixel": 0.085604,
+    "class": "heavy",
+    "reason": "0.0856 bits per pixel per frame (164360 b/s from container bit_rate (an audio bit_rate is unknown)): heavily compressed: a re-encode at the standard CRF is expected to come out larger"
+  },
   "subtitles": {
     "flags": [],
     "penalties": [],
     "penalty": 0,
-    "reason": "stream 2 ass: mov_text plus .srt sidecar (styling lost)",
+    "reason": "stream 2 ass: mov_text plus .srt sidecar (external .srt is what Roku Media Player and most TV players read; mov_text is not shown everywhere; styling lost in mov_text)",
     "result": [
       {
         "action": "mov_text",
@@ -234,7 +253,7 @@
       ]
     ]
   },
-  "version": "20261102",
+  "version": "20261107",
   "windows": [
     [
       0.0,

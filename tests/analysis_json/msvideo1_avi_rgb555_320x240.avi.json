@@ -33,6 +33,20 @@
       "samples": []
     }
   ],
+  "blockiness": {
+    "frames": 75,
+    "high": true,
+    "reason": "mean blockdetect score 46.4212 over 75 frame(s) in 1 window(s): at or above the 3.5 threshold",
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ],
+    "score": 46.4212,
+    "skipped_frames": 0,
+    "threshold": 3.5
+  },
   "cadence": {
     "flags": [],
     "idet": {
@@ -148,6 +162,11 @@
     "eligible": false,
     "reason": "video codec 'msvideo1' is not H.264"
   },
+  "size_class": {
+    "bits_per_pixel": 0.181157,
+    "class": "near",
+    "reason": "0.1812 bits per pixel per frame (208693 b/s from video stream bit_rate): a re-encode is expected near the source size"
+  },
   "subtitles": {
     "flags": [],
     "penalties": [],
@@ -211,7 +230,7 @@
       ]
     ]
   },
-  "version": "20261102",
+  "version": "20261107",
   "windows": [
     [
       0.0,

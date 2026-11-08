@@ -33,6 +33,20 @@
       "samples": []
     }
   ],
+  "blockiness": {
+    "frames": 125,
+    "high": true,
+    "reason": "mean blockdetect score 209.9673 over 125 frame(s) in 1 window(s): at or above the 3.5 threshold",
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ],
+    "score": 209.9673,
+    "skipped_frames": 0,
+    "threshold": 3.5
+  },
   "cadence": {
     "flags": [],
     "idet": {
@@ -142,6 +156,11 @@
     "eligible": false,
     "reason": "video codec 'flv1' is not H.264"
   },
+  "size_class": {
+    "bits_per_pixel": null,
+    "class": null,
+    "reason": "bits per pixel unknown (no video or container bit_rate; 320x240 at 25.0 fps)"
+  },
   "subtitles": {
     "flags": [],
     "penalties": [],
@@ -205,7 +224,7 @@
       ]
     ]
   },
-  "version": "20261102",
+  "version": "20261107",
   "windows": [
     [
       0.0,

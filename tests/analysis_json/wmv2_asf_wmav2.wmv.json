@@ -33,6 +33,20 @@
       "samples": []
     }
   ],
+  "blockiness": {
+    "frames": 125,
+    "high": true,
+    "reason": "mean blockdetect score 133.7837 over 125 frame(s) in 1 window(s): at or above the 3.5 threshold",
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ],
+    "score": 133.7837,
+    "skipped_frames": 0,
+    "threshold": 3.5
+  },
   "cadence": {
     "flags": [],
     "idet": {
@@ -144,6 +158,11 @@
     "eligible": false,
     "reason": "video codec 'wmv2' is not H.264"
   },
+  "size_class": {
+    "bits_per_pixel": 0.195937,
+    "class": "near",
+    "reason": "0.1959 bits per pixel per frame (376199 b/s from container bit_rate minus 1 audio bit_rate(s)): a re-encode is expected near the source size"
+  },
   "subtitles": {
     "flags": [],
     "penalties": [],
@@ -207,7 +226,7 @@
       ]
     ]
   },
-  "version": "20261102",
+  "version": "20261107",
   "windows": [
     [
       0.0,

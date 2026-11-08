@@ -506,14 +506,16 @@ class RefitRuleTest(unittest.TestCase):
         self.assertIsNone(parse_crf(["ffmpeg", "-crf"]))
 
     def test_crf_steps_follow_the_size_ratio(self):
-        # ceil(ln(ratio) / 0.14): 1.05 -> 0.35 -> 1 step; 1.42 -> 2.50 -> 3 steps; 2.5 -> 6.54 -> 7 steps.
+        # ceil(ln(ratio) / ln(1.12)): 1.05 -> 0.43 -> 1 step; 1.08 -> 0.68 -> 1; 1.42 -> 3.09 -> 4 steps;
+        # 2.5 -> 8.09 -> 9 steps (then capped).
         self.assertEqual(refit_crf(18, 1.05, 480), (19, 23, 1))
-        self.assertEqual(refit_crf(18, 1.42, 480), (21, 23, 3))
-        self.assertEqual(refit_crf(20, 1.42, 1080), (23, 24, 3))
+        self.assertEqual(refit_crf(18, 1.08, 480), (19, 23, 1))
+        self.assertEqual(refit_crf(18, 1.42, 480), (22, 23, 4))
+        self.assertEqual(refit_crf(20, 1.42, 1080), (24, 24, 4))
 
     def test_crf_caps_by_height(self):
-        self.assertEqual(refit_crf(18, 2.5, 480), (23, 23, 7))
-        self.assertEqual(refit_crf(20, 2.5, 1080), (24, 24, 7))
+        self.assertEqual(refit_crf(18, 2.5, 480), (23, 23, 9))
+        self.assertEqual(refit_crf(20, 2.5, 1080), (24, 24, 9))
         self.assertEqual(refit_crf(18, 2.5, 576)[1], 23)
         self.assertEqual(refit_crf(19, 2.5, 577)[1], 24)
         self.assertEqual(refit_crf(18, 2.5, None)[1], 23)
@@ -521,7 +523,7 @@ class RefitRuleTest(unittest.TestCase):
     def test_ratio_not_above_one_gives_no_step(self):
         self.assertEqual(refit_crf(18, 1.0, 480), (18, 23, 0))
         self.assertEqual(refit_crf(18, 0.8, 480), (18, 23, 0))
-        self.assertEqual(refit_crf(23, 1.42, 480), (23, 23, 3))
+        self.assertEqual(refit_crf(23, 1.42, 480), (23, 23, 4))
 
     def test_argv_with_a_filter_chain_and_denoise(self):
         argv, chain = refit_argv(PLANNED_ARGV, 21, True, "/library/.clip.mp4.0f2b6c1e.part")

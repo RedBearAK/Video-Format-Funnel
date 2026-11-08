@@ -93,10 +93,12 @@ ACTION_WORDS = {"remux": "remux", "reencode": "re-encode"}
 DONE_STATUSES = ("converted", "verified")
 
 # --- refit (convert --refit) ---
-# One CRF step changes x264's output size by roughly 12 to 15 %; ln(1.15) is 0.14, so
-# ceil(ln(ratio) / 0.14) steps are expected to bring an output 'ratio' times its source
-# down to the source size or below.
-REFIT_STEP_LOG = 0.14
+# One CRF step of x264 -preset slower saved 11.4 to 12.1 % of size on the content
+# measured for this rule (mandelbrot from an MPEG-4 q5 source: CRF 18 787647 bytes,
+# 19 698048, 21 540167, 23 414027), so ceil(ln(ratio) / ln(1.12)) steps is the estimate
+# of what brings an output 'ratio' times its source to about the source size. The caps
+# below bound it; a refit that still comes out larger is kept as it is, flagged.
+REFIT_STEP_LOG = math.log(1.12)
 REFIT_CAP_SD = 23
 REFIT_CAP_HD = 24
 REFIT_SD_MAX_HEIGHT = 576

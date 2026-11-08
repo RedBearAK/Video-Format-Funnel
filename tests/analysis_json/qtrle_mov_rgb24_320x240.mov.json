@@ -33,6 +33,20 @@
       "samples": []
     }
   ],
+  "blockiness": {
+    "frames": 75,
+    "high": true,
+    "reason": "mean blockdetect score 35.6434 over 75 frame(s) in 1 window(s): at or above the 3.5 threshold",
+    "samples": [
+      [
+        0.0,
+        null
+      ]
+    ],
+    "score": 35.6434,
+    "skipped_frames": 0,
+    "threshold": 3.5
+  },
   "cadence": {
     "flags": [],
     "idet": {
@@ -146,6 +160,11 @@
     "eligible": false,
     "reason": "video codec 'qtrle' is not H.264"
   },
+  "size_class": {
+    "bits_per_pixel": 3.209311,
+    "class": "much-smaller",
+    "reason": "3.2093 bits per pixel per frame (3697126 b/s from video stream bit_rate): a re-encode is expected to come out much smaller"
+  },
   "subtitles": {
     "flags": [],
     "penalties": [],
@@ -209,7 +228,7 @@
       ]
     ]
   },
-  "version": "20261102",
+  "version": "20261107",
   "windows": [
     [
       0.0,
