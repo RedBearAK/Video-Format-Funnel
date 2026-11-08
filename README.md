@@ -137,7 +137,7 @@ This runs on the host, not in the container, and needs neither podman nor docker
 
 ## Usage
 
-The pipeline is five separate subcommands, run in order. Each one is idempotent and resumable: run it again on the same folder and it picks up where it left off. Folders are walked recursively. `plan`, `convert`, `verify` and `index` work on the current directory when no PATH is given and print the resolved folder first; `retire`, the only stage that moves originals, always needs an explicit PATH. Global options (`--ffmpeg`, `--quiet`, `--verbose`, `--yes`) go before the subcommand name; `--ffmpeg` defaults to the `VIDFUNNEL_FFMPEG` environment variable when set.
+The pipeline is five separate subcommands, run in order. Each one is idempotent and resumable: run it again on the same folder and it picks up where it left off. Folders are walked recursively. `plan`, `convert`, `verify`, `report` and `index` work on the current directory when no PATH is given and print the resolved folder first (`report --index` reads the central index instead); `retire`, the only stage that moves originals, always needs an explicit PATH. Global options (`--ffmpeg`, `--quiet`, `--verbose`, `--yes`) go before the subcommand name; `--ffmpeg` defaults to the `VIDFUNNEL_FFMPEG` environment variable when set.
 
 The examples below are real output from a scratch folder holding copies of six test fixtures under made-up names: two H.264 MKVs, an H.264 MP4, an XviD AVI, and a `movie.avi`/`movie.mkv` pair that share a name.
 
@@ -294,7 +294,7 @@ Options:
 - `--min-score N`, `--max-score N` and `--status S` (repeatable) filter the rows.
 - `--with-logs` adds the stored ffmpeg error output and run log of each row, redacted like the rest. This is the bundle to post when asking why a file misbehaved.
 - `--from REPORT` re-runs the invocation recorded in an earlier Markdown or JSON report, with whatever options you add, so a redacted report that was sent out can be reissued with `--reveal`. A row whose status has moved on since that report is marked as changed. Because a redacted report records its paths as `<root>`, give the PATH arguments again, or have the central index available.
-- `--no-index` always reads the records; `--db PATH` names the index to use.
+- With no PATH, `report` reads the current directory like the other stages; `--index` reads the central index instead (every tree `index` has loaded), `--db PATH` names another index file, and `--no-index` always reads the records.
 
 To map a row of a redacted report back to a real file on your own machine:
 

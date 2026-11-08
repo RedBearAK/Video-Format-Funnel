@@ -10,6 +10,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from vidfunnel.record import new_record, save_record
@@ -234,6 +235,36 @@ class ReportTree(unittest.TestCase):
         code, again, _errors = self.run_report(["--from", str(report_file)])
         self.assertEqual(0, code)
         self.assertEqual(4, len(json.loads(again)["rows"]))
+
+    def test_no_path_reads_the_current_directory_and_says_so(self):
+        previous = os.getcwd()
+        os.chdir(str(self.base))
+        self.addCleanup(os.chdir, previous)
+        args = parse(["--format", "json"])
+        args.quiet = False
+        output = io.StringIO()
+        errors = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            code = run(args)
+        self.assertEqual(code, 0, errors.getvalue())
+        self.assertIn("vidfunnel report: no PATH given; reading the current directory '{}'".format(os.getcwd()),
+                      errors.getvalue())
+        self.assertEqual(len(json.loads(output.getvalue())["rows"]), 4)
+
+    def test_index_option_reads_the_index_instead_of_the_current_directory(self):
+        seen = {}
+
+        def fake_collect(paths, use_index=False, db_path=None, errors=None):
+            seen.update(paths=list(paths), use_index=use_index, db_path=db_path)
+            return []
+
+        with mock.patch("vidfunnel.report.collect", side_effect=fake_collect):
+            code, _output, errors = self.run_report(["--index"])
+        self.assertEqual(code, 0, errors)
+        self.assertEqual((seen["paths"], seen["use_index"]), ([], True))
+        with mock.patch("vidfunnel.report.collect", side_effect=fake_collect):
+            self.run_report(["--db", str(self.base / "somewhere.sqlite")])
+        self.assertEqual((seen["paths"], seen["use_index"]), ([], True), "--db alone still means the index")
 
     def test_from_redacted_report_without_paths_or_index_is_usage_error(self):
         _code, text, _errors = self.run_report([str(self.base)])

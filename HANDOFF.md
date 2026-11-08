@@ -180,7 +180,7 @@ vidfunnel check
 vidfunnel plan   [--samples N] [--full-analysis] [--assume-dar R] [--audio-offset S] [--audio-strict-aac] [--reencode-video] [--max-level 4.1|4.2] [--plain-mp4] [--par2 N] [--replan] [--jobs N] [PATH...]
 vidfunnel convert [--par2 N] [--jobs N] [--dry-run] [--refit] [PATH...]
 vidfunnel verify [PATH...]
-vidfunnel report [--format md|json|csv] [--min-score N] [--reveal] [--with-logs] PATH...
+vidfunnel report [--format md|json|csv] [--min-score N] [--reveal] [--with-logs] [--index] [PATH...]
 vidfunnel report --from REPORT [--reveal]
 vidfunnel find ID
 vidfunnel retire [--allow-review] [--allow-larger] [--quarantine DIR] PATH...

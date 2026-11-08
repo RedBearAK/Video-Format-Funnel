@@ -22,7 +22,7 @@ directory structure out of it. '--from' on such a report therefore needs the
 PATH arguments again, or the central index (rows are then found by record ID).
 """
 
-VERSION = "20261102"
+VERSION = "20261108"
 
 import argparse
 import csv
@@ -550,6 +550,8 @@ def add_arguments(parser):
                         help="add the stored ffmpeg stderr and run log of each row")
     parser.add_argument("--from", dest="from_report", default=None, metavar="REPORT",
                         help="re-run the invocation recorded in an earlier Markdown or JSON report")
+    parser.add_argument("--index", action="store_true",
+                        help="read the central index (every tree ever indexed) instead of a PATH")
     parser.add_argument("--no-index", action="store_true",
                         help="never use the central index, always read the records")
     parser.add_argument("--db", default=None, metavar="PATH",
@@ -597,7 +599,15 @@ def _merge(current, stored):
 def produce(args, stored=None, from_report_id=None):
     """Collect, filter, redact, sort and render; returns (text, header)."""
     paths = list(getattr(args, "paths", None) or ())
-    use_index = not getattr(args, "no_index", False) and (not paths or bool(getattr(args, "db", None)))
+    wants_index = bool(getattr(args, "db", None)) or bool(getattr(args, "index", False))
+    if not paths and not wants_index and stored is None and not getattr(args, "no_index", False):
+        # Like plan, convert, verify and index: no PATH means the current directory. The
+        # central index is read only when asked for (--index, --db) or when a report is
+        # re-run from a stored invocation without paths.
+        here = os.getcwd()
+        _stderr("vidfunnel report: no PATH given; reading the current directory '{}'".format(here), args)
+        paths = [here]
+    use_index = not getattr(args, "no_index", False) and (not paths or wants_index)
     if not paths and not use_index:
         raise ReportError("no PATH given and --no-index set: nothing to read")
     errors = []
