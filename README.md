@@ -173,7 +173,7 @@ plan: 3 remux, 1 re-encode, 2 quarantine, 0 skipped, 0 failed in 00:00:08; recor
 The main options:
 
 - `--samples N` sets the number of sample windows for `idet` and `cropdetect` (default 12 windows of 3 s, skipping the first and last 3 %); `--full-analysis` analyses the whole file. Files shorter than 60 s are always analysed in full. Each window is decoded once, by one ffmpeg running `idet`, `cropdetect` (when the aspect rule needs bar evidence) and `blockdetect` together; `blockdetect` runs in at most 4 of the windows, spread evenly.
-- `--jobs N` plans N files at once (default 1), also within one folder. On a four-core machine, four copies of a 3-minute MPEG-2 clip planned in 21 s with `--jobs 4` and in 39 s with `--jobs 1`. The records are the same as with `--jobs 1`; files that would get the same output name are planned one after another.
+- `--jobs N` plans N files at once (default 1), also within one folder. On a four-core machine, four copies of a 3-minute MPEG-2 clip planned in 21 s with `--jobs 4` and in 39 s with `--jobs 1`. The records are the same as with `--jobs 1`; files that would get the same output name are planned one after another. A good value is one per physical core (6 on a six-core machine): each worker runs one ffmpeg at a time and the legacy decoders use about one core, while SMT siblings add little. Plan also reads every file in full twice (the error-scan decode and the packet probe), so on a library reached over a network mount the read path, not the CPU, is often the limit; a load average well below the core count with the disk or network busy means fewer jobs would be no slower.
 - `--assume-dar 4:3|16:9` resolves an SD frame whose aspect cannot be told from the pixels.
 - `--audio-offset S` replaces the measured audio start offset.
 - `--audio-strict-aac` re-encodes MP3 to AAC instead of copying it.
@@ -222,7 +222,7 @@ The re-encode came out at two thirds of the source's size. The MP4 source was wr
 Options:
 
 - `--dry-run` prints the commands and writes nothing.
-- `--jobs N` converts N files at once. The default is 1, because x264 already uses every core for one file; `--jobs` is for remux-heavy sets.
+- `--jobs N` converts N files at once. The default is 1, because x264 already uses every core for one file; `--jobs` is for remux-heavy sets. On standard-definition sources x264 cannot use many threads (its frame threading scales with picture height and flattens out around six to eight threads at 480 lines), so on a six-core machine two encodes side by side fill it where one leaves it partly idle; three is the most worth trying, and HD sources want 1. Each job also multiplies memory and read traffic.
 - `--par2 N` writes PAR2 with N % redundancy, overriding the planned value (10 is a reasonable choice).
 - `--refit` revisits re-encodes that came out larger than their sources, described below.
 A re-encode that comes out larger than its source is kept like any other output and flagged `output-larger`, with both sizes in the record; convert prints `output is larger than the source (N > M bytes); kept and flagged 'output-larger'`. `retire` refuses such a record unless `--allow-larger` is given, so you can compare the two files first. Remuxes are exempt from this size rule: only the container changed, and fragment headers can make a small file grow slightly. A larger remux is kept and flagged `remux-larger` for information.
