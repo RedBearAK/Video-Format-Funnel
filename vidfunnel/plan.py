@@ -1121,6 +1121,13 @@ def _plan_one(tools, work, options, folder_sources, capabilities, progress, know
         record["output"]["interim_name"] = names["interim_name"]
         final_path = work.folder / names["name"]
         sidecars = build_sidecar_argvs(tools, work.inputs, final_path, analysis, work.dvd_title)
+        ours = _own_sidecar_names(existing)
+        sidecars, skipped_sidecars = _drop_foreign_text_sidecars(sidecars, ours)
+        for name in skipped_sidecars:
+            add_flag(record, "sidecar-exists")
+            say("'{}': '{}' already exists and is not ours; not written (the subtitles are inside the MP4 "
+                "as mov_text)".format(work.label, name), stream)
+        plan["sidecars_skipped"] = skipped_sidecars
         record["output"]["sidecars"] = [Path(entry["path"]).name for entry in sidecars]
         collision = names["collision"]
         reason = None
@@ -1128,7 +1135,8 @@ def _plan_one(tools, work, options, folder_sources, capabilities, progress, know
         if claims and collision != "same-stem":
             collision = "same-stem"
             reason = _claims_reason(claims, names["name"])
-        taken = [entry["path"] for entry in sidecars if os.path.exists(entry["path"])]
+        taken = [entry["path"] for entry in sidecars
+                 if os.path.exists(entry["path"]) and Path(entry["path"]).name not in ours]
         if collision is None and taken:
             collision = "sidecar-exists"
         if collision is not None:
@@ -1172,6 +1180,38 @@ def _dvd_title_names(work, tools, sha256):
         if not (tag and tag.get("src") == sha256[:16]):
             collision = "foreign-output"
     return {"name": name, "interim_name": None, "collision": collision}
+
+
+def _own_sidecar_names(existing):
+    """Names of the sidecars this source's earlier records wrote (the record and its history).
+
+    A file with one of these names beside the source is ours to overwrite,
+    so a `plan --replan` after a convert does not trip over its own .srt.
+    """
+    names = set()
+    for record in [existing] + list((existing or {}).get("history") or []):
+        for name in ((record or {}).get("output") or {}).get("sidecars") or []:
+            names.add(name)
+    return names
+
+
+def _drop_foreign_text_sidecars(sidecars, ours):
+    """Leave a user's own .srt alone: (sidecars to write, names of text sidecars skipped).
+
+    A text sidecar whose path exists and is not ours is skipped, since the
+    same subtitles go into the MP4 as mov_text and nothing is lost. Bitmap
+    sidecars (.sup, .subs.mkv) are the only copy of their stream, so an
+    existing foreign file there stays a collision for the caller to report.
+    """
+    kept = []
+    skipped = []
+    for entry in sidecars:
+        name = Path(entry["path"]).name
+        if entry.get("kind") == "srt" and os.path.exists(entry["path"]) and name not in ours:
+            skipped.append(name)
+        else:
+            kept.append(entry)
+    return kept, skipped
 
 
 def _collision_reason(collision, names, taken):

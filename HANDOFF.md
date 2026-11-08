@@ -46,7 +46,7 @@ Opus and Vorbis were considered and rejected: Vorbis-in-MP4 is nonstandard, Opus
 
 ### 2.3 Subtitles and extra streams
 
-- Text subtitles (SRT, SSA/ASS, MKV `subrip`): converted to `mov_text` inside the MP4 and always also written as a `.srt` sidecar (`NAME.srt`, or `NAME.<n>.srt` with several text streams): an external `.srt` is what Roku Media Player and most TV players read, embedded `mov_text` is not shown everywhere, and ASS styling is lost in `mov_text` anyway.
+- Text subtitles (SRT, SSA/ASS, MKV `subrip`): converted to `mov_text` inside the MP4 and always also written as a `.srt` sidecar (`NAME.srt`, or `NAME.<n>.srt` with several text streams): an external `.srt` is what Roku Media Player and most TV players read, embedded `mov_text` is not shown everywhere, and ASS styling is lost in `mov_text` anyway. An `.srt` that already exists beside the source and is not the tool's own (not named in the source's earlier records) is left alone and not written, flag `sidecar-exists`; the subtitles are still inside the MP4. A `plan --replan` after a convert recognises the tool's own sidecars and overwrites them.
 - Bitmap subtitles (DVD `dvd_subtitle`, PGS): cannot live in MP4 and are never silently dropped. PGS goes to a `.sup` sidecar through ffmpeg's `sup` muxer. ffmpeg has no `.idx/.sub` muxer, so `dvd_subtitle` streams are written to a `NAME.subs.mkv` sidecar (Matroska carries VobSub natively; mpv and Jellyfin read it as an external track). Flag `subs-sidecar` and list the sidecars in the record.
 - Chapters: carried over (`-map_chapters 0`).
 - Attachments, fonts, cover art: dropped; they stay listed in the record's probe section.

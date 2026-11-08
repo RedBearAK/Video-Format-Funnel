@@ -517,6 +517,35 @@ class PlanRunTest(unittest.TestCase):
     def plan(self, **values):
         return plan_paths(TOOLS, [str(self.root)], make_options(**values), progress=quiet())
 
+    def test_users_own_srt_beside_the_source_is_left_alone(self):
+        source = self.copy_fixture("h264_mkv_srt_subtitles.mkv", "Movie night.mkv")
+        own = self.root / "Movie night.srt"
+        own.write_text("1\n00:00:01,000 --> 00:00:02,000\nthe user's own subtitles\n")
+        summary = self.plan()
+        self.assertEqual(summary.counts["quarantine"], 0, summary.counts)
+        record = load_record(source)
+        self.assertEqual(record["status"], "planned")
+        self.assertIn("sidecar-exists", record["flags"])
+        self.assertEqual(record["output"]["sidecars"], [])
+        self.assertEqual(record["stages"]["plan"]["sidecars"], [])
+        self.assertEqual(record["stages"]["plan"]["sidecars_skipped"], ["Movie night.srt"])
+        self.assertIn("the user's own subtitles", own.read_text())
+
+    def test_replan_after_convert_does_not_collide_with_its_own_srt(self):
+        from vidfunnel.encode import convert_paths
+        source = self.copy_fixture("h264_mkv_srt_subtitles.mkv", "Movie night.mkv")
+        self.plan()
+        options = types.SimpleNamespace(par2=None, verbose=False, jobs=1, dry_run=False)
+        progress = types.SimpleNamespace(stream=io.StringIO(), quiet=True, verbose=False)
+        convert_paths(TOOLS, [str(self.root)], options, progress)
+        self.assertTrue((self.root / "Movie night.srt").exists())
+        summary = self.plan(replan=True)
+        self.assertEqual(summary.counts["quarantine"], 0, summary.counts)
+        record = load_record(source)
+        self.assertEqual(record["status"], "planned")
+        self.assertEqual(record["output"]["sidecars"], ["Movie night.srt"])
+        self.assertNotIn("sidecar-exists", record["flags"])
+
     def test_records_statuses_and_skip(self):
         for name in INTEGRATION_FIXTURES:
             self.copy_fixture(name)
