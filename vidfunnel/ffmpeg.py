@@ -46,12 +46,13 @@ ERROR_TAIL_LINES = 5
 
 _capabilities_cache = {}
 
-# On-disk copy of the capability listings, so the seven ffmpeg calls that produce
+# On-disk copy of the capability listings, so the six listing calls that produce
 # them run once per ffmpeg build instead of once per run (through a distrobox
 # wrapper each call costs more than a second). Keyed by the binary's path, size,
-# mtime and the SHA-256 of its first and last MiB (a wrapper script is hashed
-# whole), so a changed or replaced ffmpeg is queried again. 'check' always
-# queries again and refreshes the cache.
+# mtime and the SHA-256 of its first and last MiB, plus the text of `-version`
+# (one call per run), so a changed, replaced or upgraded ffmpeg is queried again
+# even behind an unchanged wrapper script. 'check' always queries again and
+# refreshes the cache.
 CAPABILITIES_CACHE_FORMAT = 1
 CAPABILITIES_CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or "~/.cache").expanduser() / "vidfunnel" / "capabilities"
 _SET_FIELDS = ("encoders", "decoders", "muxers", "demuxers", "filters", "bsfs")
@@ -231,13 +232,24 @@ _CAPABILITY_QUERIES = (
 
 
 def _binary_identity(path):
-    """What the cache key is made of: path, size, mtime_ns and the head/tail SHA-256; None when unreadable."""
+    """What the cache key is made of; None when the file is unreadable or ffmpeg does not run.
+
+    Path, size, mtime_ns and the head/tail SHA-256 of the file, plus the text
+    of `ffmpeg -version` (one call). The file alone is not enough: the
+    recommended setup points --ffmpeg at a distrobox wrapper script, which
+    stays byte-identical when the ffmpeg inside the box is upgraded; the
+    version banner (version and configuration) changes with the build.
+    """
     from vidfunnel.record import cheap_fingerprint
     try:
         fingerprint = cheap_fingerprint(path)
     except OSError:
         return None
-    identity = {"path": str(path)}
+    try:
+        banner = run([path, "-hide_banner", "-version"]).stdout
+    except (FfmpegError, ToolNotFound, OSError):
+        return None
+    identity = {"path": str(path), "version_banner": banner.strip()}
     identity.update(fingerprint)
     return identity
 
@@ -311,7 +323,10 @@ def capabilities(tools, refresh=False):
             _capabilities_cache[key] = cached
             return cached
     say("querying the capabilities of '{}' ({} calls)".format(tools.ffmpeg, 1 + len(_CAPABILITY_QUERIES)))
-    version_output = run([tools.ffmpeg, "-hide_banner", "-version"]).stdout
+    if identity is not None:
+        version_output = identity["version_banner"]  # the identity already ran -version
+    else:
+        version_output = run([tools.ffmpeg, "-hide_banner", "-version"]).stdout
     version = _version_string(version_output)
     version_tuple = parse_version(version) if version else (0,)
     result = {

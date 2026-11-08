@@ -275,7 +275,8 @@ class RunnerTests(unittest.TestCase):
             run([shutil.which("python3") or "python3", "-c", script], progress=explode)
 
 
-QUERY_CALLS = 1 + len(vidfunnel.ffmpeg._CAPABILITY_QUERIES)  # -version plus the six listings
+QUERY_CALLS = 1 + len(vidfunnel.ffmpeg._CAPABILITY_QUERIES)  # cold: -version (the cache key) plus the six listings
+WARM_CALLS = 1  # warm: only the -version call that keys the cache
 
 
 @unittest.skipUnless(os.path.exists(HOST_FFMPEG), NO_HOST_FFMPEG)
@@ -318,7 +319,7 @@ class CapabilitiesCacheTests(unittest.TestCase):
         self.assertEqual(len(list(self.cache_dir.glob("*.json"))), 1)
         clear_capabilities_cache()
         second, calls = self.query_counting_runs()
-        self.assertEqual(calls, 0)
+        self.assertEqual(calls, WARM_CALLS)
         self.assertEqual(second, first)
         self.assertIsInstance(second["filters"], set)
         self.assertEqual(second["version_tuple"], first["version_tuple"])
@@ -331,6 +332,25 @@ class CapabilitiesCacheTests(unittest.TestCase):
         _found, calls = self.query_counting_runs()
         self.assertEqual(calls, QUERY_CALLS)
         self.assertEqual(len(list(self.cache_dir.glob("*.json"))), 2, "a new identity gets its own file")
+
+    def test_upgraded_ffmpeg_behind_an_unchanged_wrapper_is_queried_again(self):
+        # The wrapper execs whatever 'current' points at; the wrapper file itself never changes.
+        current = os.path.join(self.folder, "current")
+        with open(current, "w") as handle:
+            handle.write("#!/bin/sh\nexec '{}' \"$@\"\n".format(HOST_FFMPEG))
+        os.chmod(current, 0o755)
+        with open(self.wrapper, "w") as handle:
+            handle.write("#!/bin/sh\nexec '{}' \"$@\"\n".format(current))
+        self.query_counting_runs()
+        wrapper_bytes = open(self.wrapper, "rb").read()
+        clear_capabilities_cache()
+        with open(current, "w") as handle:
+            handle.write("#!/bin/sh\nif [ \"$1\" = -hide_banner ] && [ \"$2\" = -version ]; then\n"
+                         "  '{0}' \"$@\" | sed '1s/$/ (another build)/'\n  exit 0\nfi\nexec '{0}' \"$@\"\n".format(HOST_FFMPEG))
+        self.assertEqual(open(self.wrapper, "rb").read(), wrapper_bytes, "the wrapper file is unchanged")
+        _found, calls = self.query_counting_runs()
+        self.assertEqual(calls, QUERY_CALLS, "a new version banner behind the same wrapper means a fresh query")
+        self.assertEqual(len(list(self.cache_dir.glob("*.json"))), 2)
 
     def test_refresh_queries_again_and_rewrites_the_cache(self):
         self.query_counting_runs()

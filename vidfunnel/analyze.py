@@ -151,10 +151,12 @@ SIZE_CLASSES = ("heavy", "near", "smaller", "much-smaller")
 # 5.20, MPEG-4 q20 13.0. 3.5 sits between the moderate (2.8 and below) and the
 # low-bitrate (3.8 and above) DCT encodes. Every testsrc fixture scores above it.
 # These are all single-window files. The same ladder made 90 s long (12 windows)
-# scored within 0.35 of the 12-window mean when sampled in 4 windows (x264 CRF 18
+# scored within 0.37 of the 12-window mean when sampled in 4 windows (x264 CRF 18
 # 1.09 and 1.08, MPEG-4 q5 2.06 and 1.99, WMV2 600k 5.88 and 5.54, MPEG-4 300k
 # 7.63 and 7.61, FLV1 200k 8.61 and 8.98, MPEG-4 q20 7.01 and 6.87), on the same
-# side of 3.5 every time (2026-11-07).
+# side of 3.5 every time (2026-11-07). Note that WMV2 600k scores 2.81 on the 5 s
+# clip and 5.88 on the 90 s one: the mandelbrot content, not the sampling, moves
+# it across 3.5, so the threshold separates the ladder's ends, not every encode.
 BLOCKINESS_HIGH = 3.5
 BLOCKDETECT_FILTER = "blockdetect"
 BLOCKDETECT_CHAIN = "blockdetect,metadata=mode=print:key=lavfi.block"

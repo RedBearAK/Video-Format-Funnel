@@ -88,7 +88,7 @@ HandBrake's "Web optimized" checkbox is `-movflags +faststart` (moov atom moved 
 
 ## 4. Analysis rules
 
-All analysis is sampled, not full-length, and every result is recorded with the sample positions so it can be reproduced. Default sampling: 12 windows of 3 s, evenly spaced, skipping the first and last 3 % of the duration (titles, credits, black). Files shorter than 60 s are analysed in full automatically (the windows would overlap). `--samples N` and `--full-analysis` override. Each window is read by one ffmpeg process whose filter graph chains `idet` (first, since it reads the field structure), `cropdetect` when §4.2 needs bar evidence, and `blockdetect` in at most 4 of the windows, spread evenly (of 12: the 1st, 4th, 7th and 10th); the three results are parsed from that one run's stderr.
+All analysis is sampled, not full-length, and every result is recorded with the sample positions so it can be reproduced. Default sampling: 12 windows of 3 s, evenly spaced, skipping the first and last 3 % of the duration (titles, credits, black). Files shorter than 60 s are analysed in full automatically (the windows would overlap). `--samples N` and `--full-analysis` override. Each window is read by one ffmpeg process whose filter graph splits the decoded video into one branch per filter: `idet`, `cropdetect` when §4.2 needs bar evidence, and `blockdetect` in at most 4 of the windows, spread evenly (of 12: the 1st, 4th, 7th and 10th). The split, not a chain, so that each filter negotiates its own pixel format as it would alone (a chain changed cropdetect and blockdetect results on RGB and palette sources); the three results are parsed from that one run's stderr.
 
 ### 4.1 Decode check
 

@@ -232,8 +232,8 @@ class HostCheckTests(unittest.TestCase):
         listing_calls = []
 
         def counting(argv, *rest, **options):
-            if len(argv) >= 2 and argv[1] == "-hide_banner":
-                listing_calls.append(list(argv))
+            if len(argv) >= 3 and argv[1] == "-hide_banner" and argv[2] != "-version":
+                listing_calls.append(list(argv))  # the listings, not the -version call that keys the cache
             return real_run(argv, *rest, **options)
 
         with unittest.mock.patch("vidfunnel.ffmpeg.CAPABILITIES_CACHE_DIR", cache_dir), \
