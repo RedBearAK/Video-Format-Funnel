@@ -195,7 +195,7 @@ verifying 'Phone clip 3.vidfunnel.mp4' (101 KiB)
 verifying 'Wedding DVD rip.mp4' (112 KiB)
 [verify decode] 00:00:05 / 00:00:05  99.8 %  0 fps  60.0x  eta 00:00:00
   verified 'Wedding DVD rip.mp4': score 85 (review); frames 150 of 150 expected, duration delta 0.0 s
-convert: 0 converted, 4 verified, 0 skipped, 0 failed, 0 larger in 00:00:04; records in '.vidfunnel/' under each folder
+convert: 0 converted, 4 verified, 0 skipped, 0 failed in 00:00:04; records in '.vidfunnel/' under each folder
 ```
 
 The re-encode came out at two thirds of the source's size. The MP4 source was written under the interim name because the output name is its own, and the letterboxed file keeps its 15-point aspect penalty from `plan`, which puts it in the `review` band.
@@ -205,7 +205,7 @@ Options:
 - `--dry-run` prints the commands and writes nothing.
 - `--jobs N` converts N files at once. The default is 1, because x264 already uses every core for one file; `--jobs` is for remux-heavy sets.
 - `--par2 N` writes PAR2 with N % redundancy, overriding the planned value (10 is a reasonable choice).
-- `--keep-larger` keeps a re-encode that came out larger than its source. Without it such an output is removed and the record is marked `failed` with flag `output-larger`; with it the output is kept but is never eligible for retirement. Remuxes are exempt from this size rule: only the container changed, and fragment headers can make a small file grow slightly. A larger remux is kept and flagged `remux-larger` for information.
+A re-encode that comes out larger than its source is kept like any other output and flagged `output-larger`, with both sizes in the record; convert prints `output is larger than the source (N > M bytes); kept and flagged 'output-larger'`. `retire` refuses such a record unless `--allow-larger` is given, so you can compare the two files first. Remuxes are exempt from this size rule: only the container changed, and fragment headers can make a small file grow slightly. A larger remux is kept and flagged `remux-larger` for information.
 
 ### verify
 
@@ -276,7 +276,7 @@ vidfunnel retire "Home Videos"
 2. the source still matches the record's fingerprint, so it has not been replaced since it was planned;
 3. the output exists;
 4. the score is not in the `hold` band, and not in the `review` band unless `--allow-review` is given;
-5. the output is not larger than the source and was not kept with `--keep-larger`;
+5. a re-encode's output is not larger than the source and the record is not flagged `output-larger`, unless `--allow-larger` is given (the record is then flagged `allowed-larger`, so the report shows the choice);
 6. the output's full SHA-256 matches the record (the one expensive check, so it runs last);
 7. an output under the interim `<stem>.vidfunnel.mp4` name can be renamed to its final name;
 8. the quarantine destination does not exist yet.
@@ -326,7 +326,7 @@ Every file starts at 100 points; the analysis and verify subtract penalties, and
 
 Sources that cannot be converted are quarantined in place with a reason and a record: `unsupported` (ffmpeg cannot decode a stream), `decode-failed`, `no-video`, `swf-vector` (an SWF with no video stream), and `output-collision` (see below).
 
-The output profile in short: libx264 High profile, level 4.1 (4.2 only for field-rate HD), `yuv420p`, CRF 18 up to 576 lines, 19 at 720p, 20 at 1080p, `-preset slower`, closed GOP of at most 2 s, source resolution and frame rate (VFR stays VFR), aspect as SAR, colour tags set from the frame size and rate when the source has none. Audio: AAC-LC and MP3 copied unchanged, everything else AAC-LC at 96 kb/s per channel with the channel layout and sample rate kept. Text subtitles become `mov_text` (plus an `.srt` sidecar when ASS styling would be lost), bitmap subtitles go to sidecars (`.sup` for PGS, `NAME.subs.mkv` for DVD subtitles), chapters are kept. Container: `-movflags +frag_keyframe+empty_moov+default_base_moof+use_metadata_tags`. The full specification, with the reasons for each choice, is in `HANDOFF.md` sections 2 to 5.
+The output profile in short: libx264 High profile, level 4.1 (4.2 only for field-rate HD), `yuv420p`, CRF 18 up to 576 lines, 19 at 720p, 20 at 1080p, `-preset slower`, closed GOP of at most 2 s, source resolution and frame rate (VFR stays VFR), aspect as SAR, colour tags set from the frame size and rate when the source has none. Audio: AAC-LC and MP3 copied unchanged, everything else AAC-LC at 96 kb/s per channel with the channel layout and sample rate kept. Text subtitles become `mov_text` and an `.srt` sidecar is always written as well (an external `.srt` is what Roku Media Player and most TV players read; embedded `mov_text` is not shown everywhere), bitmap subtitles go to sidecars (`.sup` for PGS, `NAME.subs.mkv` for DVD subtitles), chapters are kept. Container: `-movflags +frag_keyframe+empty_moov+default_base_moof+use_metadata_tags`. The full specification, with the reasons for each choice, is in `HANDOFF.md` sections 2 to 5.
 
 ### What to expect in output sizes
 

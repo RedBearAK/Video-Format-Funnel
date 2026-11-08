@@ -26,10 +26,11 @@ else output.name, and checked:
   same video filters as the encode (below the threshold costs 25 points);
 - the output's SHA-256, size and cheap fingerprint, taken before the checks
   above read the file, and its size relative to the source (an output larger
-  than the source is noted; retire refuses it). The cheap fingerprint is taken
-  again after the last check; when it differs the stage records
-  'output_changed_during_verify': true, the record is 'failed' and carries no
-  score, since the hash and the checks may describe different bytes.
+  than the source is noted; retire refuses it without --allow-larger). The
+  cheap fingerprint is taken again after the last check; when it differs the
+  stage records 'output_changed_during_verify': true, the record is 'failed'
+  and carries no score, since the hash and the checks may describe different
+  bytes.
 
 `run` collects the records first and then, inside each folder's lock, reads
 each record again from disk and verifies that copy; a record whose status is

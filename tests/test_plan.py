@@ -275,7 +275,31 @@ class PixelArtAndSubtitleTest(unittest.TestCase):
         self.assertIn(("-map", "0:s:0"), pairs(argv))
         self.assertEqual(value_after(argv, "-c:s"), "mov_text")
         _probe, analysis = load_pair("h264_mkv_srt_subtitles.mkv")
-        self.assertEqual(build_sidecar_argvs(FAKE_TOOLS, ["/library/clips/source.mkv"], OUTPUT_PATH, analysis), [])
+        sidecars = build_sidecar_argvs(FAKE_TOOLS, ["/library/clips/source.mkv"], OUTPUT_PATH, analysis)
+        self.assertEqual([(entry["kind"], entry["path"]) for entry in sidecars],
+                         [("srt", "/library/clips/output.srt")])
+        self.assertIn(("-map", "0:s:0"), pairs(sidecars[0]["argv"]))
+        self.assertIn(("-c:s", "srt"), pairs(sidecars[0]["argv"]))
+        self.assertEqual(sidecars[0]["argv"][-1], "/library/clips/output.srt")
+
+    def test_srt_sidecar_from_a_fresh_subtitle_decision(self):
+        probe, analysis = load_pair("h264_mkv_srt_subtitles.mkv")
+        fresh = copy.deepcopy(analysis)
+        fresh["subtitles"] = decide_subtitles(probe["subtitles"])
+        sidecars = build_sidecar_argvs(FAKE_TOOLS, ["/library/clips/source.mkv"], OUTPUT_PATH, fresh)
+        self.assertEqual([entry["path"] for entry in sidecars], ["/library/clips/output.srt"])
+
+    def test_several_text_streams_get_numbered_srt_sidecars(self):
+        probe, analysis = load_pair("h264_mkv_srt_subtitles.mkv")
+        mixed = copy.deepcopy(analysis)
+        mixed["subtitles"] = decide_subtitles([{"index": 2, "codec": "subrip", "language": "eng"},
+                                               {"index": 3, "codec": "ass", "language": "fra"},
+                                               {"index": 4, "codec": "hdmv_pgs_subtitle", "language": None}])
+        sidecars = build_sidecar_argvs(FAKE_TOOLS, ["/library/clips/source.mkv"], OUTPUT_PATH, mixed)
+        self.assertEqual([(entry["kind"], entry["path"]) for entry in sidecars],
+                         [("srt", "/library/clips/output.0.srt"), ("srt", "/library/clips/output.1.srt"),
+                          ("sup", "/library/clips/output.sup")])
+        self.assertIn(("-map", "0:s:1"), pairs(sidecars[1]["argv"]))
 
     def test_ass_to_mov_text_and_srt_sidecar(self):
         argv = argv_for("h264_mkv_ass_subtitles.mkv")

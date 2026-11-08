@@ -613,9 +613,17 @@ class SubtitleTests(unittest.TestCase):
     def test_subrip(self):
         decision = decide_subtitles(load_probe("h264_mkv_srt_subtitles.mkv")["subtitles"])
         entry = decision["result"][0]
-        self.assertEqual((entry["codec"], entry["action"], entry["sidecar"]), ("subrip", "mov_text", None))
+        self.assertEqual((entry["codec"], entry["action"], entry["sidecar"]), ("subrip", "mov_text", ".srt"))
         self.assertEqual(entry["language"], "eng")
         self.assertEqual(decision["flags"], [])
+        self.assertIn("Roku Media Player", decision["reason"])
+
+    def test_every_text_codec_gets_srt_sidecar(self):
+        streams = [{"index": index, "codec": codec, "language": None}
+                   for index, codec in enumerate(("subrip", "ass", "ssa", "webvtt", "mov_text", "text"), 2)]
+        decision = decide_subtitles(streams)
+        self.assertEqual([(entry["action"], entry["sidecar"]) for entry in decision["result"]],
+                         [("mov_text", ".srt")] * 6)
 
     def test_ass_gets_srt_sidecar(self):
         entry = decide_subtitles(load_probe("h264_mkv_ass_subtitles.mkv")["subtitles"])["result"][0]

@@ -23,7 +23,7 @@ function that implements them (aspect tie-break, idet window classes, the
 packet-quantisation tolerance on drift, audio priming).
 """
 
-VERSION = "20261102"
+VERSION = "20261107"
 
 import math
 import os
@@ -1038,8 +1038,10 @@ def decide_audio(audio_stream, sync_entry, strict_aac=False):
 def decide_subtitles(subtitle_streams):
     """Subtitle handling (HANDOFF 2.3). Pure.
 
-    Text codecs become mov_text in the MP4; ASS/SSA also get an '.srt'
-    sidecar (styling is lost in mov_text). dvd_subtitle goes to a
+    Text codecs become mov_text in the MP4 and always also get an '.srt'
+    sidecar: an external .srt is what Roku Media Player and most TV players
+    read, embedded mov_text is not shown everywhere, and ASS/SSA styling is
+    lost in mov_text anyway. dvd_subtitle goes to a
     '.subs.mkv' sidecar, PGS to '.sup', flag 'subs-sidecar'. A codec that is
     neither is listed as 'unsupported' with flag 'subs-unsupported', never
     dropped silently. Result: [{'index', 'codec', 'action', 'sidecar',
@@ -1054,11 +1056,11 @@ def decide_subtitles(subtitle_streams):
                  "language": stream.get("language")}
         if codec in TEXT_SUBTITLE_CODECS:
             entry["action"] = "mov_text"
+            entry["sidecar"] = ".srt"
+            why = "external .srt is what Roku Media Player and most TV players read; mov_text is not shown everywhere"
             if codec in STYLED_SUBTITLE_CODECS:
-                entry["sidecar"] = ".srt"
-                reasons.append("stream {} {}: mov_text plus .srt sidecar (styling lost)".format(entry["index"], codec))
-            else:
-                reasons.append("stream {} {}: mov_text".format(entry["index"], codec))
+                why += "; styling lost in mov_text"
+            reasons.append("stream {} {}: mov_text plus .srt sidecar ({})".format(entry["index"], codec, why))
         elif codec in BITMAP_SUBTITLE_SIDECARS:
             entry["action"] = "sidecar"
             entry["sidecar"] = BITMAP_SUBTITLE_SIDECARS[codec]

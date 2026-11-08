@@ -143,10 +143,10 @@ class GuardTests(RetireCase):
         self.beach_record["score"] = 75
         with mock.patch.object(retire, "sha256_file") as hasher:
             self.assert_refused("score-review", self.beach_source, self.beach_record)
-            add_flag(self.beach_record, "keep-larger")
+            add_flag(self.beach_record, "output-larger")
             self.assert_refused("output-larger", self.beach_source, self.beach_record, allow_review=True)
         hasher.assert_not_called()
-        self.beach_record["flags"].remove("keep-larger")
+        self.beach_record["flags"].remove("output-larger")
         self.assert_refused("output-hash-mismatch", self.beach_source, self.beach_record, allow_review=True)
 
     def test_no_record(self):
@@ -207,9 +207,19 @@ class GuardTests(RetireCase):
         self.assertFalse(self.beach_source.exists())
         self.assertTrue((self.quarantine / "holidays" / "holiday_beach.avi").is_file())
 
-    def test_keep_larger_flag(self):
-        add_flag(self.beach_record, "keep-larger")
-        self.assert_refused("output-larger", self.beach_source, self.beach_record)
+    def test_output_larger_flag_is_refused_without_allow_larger(self):
+        add_flag(self.beach_record, "output-larger")
+        refusal = self.assert_refused("output-larger", self.beach_source, self.beach_record)
+        self.assertIn("--allow-larger", refusal.detail)
+
+    def test_output_larger_flag_is_retired_with_allow_larger(self):
+        add_flag(self.beach_record, "output-larger")
+        retire_one(self.beach_source, self.beach_record, self.root, allow_larger=True)
+        self.assertFalse(self.beach_source.exists())
+        self.assertTrue((self.quarantine / "holidays" / "holiday_beach.avi").is_file())
+        saved = load_record(self.beach_source)
+        self.assertEqual(saved["status"], "retired")
+        self.assertIn("allowed-larger", saved["flags"])
 
     def test_output_larger_than_source_without_flag(self):
         bigger = SOURCE_BYTES + b"more"
@@ -217,7 +227,17 @@ class GuardTests(RetireCase):
         self.beach_record["output"]["sha256"] = sha256_file(self.beach_output)
         self.beach_record["output"]["size"] = len(bigger)
         self.beach_record["action"] = "reencode"
-        self.assert_refused("output-larger", self.beach_source, self.beach_record)
+        refusal = self.assert_refused("output-larger", self.beach_source, self.beach_record)
+        self.assertIn("'holiday_beach.mp4' ({} bytes)".format(len(bigger)), refusal.detail)
+        self.assertIn("({} bytes)".format(len(SOURCE_BYTES)), refusal.detail)
+        self.assertIn("--allow-larger", refusal.detail)
+        retire_one(self.beach_source, self.beach_record, self.root, allow_larger=True)
+        self.assertFalse(self.beach_source.exists())
+        self.assertIn("allowed-larger", load_record(self.beach_source)["flags"])
+
+    def test_smaller_output_gets_no_allowed_larger_flag(self):
+        retire_one(self.beach_source, self.beach_record, self.root, allow_larger=True)
+        self.assertNotIn("allowed-larger", load_record(self.beach_source)["flags"])
 
     def test_remux_larger_than_source_is_eligible(self):
         bigger = SOURCE_BYTES + b"more"
@@ -245,7 +265,7 @@ class GuardTests(RetireCase):
         self.assertEqual(result, {"output_path": self.meeting_interim,
                                   "final_output_path": self.meeting_source,
                                   "band": "ok", "sha256_verified": True,
-                                  "members": [self.meeting_source]})
+                                  "members": [self.meeting_source], "larger": False})
 
     def test_large_output_hash_shows_progress(self):
         large = b"\0" * (33 * 1024 * 1024)
@@ -490,6 +510,19 @@ class VobGroupTests(RetireCase):
         self.group_record["output"]["size"] = len(larger_than_first)
         stage = retire_one(self.first_member, self.group_record, self.root)
         self.assertEqual(len(stage["destinations"]), 2)
+        self.assertNotIn("allowed-larger", load_record(self.first_member)["flags"])
+
+    def test_output_larger_than_the_group_needs_allow_larger(self):
+        group_size = self.first_member.stat().st_size + self.second_member.stat().st_size
+        larger_than_group = b"x" * (group_size + 100)
+        write_bytes(self.group_output, larger_than_group)
+        self.group_record["output"]["sha256"] = sha256_file(self.group_output)
+        self.group_record["output"]["size"] = len(larger_than_group)
+        refusal = self.assert_refused("output-larger", self.first_member, self.group_record)
+        self.assertIn("({} bytes)".format(group_size), refusal.detail)
+        stage = retire_one(self.first_member, self.group_record, self.root, allow_larger=True)
+        self.assertEqual(len(stage["destinations"]), 2)
+        self.assertIn("allowed-larger", load_record(self.first_member)["flags"])
 
     def test_second_member_in_quarantine_moves_nothing(self):
         write_bytes(self.quarantine / "dvd_rip" / "VTS_01_2.VOB", b"already here")
@@ -591,6 +624,18 @@ class RunTests(RetireCase):
         self.assertFalse(self.beach_source.exists())
         self.assertEqual(load_record(self.meeting_source)["status"], "converted")
 
+    def test_run_allow_larger_option(self):
+        from vidfunnel.cli import EXIT_OK
+        add_flag(self.beach_record, "output-larger")
+        save_record(self.beach_source, self.beach_record)
+        out, _err = self.quietly()
+        self.assertEqual(run(self.namespace(str(self.beach_source))), EXIT_OK)
+        self.assertIn("refused (output-larger)", out.getvalue())
+        self.assertTrue(self.beach_source.is_file())
+        self.assertEqual(run(self.namespace("--allow-larger", str(self.beach_source))), EXIT_OK)
+        self.assertFalse(self.beach_source.exists())
+        self.assertIn("allowed-larger", load_record(self.beach_source)["flags"])
+
     def test_run_single_file_path(self):
         out, _err = self.quietly()
         run(self.namespace(str(self.beach_source)))
@@ -647,6 +692,19 @@ class RunTests(RetireCase):
             run(self.namespace("--destroy-originals-now", str(self.root), yes=True))
         self.assertFalse(self.beach_source.exists())
         self.assertFalse(self.meeting_interim.exists())
+
+    def test_destroy_honours_allow_larger(self):
+        add_flag(self.beach_record, "output-larger")
+        save_record(self.beach_source, self.beach_record)
+        out, _err = self.quietly()
+        with mock.patch.object(sys, "stdin", PipeInput()):
+            run(self.namespace("--destroy-originals-now", str(self.beach_source), yes=True))
+        self.assertIn("refused (output-larger)", out.getvalue())
+        self.assertTrue(self.beach_source.is_file())
+        with mock.patch.object(sys, "stdin", PipeInput()):
+            run(self.namespace("--destroy-originals-now", "--allow-larger", str(self.beach_source), yes=True))
+        self.assertFalse(self.beach_source.exists())
+        self.assertIn("allowed-larger", load_record(self.beach_source)["flags"])
 
     def test_destroy_without_terminal_or_yes_refuses(self):
         from vidfunnel.cli import EXIT_USAGE

@@ -699,20 +699,25 @@ def _sidecar_base(output_path):
 def build_sidecar_argvs(tools, source_inputs, output_path, analysis, dvd_title=None):
     """One argv per subtitle sidecar (HANDOFF 2.3), named after `output_path` (the final output name).
 
-    ASS/SSA -> 'NAME.srt'; PGS -> 'NAME.sup'; every dvd_subtitle stream into
-    one 'NAME.subs.mkv'. With several streams of one kind the subtitle number
-    goes in: 'NAME.2.srt'.
+    Every text stream that goes into the MP4 as mov_text (subrip, ASS/SSA,
+    WebVTT, mov_text, text) -> 'NAME.srt' as well, since an external .srt is
+    what Roku Media Player and most TV players read; PGS -> 'NAME.sup'; every
+    dvd_subtitle stream into one 'NAME.subs.mkv'. With several streams of one
+    kind the subtitle number goes in: 'NAME.2.srt'. A text stream counts by
+    its action 'mov_text' as well as by sidecar '.srt', so an analysis saved
+    before every text stream was marked for a sidecar still gets one.
     """
     inputs = input_arguments(source_inputs, dvd_title)
     base = _sidecar_base(output_path)
     head = [tools.ffmpeg, "-hide_banner", "-nostdin", "-y"] + inputs
     entries = list(enumerate((analysis.get("subtitles") or {}).get("result") or []))
-    styled = [position for position, entry in entries if entry.get("sidecar") == ".srt"]
+    text_streams = [position for position, entry in entries
+                    if entry.get("action") == "mov_text" or entry.get("sidecar") == ".srt"]
     pgs = [position for position, entry in entries if entry.get("sidecar") == ".sup"]
     vobsub = [position for position, entry in entries if entry.get("sidecar") == ".subs.mkv"]
     sidecars = []
-    for position in styled:
-        path = base + (".srt" if len(styled) == 1 else ".{}.srt".format(position))
+    for position in text_streams:
+        path = base + (".srt" if len(text_streams) == 1 else ".{}.srt".format(position))
         sidecars.append({"path": path, "kind": "srt",
                          "argv": head + ["-map", "0:s:{}".format(position), "-c:s", "srt", "-f", "srt", path]})
     for position in pgs:

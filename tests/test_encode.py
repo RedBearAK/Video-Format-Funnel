@@ -52,10 +52,7 @@ def quiet():
 
 
 def convert_options(**values):
-    # The fixtures are tiny, and a remux into fragmented MP4 adds a few hundred bytes of fragment headers, so
-    # their outputs can come out slightly larger than the source. Tests of other mechanics keep such outputs;
-    # the size rule has its own tests, which pass keep_larger=False.
-    defaults = dict(par2=None, keep_larger=True, verbose=False, jobs=1, dry_run=False)
+    defaults = dict(par2=None, verbose=False, jobs=1, dry_run=False)
     defaults.update(values)
     return types.SimpleNamespace(**defaults)
 
@@ -336,55 +333,70 @@ class ConvertRunTest(unittest.TestCase):
         self.assertEqual(saved["status"], "failed")
         self.assertIn("output-collision", saved["flags"])
 
-    def test_output_larger_than_source_is_removed(self):
+    def test_reencode_larger_than_source_is_kept_and_flagged(self):
         record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
         record["source"]["size"] = 1
         record["action"] = "reencode"  # the size rule applies to re-encodes; the argv itself is still the remux
-        stage = self.convert(REMUX_SOURCE, record, keep_larger=False)
-        self.assertEqual(stage["outcome"], "larger")
+        progress = quiet()
+        stage = convert_one(TOOLS, self.root / REMUX_SOURCE, record, convert_options(), progress=progress)
+        self.assertEqual(stage["outcome"], "ok", stage)
         self.assertEqual(stage["source_size"], 1)
         self.assertGreater(stage["output_size"], 1)
-        self.assertFalse((self.root / "h264_high_mkv_aac.mp4").exists())
+        output = self.root / "h264_high_mkv_aac.mp4"
+        self.assertTrue(output.is_file())
+        self.assertEqual(output.stat().st_size, stage["output_size"])
         self.assertEqual(self.leftover_parts(), [])
         saved = load_record(self.root / REMUX_SOURCE)
-        self.assertEqual(saved["status"], "failed")
+        self.assertIn(saved["status"], DONE)
         self.assertIn("output-larger", saved["flags"])
+        self.assertNotIn("remux-larger", saved["flags"])
+        self.assertEqual(saved["stages"]["convert"]["outcome"], "ok")
+        self.assertIn("kept and flagged 'output-larger'", progress.stream.getvalue())
 
-    def test_output_larger_than_source_is_kept_with_keep_larger(self):
+    def test_larger_reencode_counts_as_converted_in_the_summary(self):
         record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
         record["source"]["size"] = 1
         record["action"] = "reencode"
-        stage = self.convert(REMUX_SOURCE, record, keep_larger=True)
-        self.assertEqual(stage["outcome"], "ok", stage)
-        self.assertTrue((self.root / "h264_high_mkv_aac.mp4").is_file())
-        saved = load_record(self.root / REMUX_SOURCE)
-        self.assertIn(saved["status"], DONE)
-        self.assertIn("keep-larger", saved["flags"])
-        self.assertNotIn("output-larger", saved["flags"])
+        save_record(self.root / REMUX_SOURCE, record)
+        code, text = self.run_command(quiet=False)
+        self.assertEqual(code, 0, text)
+        summary_lines = [line for line in text.splitlines() if line.startswith("convert:")]
+        self.assertEqual(len(summary_lines), 1, text)
+        self.assertNotIn("larger", summary_lines[0])
+        self.assertIn("0 failed", summary_lines[0])
+        self.assertIn(load_record(self.root / REMUX_SOURCE)["status"], DONE, text)
+        self.assertIn("output-larger", load_record(self.root / REMUX_SOURCE)["flags"])
+
+    def test_keep_larger_option_is_gone(self):
+        from vidfunnel import cli
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                cli.build_parser().parse_args(["convert", "--keep-larger"])
 
     def test_remux_larger_than_source_is_kept_and_flagged(self):
         record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
         record["source"]["size"] = 1
         self.assertEqual(record["action"], "remux")
-        stage = self.convert(REMUX_SOURCE, record, keep_larger=False)
+        stage = self.convert(REMUX_SOURCE, record)
         self.assertEqual(stage["outcome"], "ok", stage)
         self.assertTrue((self.root / "h264_high_mkv_aac.mp4").is_file())
         saved = load_record(self.root / REMUX_SOURCE)
         self.assertIn("remux-larger", saved["flags"])
         self.assertNotIn("output-larger", saved["flags"])
-        self.assertNotIn("keep-larger", saved["flags"])
 
-    def test_output_smaller_than_source_is_kept_without_keep_larger(self):
+    def test_output_smaller_than_source_is_not_flagged(self):
         record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
         record["source"]["size"] = 10 ** 9
-        stage = self.convert(REMUX_SOURCE, record, keep_larger=False)
+        record["action"] = "reencode"
+        stage = self.convert(REMUX_SOURCE, record)
         self.assertEqual(stage["outcome"], "ok", stage)
         saved = load_record(self.root / REMUX_SOURCE)
-        self.assertNotIn("keep-larger", saved["flags"])
+        self.assertNotIn("output-larger", saved["flags"])
+        self.assertNotIn("remux-larger", saved["flags"])
 
     def run_command(self, *extra, **values):
         defaults = dict(paths=[str(self.root)], ffmpeg=None, quiet=True, verbose=False, log=None, yes=False,
-                        par2=None, jobs=1, dry_run=False, keep_larger=False)
+                        par2=None, jobs=1, dry_run=False)
         defaults.update(values)
         args = argparse.Namespace(**defaults)
         captured = io.StringIO()
@@ -406,7 +418,7 @@ class ConvertRunTest(unittest.TestCase):
 
     def test_two_jobs_convert_both_planned_records(self):
         self.plan(REMUX_SOURCE, MP4_SOURCE)
-        code, text = self.run_command(jobs=2, keep_larger=True)
+        code, text = self.run_command(jobs=2)
         self.assertEqual(code, 0, text)
         self.assertTrue((self.root / "h264_high_mkv_aac.mp4").is_file())
         self.assertTrue((self.root / "h264_mp4_aac.vidfunnel.mp4").is_file())

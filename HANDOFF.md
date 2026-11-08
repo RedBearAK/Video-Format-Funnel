@@ -46,7 +46,7 @@ Opus and Vorbis were considered and rejected: Vorbis-in-MP4 is nonstandard, Opus
 
 ### 2.3 Subtitles and extra streams
 
-- Text subtitles (SRT, SSA/ASS, MKV `subrip`): converted to `mov_text` inside the MP4 and also written as a `.srt` sidecar when styling would be lost (ASS).
+- Text subtitles (SRT, SSA/ASS, MKV `subrip`): converted to `mov_text` inside the MP4 and always also written as a `.srt` sidecar (`NAME.srt`, or `NAME.<n>.srt` with several text streams): an external `.srt` is what Roku Media Player and most TV players read, embedded `mov_text` is not shown everywhere, and ASS styling is lost in `mov_text` anyway.
 - Bitmap subtitles (DVD `dvd_subtitle`, PGS): cannot live in MP4 and are never silently dropped. PGS goes to a `.sup` sidecar through ffmpeg's `sup` muxer. ffmpeg has no `.idx/.sub` muxer, so `dvd_subtitle` streams are written to a `NAME.subs.mkv` sidecar (Matroska carries VobSub natively; mpv and Jellyfin read it as an external track). Flag `subs-sidecar` and list the sidecars in the record.
 - Chapters: carried over (`-map_chapters 0`).
 - Attachments, fonts, cover art: dropped; they stay listed in the record's probe section.
@@ -158,7 +158,7 @@ Each converted file gets a score from 100 minus the penalties above, plus post-c
 | Any decoder warning during the probe pass | −10 per class |
 | Output video duration differs from the source's by more than 0.1 s plus one output frame interval (stream durations, not container durations) | −20 |
 | Frame count outside the expected range (after telecine/field-rate adjustment) | −30 |
-| Output of a re-encode larger than source (kept only with `--keep-larger`) | not eligible for retirement; a remux is exempt, since only the container changed and fragment headers can make a small file grow slightly (flag `remux-larger`, informational) |
+| Output of a re-encode larger than source (always kept, flag `output-larger`) | `retire` refuses it unless `--allow-larger` is given, which adds the flag `allowed-larger`; a remux is exempt, since only the container changed and fragment headers can make a small file grow slightly (flag `remux-larger`, informational) |
 | Output stream count differs from the expected (a video, audio or text-subtitle stream of the source is missing) | −50 |
 | Identity tag missing or naming another record or source | −100 |
 | Optional sampled SSIM against source below threshold (`--ssim-check`, default off, threshold 0.97 on luma) | −25 |
@@ -173,13 +173,13 @@ Every stage is a separate subcommand, idempotent, and resumable. State lives in 
 ```
 vidfunnel check
 vidfunnel plan   [--samples N] [--full-analysis] [--assume-dar R] [--audio-offset S] [--audio-strict-aac] [--reencode-video] [--max-level 4.1|4.2] [--plain-mp4] [--par2 N] [--replan] [PATH...]
-vidfunnel convert [--par2 N] [--jobs N] [--dry-run] [--keep-larger] [PATH...]
+vidfunnel convert [--par2 N] [--jobs N] [--dry-run] [PATH...]
 vidfunnel verify [PATH...]
 vidfunnel report [--format md|json|csv] [--min-score N] [--reveal] [--with-logs] PATH...
 vidfunnel report --from REPORT [--reveal]
 vidfunnel find ID
-vidfunnel retire [--allow-review] [--quarantine DIR] PATH...
-vidfunnel retire --destroy-originals-now [--allow-review] PATH...
+vidfunnel retire [--allow-review] [--allow-larger] [--quarantine DIR] PATH...
+vidfunnel retire --destroy-originals-now [--allow-review] [--allow-larger] PATH...
 vidfunnel index [--rebuild] [--db PATH] [PATH...]
 vidfunnel --install-command [--user|--system]
 vidfunnel --uninstall-command
@@ -206,7 +206,7 @@ Full-length null decode of the output with error counting, duration and frame-co
 
 ### 6.5 `retire`
 
-The only stage that touches originals, and it is separate from `convert` by design. For each source it checks: a record exists, status is `verified`, the source still matches the record's cheap fingerprint (it has not been replaced since it was planned), output exists and its full SHA-256 matches the record, score meets the band rule, output size rule satisfied. Only then it moves the original into the quarantine directory (default `.vidfunnel-retired/` under the top-level path given, preserving relative paths), and, for an output written under the interim `<stem>.vidfunnel.mp4` name (§2.4), renames it to `<stem>.mp4` once the original is out of the way, recording the rename. `--destroy-originals-now` unlinks instead of moving and is the only destructive flag in the tool; it prints what it is about to do and requires typing `destroy` on stdin unless `--yes` is also given. No other subcommand ever removes or overwrites a source.
+The only stage that touches originals, and it is separate from `convert` by design. For each source it checks: a record exists, status is `verified`, the source still matches the record's cheap fingerprint (it has not been replaced since it was planned), output exists and its full SHA-256 matches the record, score meets the band rule, output size rule satisfied (a re-encode larger than its source, or flagged `output-larger`, only with `--allow-larger`, which flags the record `allowed-larger`). Only then it moves the original into the quarantine directory (default `.vidfunnel-retired/` under the top-level path given, preserving relative paths), and, for an output written under the interim `<stem>.vidfunnel.mp4` name (§2.4), renames it to `<stem>.mp4` once the original is out of the way, recording the rename. `--destroy-originals-now` unlinks instead of moving and is the only destructive flag in the tool; it prints what it is about to do and requires typing `destroy` on stdin unless `--yes` is also given. No other subcommand ever removes or overwrites a source.
 
 ### 6.6 `report`
 

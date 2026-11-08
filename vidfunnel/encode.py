@@ -20,16 +20,17 @@ What convert writes into the record:
   source_size, size_ratio (None when the source size is unknown);
 - stages.convert on an ffmpeg failure: outcome 'failed', error,
   returncode, stderr (last 4000 characters), argv; status 'failed';
-- stages.convert when the output came out larger than the source and
-  --keep-larger was not given: outcome 'larger', output_size, source_size;
-  the output is removed, flag 'output-larger', status 'failed';
+- a re-encode that came out larger than its source is kept like any
+  other output (outcome 'ok', output_size and source_size as above) and
+  gets the flag 'output-larger'; retire refuses it without --allow-larger.
+  A remux that came out larger gets the informational flag 'remux-larger';
 - stages.convert when the output name is taken by a file that is not
   ours: outcome 'output-collision', error; flag 'output-collision', status
   'failed';
 - output.size and output.fingerprint (the cheap fingerprint after the
   mtime is set, so a later run can skip the file without verify having
   run), status 'converted' (or 'verified' once verify has run);
-- flags 'keep-larger', 'sidecar-failed', 'par2-skipped', 'par2-failed',
+- flags 'output-larger', 'remux-larger', 'sidecar-failed', 'par2-skipped', 'par2-failed',
   'source-changed' (status 'source-changed' too) as they apply.
 
 Before anything runs, planned records whose output names meet in one
@@ -79,7 +80,7 @@ from vidfunnel.record import (
 
 PART_SUFFIX = ".part"
 STDERR_TAIL = 4000
-OUTCOMES = ("converted", "verified", "skipped", "failed", "larger")
+OUTCOMES = ("converted", "verified", "skipped", "failed")
 ACTION_WORDS = {"remux": "remux", "reencode": "re-encode"}
 DONE_STATUSES = ("converted", "verified")
 
@@ -361,7 +362,7 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
 
     `source` is the record's key path (the source file, the first VOB of a
     group, or '<dvd folder>_titleNN' beside the DVD folder); its parent is
-    the folder. `options` carries par2 (override or None), keep_larger,
+    the folder. `options` carries par2 (override or None) and
     verbose. `progress` is None or carries stream and quiet. The record is
     changed in place and saved after each change of state.
     """
@@ -451,20 +452,10 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
             say("  remuxed output is larger than the source ({} > {} bytes); container overhead, kept".format(
                 output_size, source_size), stream)
         elif output_size > source_size:
-            if not getattr(options, "keep_larger", False):
-                _remove(output_path)
-                stage = {"outcome": "larger", "output_size": output_size, "source_size": source_size,
-                         "elapsed_s": round(elapsed, 3)}
-                add_stage(record, "convert", stage)
-                add_flag(record, "output-larger")
-                set_status(record, "failed")
-                save_record(key, record)
-                say("  output is larger than the source ({} > {} bytes); removed '{}' "
-                    "(--keep-larger keeps it)".format(output_size, source_size, output_path.name), stream)
-                return record["stages"]["convert"]
-            add_flag(record, "keep-larger")
-            say("  output is larger than the source ({} > {} bytes); kept because of --keep-larger".format(
-                output_size, source_size), stream)
+            # Kept and flagged; retire refuses it without --allow-larger (HANDOFF 5).
+            add_flag(record, "output-larger")
+            say("  output is larger than the source ({} > {} bytes); kept and flagged 'output-larger' "
+                "(retire will refuse it without --allow-larger)".format(output_size, source_size), stream)
     else:
         say("  source size unknown; the size rule could not be applied to '{}'".format(output_path.name), stream)
 
@@ -710,8 +701,6 @@ def convert_paths(tools, paths, options, progress=None):
                 if record.get("status") == "failed":
                     return "failed"
                 return "verified" if record.get("status") == "verified" else "converted"
-            if outcome == "larger":
-                return "larger"
             if outcome == "skipped":
                 return "skipped"
             return "failed"
@@ -754,8 +743,6 @@ def add_arguments(parser):
     parser.add_argument("--jobs", type=_positive_int, default=1, metavar="N",
                         help="files converted at once (default 1; x264 already uses every core)")
     parser.add_argument("--dry-run", action="store_true", help="print the commands only; write nothing")
-    parser.add_argument("--keep-larger", action="store_true",
-                        help="keep an output larger than its source (it is then not eligible for retirement)")
     return parser
 
 
@@ -777,12 +764,11 @@ def run(args):
         return EXIT_USAGE
     options = types.SimpleNamespace(par2=getattr(args, "par2", None), jobs=getattr(args, "jobs", 1),
                                     dry_run=bool(getattr(args, "dry_run", False)),
-                                    keep_larger=bool(getattr(args, "keep_larger", False)),
                                     verbose=bool(getattr(args, "verbose", False)))
     progress = types.SimpleNamespace(stream=None, quiet=bool(getattr(args, "quiet", False)),
                                      verbose=options.verbose)
     summary = convert_paths(tools, args.paths, options, progress)
-    failed = summary.counts.get("failed", 0) + summary.counts.get("larger", 0) + summary.counts.get("collision", 0)
+    failed = summary.counts.get("failed", 0) + summary.counts.get("collision", 0)
     return EXIT_ERROR if failed or getattr(summary, "lock_errors", None) else EXIT_OK
 
 # End of File #

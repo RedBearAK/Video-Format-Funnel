@@ -4,9 +4,11 @@ The only stage that ever touches an original file. For each source it checks,
 in this order (GUARDS): a usable record exists; its status is 'verified'; the
 source still matches the record's cheap fingerprint; the output exists; the
 score is not in the 'hold' band and, without --allow-review, not in the
-'review' band; the output is not larger than the source and the record does
-not carry 'keep-larger'; the output's full SHA-256 matches the record (the
-only expensive guard, so it runs after the cheap ones); an output under the
+'review' band; without --allow-larger, a re-encode's output is not larger
+than the source and the record does not carry 'output-larger' (with it,
+retire proceeds and flags the record 'allowed-larger'); the output's full
+SHA-256 matches the record (the only expensive guard, so it runs after the
+cheap ones); an output under the
 interim '<stem>.vidfunnel.mp4' name (section 2.4) can be renamed to its final
 name; and the quarantine destination does not exist yet. The first
 failed guard raises RetireRefused and nothing is moved.
@@ -34,7 +36,7 @@ import sys
 import types
 from pathlib import Path
 
-from vidfunnel.progress import Progress, StageSummary, format_bytes, is_tty, say
+from vidfunnel.progress import Progress, StageSummary, is_tty, say
 from vidfunnel.record import (
     FolderLock,
     LockHeld,
@@ -65,7 +67,8 @@ GUARDS = (
 )
 
 QUARANTINE_DIR_NAME = ".vidfunnel-retired"
-KEEP_LARGER_FLAG = "keep-larger"
+OUTPUT_LARGER_FLAG = "output-larger"
+ALLOWED_LARGER_FLAG = "allowed-larger"
 PROGRESS_THRESHOLD = 32 * 1024 * 1024     # hash and copy show live progress above this size
 COPY_BLOCK = 1024 * 1024
 DESTROY_WORD = "destroy"
@@ -122,14 +125,16 @@ def _hash_output(path, size, progress, quiet):
 # ---------------------------------------------------------------- guards
 
 
-def check_eligible(source, record, allow_review=False, progress=None, quiet=False):
+def check_eligible(source, record, allow_review=False, progress=None, quiet=False, allow_larger=False):
     """Run the guards up to 'interim-rename-blocked' in GUARDS order; RetireRefused at the first failure.
 
     'quarantine-exists' depends on the destination and is checked by retire_one.
     progress: None (a Progress line is shown for outputs over 32 MiB unless
     quiet) or a Progress-like object handed to sha256_file. Returns
     {'output_path', 'final_output_path', 'band', 'sha256_verified': True,
-    'members': [paths]}; 'members' is [source] for a single file and every
+    'members': [paths], 'larger': bool}; 'larger' is True when the output is
+    larger than the source (or flagged 'output-larger') and allow_larger let
+    it pass; 'members' is [source] for a single file and every
     member of source.members, in order, for a 'vob-group' record, each of
     which must still match its own fingerprint ('source-changed' names the
     member) and whose sizes add up to the size 'output-larger' compares with.
@@ -231,15 +236,20 @@ def check_eligible(source, record, allow_review=False, progress=None, quiet=Fals
                             "score {} is in the review band (60-89); pass --allow-review after checking it".format(
                                 score))
 
-    # output-larger
+    # output-larger: a re-encode larger than its source (a remux may grow by container
+    # overhead and is not counted), or a record convert flagged as such.
     flags = record.get("flags") or []
-    if KEEP_LARGER_FLAG in flags:
-        raise RetireRefused("output-larger",
-                            "the output was kept although larger than the source (--keep-larger); "
-                            "such a conversion is not eligible for retirement")
-    if record.get("action") == "reencode" and actual_size > source_size:
-        raise RetireRefused("output-larger", "output '{}' ({}) is larger than the source ({})".format(
-            output_path.name, format_bytes(actual_size), format_bytes(source_size)))
+    larger = record.get("action") == "reencode" and actual_size > source_size
+    flagged = OUTPUT_LARGER_FLAG in flags
+    if (larger or flagged) and not allow_larger:
+        if larger:
+            detail = ("output '{}' ({} bytes) is larger than the source ({} bytes); "
+                      "--allow-larger retires it anyway".format(output_path.name, actual_size, source_size))
+        else:
+            detail = ("the record carries '{}' (output '{}' is {} bytes, the source {} bytes); "
+                      "--allow-larger retires it anyway".format(OUTPUT_LARGER_FLAG, output_path.name, actual_size,
+                                                                source_size))
+        raise RetireRefused("output-larger", detail)
 
     # output-hash-mismatch (size first: a different size cannot have the same hash)
     expected_hash = output_section.get("sha256")
@@ -269,6 +279,7 @@ def check_eligible(source, record, allow_review=False, progress=None, quiet=Fals
         "band": score_band,
         "sha256_verified": True,
         "members": member_paths,
+        "larger": bool(larger or flagged),
     }
 
 
@@ -430,7 +441,7 @@ def _retire_member(source, destination, quiet):
 
 
 def retire_one(source, record, root, quarantine_dir=None, destroy=False, allow_review=False,
-               progress=None, quiet=False):
+               progress=None, quiet=False, allow_larger=False):
     """Check the guards, then quarantine (or, destroy=True, unlink) one source; return the retire stage.
 
     destroy=True unlinks without asking: the caller (run) has already obtained
@@ -446,10 +457,12 @@ def retire_one(source, record, root, quarantine_dir=None, destroy=False, allow_r
     saved, because the source is gone. When a member fails after earlier
     members were moved or unlinked, the stage holds {mode, partial: [{name,
     destination}], failed, error}, the status stays 'verified', the record is
-    saved and OSError is raised, so a person sees it.
+    saved and OSError is raised, so a person sees it. A larger output let
+    through by allow_larger adds the flag 'allowed-larger' to the record.
     """
     source = Path(source)
-    eligibility = check_eligible(source, record, allow_review=allow_review, progress=progress, quiet=quiet)
+    eligibility = check_eligible(source, record, allow_review=allow_review, progress=progress, quiet=quiet,
+                                 allow_larger=allow_larger)
 
     member_paths = eligibility["members"]
     destinations = [None] * len(member_paths)
@@ -523,6 +536,8 @@ def retire_one(source, record, root, quarantine_dir=None, destroy=False, allow_r
     if par2_outcome is not None:
         stage.update(par2_outcome)
     add_stage(record, "retire", stage)
+    if eligibility["larger"]:
+        add_flag(record, ALLOWED_LARGER_FLAG)
     set_status(record, "retired")
     save_record(source, record)
     if rename_error is not None:
@@ -566,6 +581,9 @@ def add_arguments(parser):
                         "retire never assumes the current directory")
     parser.add_argument("--allow-review", action="store_true",
                         help="also retire sources whose score is in the review band (60-89)")
+    parser.add_argument("--allow-larger", action="store_true",
+                        help="also retire sources whose re-encoded output is larger than the source "
+                        "(the record is flagged 'allowed-larger')")
     parser.add_argument("--quarantine", metavar="DIR", default=None,
                         help="quarantine directory (default: '.vidfunnel-retired' under each PATH)")
     parser.add_argument("--destroy-originals-now", action="store_true",
@@ -674,6 +692,7 @@ def run(args):
     destroy = bool(getattr(args, "destroy_originals_now", False))
     yes = bool(getattr(args, "yes", False))
     allow_review = bool(getattr(args, "allow_review", False))
+    allow_larger = bool(getattr(args, "allow_larger", False))
     quarantine_dir = getattr(args, "quarantine", None)
 
     if destroy and not yes and not is_tty(sys.stdin):
@@ -705,7 +724,7 @@ def run(args):
                     prefix = "[retire {}/{}]".format(position, total)
                     say("{} '{}' -> quarantine".format(prefix, candidate.display))
                     _retire_candidate(candidate, prefix, quarantine_dir, False, allow_review, quiet,
-                                      summary, problems)
+                                      summary, problems, allow_larger)
             finally:
                 lock.release()
     else:
@@ -728,7 +747,8 @@ def run(args):
                 say("{} '{}' checking before destroy".format(prefix, candidate.display))
                 try:
                     record = _fresh_record(candidate)
-                    eligibility = check_eligible(candidate.source, record, allow_review=allow_review, quiet=quiet)
+                    eligibility = check_eligible(candidate.source, record, allow_review=allow_review, quiet=quiet,
+                                                 allow_larger=allow_larger)
                 except RetireRefused as refusal:
                     _refused(prefix, candidate, refusal, summary)
                     continue
@@ -743,7 +763,7 @@ def run(args):
                 for prefix, candidate, _paths in eligible:
                     say("{} '{}' -> destroy".format(prefix, candidate.display))
                     _retire_candidate(candidate, prefix, quarantine_dir, True, allow_review, quiet,
-                                      summary, problems)
+                                      summary, problems, allow_larger)
             elif eligible:
                 summary.add("cancelled", len(eligible))
             elif not quiet:
@@ -753,12 +773,13 @@ def run(args):
     return EXIT_ERROR if problems else EXIT_OK
 
 
-def _retire_candidate(candidate, prefix, quarantine_dir, destroy, allow_review, quiet, summary, problems):
+def _retire_candidate(candidate, prefix, quarantine_dir, destroy, allow_review, quiet, summary, problems,
+                      allow_larger=False):
     """Retire one candidate under its folder lock; refusals and errors are printed and counted."""
     try:
         record = _fresh_record(candidate)
         stage = retire_one(candidate.source, record, candidate.root, quarantine_dir=quarantine_dir,
-                           destroy=destroy, allow_review=allow_review, quiet=quiet)
+                           destroy=destroy, allow_review=allow_review, quiet=quiet, allow_larger=allow_larger)
     except RetireRefused as refusal:
         _refused(prefix, candidate, refusal, summary)
         return
