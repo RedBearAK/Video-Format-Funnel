@@ -413,6 +413,18 @@ The rule tests run against probe and analysis JSON captured from the fixtures an
 - The redacted log file option described in `HANDOFF.md` section 6.10 (`--log FILE`) is not built yet.
 - Whether QuickTime Player and Jellyfin display the standard `title` tag next to the `vidfunnel` tag has been checked only through ffprobe, not on a real player.
 
+## Sponsor / Donate
+
+A tool like this takes a lot of time to get right: every legacy format has its own quirks, every ffmpeg major changes something, and nothing may ever touch an original by accident. If vidfunnel saved you time or a library, and you would like me to keep maintaining and improving it, you can throw some money at me on one of these platforms:
+
+<a href="https://www.buymeacoffee.com/RedBearAK"><img src="https://img.buymeacoffee.com/button-api/?text=Buy me a coffee&emoji=&slug=RedBearAK&button_colour=865e3c&font_colour=ffffff&font_family=Bree&outline_colour=ffffff&coffee_colour=FFDD00" /></a>
+
+https://buymeacoffee.com/RedBearAK
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G2G34VVZW)
+
+https://ko-fi.com/RedBearAK
+
 ## Licence
 
 GPL-3.0-or-later.
