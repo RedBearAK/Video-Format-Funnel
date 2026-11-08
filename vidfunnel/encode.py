@@ -888,6 +888,9 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
         say("failed: refit of '{}': could not replace '{}': {}".format(label, output_path.name, error), stream)
         return "failed", str(error)
 
+    # The file on disk is now the refit. Everything that describes it goes into the
+    # record and is saved before the slow PAR2 step, so an interrupt there leaves a
+    # record that says what happened (a convert PAR2 set is then stale, see below).
     first_source = _source_files(folder, record)[0][0]
     try:
         source_mtime = os.stat(str(first_source)).st_mtime_ns
@@ -902,17 +905,31 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
     record.pop("score", None)
     output = record.setdefault("output", {})
     output.pop("sha256", None)
-
+    add_stage(record, "refit", {"attempt": attempt, "outcome": "replaced"})
+    refit_stage = stages["refit"]
+    add_flag(record, REFIT_FLAG)
+    if new_size <= plan["source_size"]:
+        record["flags"] = [flag for flag in record.get("flags") or [] if flag != OUTPUT_LARGER_FLAG]
+    output["size"] = new_size
+    output["fingerprint"] = cheap_fingerprint(output_path)
+    set_status(record, "converted")
     convert = stages.get("convert") or {}
-    refit_stage = {"attempt": attempt, "outcome": "replaced"}
     redundancy = getattr(options, "par2", None)
     if redundancy is None and convert.get("par2_files"):
         redundancy = convert.get("par2_redundancy")
+    stale_par2 = _par2_files(output_path)
+    if stale_par2:
+        # Written for the output this one replaced; they can no longer repair anything.
+        refit_stage["par2_stale"] = [path.name for path in stale_par2]
+        add_flag(record, "par2-stale")
+    save_record(key, record)
+
     if redundancy:
         if shutil.which("par2") is None:
-            add_flag(record, "par2-skipped")
-            say("  PAR2 for '{}' is out of date and 'par2' is not on PATH; not rewritten".format(output_path.name),
-                stream)
+            for path in stale_par2:
+                _remove(path)
+            say("  PAR2 for '{}' is out of date and 'par2' is not on PATH; the stale set is removed, "
+                "flagged 'par2-stale'".format(output_path.name), stream)
         else:
             try:
                 refit_stage["par2_files"] = [path.name for path in write_par2(output_path, redundancy, progress)]
@@ -920,14 +937,9 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
                 refit_stage["par2_error"] = str(error)
                 add_flag(record, "par2-failed")
                 say("  PAR2 failed for '{}': {}".format(output_path.name, error), stream)
-    add_stage(record, "refit", refit_stage)
-    add_flag(record, REFIT_FLAG)
-    if new_size <= plan["source_size"]:
-        record["flags"] = [flag for flag in record.get("flags") or [] if flag != OUTPUT_LARGER_FLAG]
-    output["size"] = new_size
-    output["fingerprint"] = cheap_fingerprint(output_path)
-    set_status(record, "converted")
-    save_record(key, record)
+            else:
+                record["flags"] = [flag for flag in record.get("flags") or [] if flag != "par2-stale"]
+            save_record(key, record)
     say("  refit '{}': {}; replaced '{}' ({} bytes, was {}){}".format(
         label, result_words, output_path.name, new_size, plan["output_size"],
         "" if new_size <= plan["source_size"] else "; still larger than the source, '{}' kept".format(

@@ -695,6 +695,57 @@ class RefitRunTest(unittest.TestCase):
         self.assertEqual(verified["status"], "verified")
         self.assertEqual(verified["output"]["sha256"], sha256_of(self.root / REFIT_OUTPUT))
 
+    def test_interrupt_during_par2_leaves_a_record_that_describes_the_new_output(self):
+        if shutil.which("par2") is None:
+            self.skipTest("par2 is not on PATH")
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True, par2=10)
+        before = load_record(self.root / REFIT_SOURCE)
+        self.assertTrue(before["stages"]["convert"]["par2_files"])
+        with unittest.mock.patch("vidfunnel.encode.write_par2", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.refit()
+        saved = load_record(self.root / REFIT_SOURCE)
+        on_disk = (self.root / REFIT_OUTPUT).stat().st_size
+        self.assertEqual(saved["stages"]["refit"]["outcome"], "replaced")
+        self.assertEqual(saved["stages"]["refit"]["attempt"]["output_size"], on_disk)
+        self.assertEqual(saved["output"]["size"], on_disk)
+        self.assertEqual(saved["status"], "converted")
+        self.assertNotIn("sha256", saved["output"])
+        self.assertIn("refitted", saved["flags"])
+        self.assertIn("par2-stale", saved["flags"], "the convert PAR2 set no longer matches the output")
+        self.assertEqual(self.leftover_parts(), [])
+        summary, text = self.refit()
+        self.assertEqual(summary.skip_reasons, {"already refitted": 1}, text)
+
+    def test_refit_without_par2_on_path_removes_the_stale_set(self):
+        if shutil.which("par2") is None:
+            self.skipTest("par2 is not on PATH")
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True, par2=10)
+        output = self.root / REFIT_OUTPUT
+        self.assertTrue([name for name in os.listdir(str(self.root)) if name.endswith(".par2")])
+        real_which = shutil.which
+        with unittest.mock.patch("vidfunnel.encode.shutil.which",
+                                 side_effect=lambda name, *rest: None if name == "par2" else real_which(name, *rest)):
+            summary, text = self.refit()
+        self.assertEqual(summary.counts["refitted"], 1, text)
+        self.assertEqual([name for name in os.listdir(str(self.root)) if name.endswith(".par2")], [])
+        saved = load_record(self.root / REFIT_SOURCE)
+        self.assertIn("par2-stale", saved["flags"])
+        self.assertNotIn("par2-skipped", saved["flags"])
+        self.assertIn("stale set is removed", text)
+
+    def test_refit_rewrites_par2_and_clears_the_stale_flag(self):
+        if shutil.which("par2") is None:
+            self.skipTest("par2 is not on PATH")
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True, par2=10)
+        summary, text = self.refit()
+        self.assertEqual(summary.counts["refitted"], 1, text)
+        saved = load_record(self.root / REFIT_SOURCE)
+        self.assertNotIn("par2-stale", saved["flags"])
+        self.assertTrue(saved["stages"]["refit"]["par2_files"])
+        self.assertEqual(subprocess.run(["par2", "verify", "-q", str(self.root / (REFIT_OUTPUT + ".par2"))],
+                                        capture_output=True).returncode, 0)
+
     def test_refit_not_smaller_keeps_the_output_and_retire_refuses_it(self):
         # Constructed: the planned CRF is lowered to 10, so the refit at CRF 11 comes out larger
         # than the existing CRF 18 output.
