@@ -77,6 +77,8 @@ from vidfunnel.analyze import (
 from vidfunnel.ffmpeg import DecodeResult, FfmpegError, classify_messages, ffprobe_json
 from vidfunnel.ffmpeg import capabilities as ffmpeg_capabilities
 from vidfunnel.ffmpeg import run as run_tool
+from vidfunnel.interrupt import check as check_interrupted
+from vidfunnel.interrupt import run_pool
 from vidfunnel.probe import (
     classify,
     decodable_codecs,
@@ -947,6 +949,7 @@ def _sha256_paths(paths, label, progress):
         for path in paths:
             with open(str(path), "rb") as handle:
                 while True:
+                    check_interrupted()
                     block = handle.read(1024 * 1024)
                     if not block:
                         break
@@ -1453,11 +1456,21 @@ def _plan_parallel(tools, options, progress, stream, summary, capabilities, fold
                    jobs):
     """The items of every locked folder through a pool of `jobs` threads; returns the rows in list order.
 
-    One future per item, except that items with the same output name in one
-    folder share a future and run one after another in list order.
+    One task per item, except that items with the same output name in one
+    folder share a task and run one after another in list order. A
+    folder's file is updated and its lock released on this thread as soon as
+    its last group has returned, so a finished folder is open to convert
+    while the others are still planned.
+
+    Ctrl+C: vidfunnel.interrupt.interrupted is set by run_pool on this
+    thread when KeyboardInterrupt arrives, and read by every ffmpeg or
+    ffprobe start and exit in the workers (and the hash loop), which then
+    raise Interrupted. _plan_one saves a record only at the end of an item
+    and Interrupted is not among the errors it records as 'failed', so an
+    interrupted item leaves its record as it was; groups not yet started are
+    not started, and the folders still open keep their folder file unchanged.
     """
-    import concurrent.futures
-    folder_locks = []
+    folder_locks = {}
     groups = {}
     order = []
     position = 0
@@ -1468,7 +1481,7 @@ def _plan_parallel(tools, options, progress, stream, summary, capabilities, fold
             if lock is None:
                 position += len(entries)
                 continue
-            folder_locks.append((folder, lock))
+            folder_locks[folder] = lock
             for work, found in entries:
                 position += 1
                 key = _output_name_key(work)
@@ -1476,7 +1489,11 @@ def _plan_parallel(tools, options, progress, stream, summary, capabilities, fold
                     groups[key] = []
                     order.append(key)
                 groups[key].append((folder, work, found, position))
-        record_locks = {folder: threading.Lock() for folder, _lock in folder_locks}
+        record_locks = {folder: threading.Lock() for folder in folder_locks}
+        outstanding = {}
+        for key in order:
+            folder = groups[key][0][0]
+            outstanding[folder] = outstanding.get(folder, 0) + 1
 
         def plan_group(members):
             results = []
@@ -1487,25 +1504,24 @@ def _plan_parallel(tools, options, progress, stream, summary, capabilities, fold
             return results
 
         results = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-            futures = [pool.submit(plan_group, groups[key]) for key in order]
-            try:
-                for future in futures:
-                    results.extend(future.result())
-            except KeyboardInterrupt:
-                for future in futures:
-                    future.cancel()
-                raise
+
+        def group_done(index, group_results):
+            results.extend(group_results)
+            folder = groups[order[index]][0][0]
+            outstanding[folder] -= 1
+            if outstanding[folder] == 0:
+                _update_folder_file(folder, [work for work, _found in by_folder[folder]])
+                folder_locks.pop(folder).release()
+
+        run_pool(jobs, [lambda members=groups[key]: plan_group(members) for key in order], group_done)
         rows = []
         for _number, (outcome, record) in sorted(results, key=lambda entry: entry[0]):
             summary.add(outcome)
             if record is not None:
                 rows.append(_table_row(outcome, record))
-        for folder, _lock in folder_locks:
-            _update_folder_file(folder, [work for work, _found in by_folder[folder]])
         return rows
     finally:
-        for _folder, lock in folder_locks:
+        for lock in folder_locks.values():
             lock.release()
 
 

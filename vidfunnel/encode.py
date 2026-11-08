@@ -55,7 +55,6 @@ whose output still matches its fingerprint is reported as already converted.
 
 VERSION = "20261107"
 
-import concurrent.futures
 import math
 import os
 import shlex
@@ -69,6 +68,8 @@ from pathlib import Path
 
 from vidfunnel.ffmpeg import FfmpegError, ToolNotFound
 from vidfunnel.ffmpeg import run as run_tool
+from vidfunnel.interrupt import Interrupted, child_interrupted, run_pool
+from vidfunnel.interrupt import check as check_interrupted
 from vidfunnel.progress import Progress, StageSummary, ffmpeg_progress_callback, say
 from vidfunnel.record import (
     RECORD_DIR,
@@ -284,6 +285,7 @@ def write_par2(output_path, redundancy, progress=None):
     index_name = output_path.name + ".par2"
     argv = [par2, "create", "-r{}".format(int(redundancy)), "-n1", "-q", "--", index_name, output_path.name]
     say("writing PAR2 ({} %) for '{}'".format(int(redundancy), output_path.name), stream)
+    check_interrupted()
     process = subprocess.Popen(argv, cwd=str(output_path.parent), stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
                                encoding="utf-8", errors="replace")
@@ -307,6 +309,8 @@ def write_par2(output_path, redundancy, progress=None):
     if process.returncode != 0:
         for partial in _par2_files(output_path):
             _remove(partial)
+        if child_interrupted(process.returncode):
+            raise Interrupted("par2 was stopped by the interrupt (status {})".format(process.returncode))
         raise OSError("par2 exited with status {} for '{}': {}".format(
             process.returncode, output_path.name, "".join(collected).strip()[-STDERR_TAIL:]))
     files = _par2_files(output_path)
@@ -975,6 +979,12 @@ def refit_paths(tools, paths, options, progress=None):
 
     Returns the StageSummary (counts refitted, kept, skipped, failed, with
     `lock_errors` and `skip_reasons`, a {reason: count} dict).
+
+    Ctrl+C with --jobs: as in convert_paths, run_pool sets
+    vidfunnel.interrupt.interrupted on this thread, the workers' ffmpeg runs
+    raise Interrupted, and refit_one lets it through its 'failed' handler
+    and removes its part file on the way out, so the record of an
+    interrupted refit is left as it was.
     """
     stream, quiet, verbose = _stream_of(progress)
     jobs = max(1, int(getattr(options, "jobs", 1) or 1))
@@ -1047,9 +1057,13 @@ def refit_paths(tools, paths, options, progress=None):
             for position, key in enumerate(runnable, 1):
                 results.append(work(position, key))
         else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-                futures = [pool.submit(work, position, key) for position, key in enumerate(runnable, 1)]
-                results = [future.result() for future in futures]
+            results = [None] * len(runnable)
+
+            def refit_done(index, value):
+                results[index] = value
+
+            run_pool(jobs, [lambda position=position, key=key: work(position, key)
+                            for position, key in enumerate(runnable, 1)], refit_done)
         for outcome, reason in results:
             if outcome == "skipped":
                 skipped(reason)
@@ -1193,6 +1207,14 @@ def convert_paths(tools, paths, options, progress=None):
     The summary carries `lock_errors` (folders whose lock could not be
     created) next to its counts; refused output collisions are counted as
     'collision'.
+
+    Ctrl+C with --jobs: vidfunnel.interrupt.interrupted is set by run_pool on
+    this thread when KeyboardInterrupt arrives and read by every ffmpeg and
+    par2 start and exit in the workers (and the hash loop of verify), which
+    then raise Interrupted. convert_one's handlers that record 'failed' do
+    not catch it and its finally removes the part file, so the record of an
+    interrupted item keeps the last state it was saved in, as after Ctrl+C
+    without --jobs; items not yet started are not started.
     """
     if getattr(options, "refit", False):
         return refit_paths(tools, paths, options, progress)
@@ -1275,10 +1297,9 @@ def convert_paths(tools, paths, options, progress=None):
             for position, (key, _folder) in enumerate(runnable, 1):
                 summary.add(work(position, key))
         else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-                futures = [pool.submit(work, position, key) for position, (key, _folder) in enumerate(runnable, 1)]
-                for future in futures:
-                    summary.add(future.result())
+            run_pool(jobs, [lambda position=position, key=key: work(position, key)
+                            for position, (key, _folder) in enumerate(runnable, 1)],
+                     lambda _index, outcome: summary.add(outcome))
     finally:
         for lock in locks:
             lock.release()

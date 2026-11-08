@@ -19,6 +19,7 @@ import uuid
 from pathlib import Path
 
 import vidfunnel
+from vidfunnel.interrupt import check as check_interrupted
 
 RECORD_DIR = ".vidfunnel"
 LOCK_NAME = "lock"
@@ -295,6 +296,7 @@ def sha256_file(path, progress=None):
     next_report = PROGRESS_EVERY
     with open(str(path), "rb") as stream:
         while True:
+            check_interrupted()
             block = stream.read(HASH_BLOCK)
             if not block:
                 break

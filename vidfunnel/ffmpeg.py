@@ -20,6 +20,8 @@ import threading
 from collections import namedtuple
 from pathlib import Path
 
+from vidfunnel.interrupt import Interrupted, child_interrupted
+from vidfunnel.interrupt import check as check_interrupted
 from vidfunnel.progress import say
 
 
@@ -437,8 +439,14 @@ def run(argv, progress=None, check=True):
     check=True raises FfmpegError on a non-zero status. A missing executable
     raises ToolNotFound. If the callback raises (or Ctrl+C arrives), ffmpeg is
     killed before the exception propagates.
+
+    While vidfunnel.interrupt.interrupted is set (Ctrl+C during a --jobs
+    pool), no process is started and a child that exits non-zero is not
+    reported: both raise Interrupted, whatever `check` says (see
+    vidfunnel.interrupt.child_interrupted).
     """
     argv = [os.fspath(part) for part in argv]
+    check_interrupted()
     popen_options = dict(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -481,6 +489,9 @@ def run(argv, progress=None, check=True):
         stdout = "".join(stdout_lines)
         stderr = "".join(stderr_parts)
 
+    if child_interrupted(process.returncode):
+        raise Interrupted("'{}' was stopped by the interrupt (status {})".format(
+            os.path.basename(argv[0]), process.returncode))
     result = CompletedRun(argv, process.returncode, stdout, stderr)
     if check and process.returncode != 0:
         raise FfmpegError(_error_message(argv, process.returncode, stderr), argv, process.returncode, stderr)
