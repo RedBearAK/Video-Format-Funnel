@@ -53,7 +53,7 @@ refused without being touched, except that a converted or verified record
 whose output still matches its fingerprint is reported as already converted.
 """
 
-VERSION = "20261107"
+VERSION = "20261108"
 
 import math
 import os

@@ -7,7 +7,7 @@ same name pattern, so a pair of distrobox wrappers in a directory of their own
 works without shadowing the host's tools.
 """
 
-VERSION = "20261107"
+VERSION = "20261108"
 
 import hashlib
 import json

@@ -6,7 +6,7 @@ per source file, named after the full source file name including its extension
 Records are the authority; every write is atomic (temp file, then os.replace).
 """
 
-VERSION = "20261107"
+VERSION = "20261108"
 
 import contextlib
 import datetime

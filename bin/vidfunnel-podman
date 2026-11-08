@@ -9,7 +9,7 @@
 # --uninstall-command run on the host and link 'vidfunnel' to this wrapper.
 # See HANDOFF.md section 8.
 
-VERSION="20261107"
+VERSION="20261108"
 
 set -eu
 set -f

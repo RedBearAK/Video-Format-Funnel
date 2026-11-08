@@ -19,7 +19,7 @@ unlike Ctrl+C to a terminal's process group). main() then prints
 raises; later ones do nothing, so they cannot cut that cleanup short.
 """
 
-VERSION = "20261107"
+VERSION = "20261108"
 
 import argparse
 import importlib

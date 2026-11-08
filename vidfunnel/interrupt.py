@@ -30,7 +30,7 @@ end the way child_interrupted() expects); vidfunnel.cli.main calls it
 again after a SIGTERM, for the case without a pool.
 """
 
-VERSION = "20261107"
+VERSION = "20261108"
 
 import queue
 import threading
