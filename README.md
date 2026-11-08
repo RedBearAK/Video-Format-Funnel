@@ -24,6 +24,8 @@ It does not scale video (except an integer upscale of tiny palette animations), 
 
 Whether an ffmpeg has `dvdvideo` depends on the distribution's build flags, not on the version. As tested on 2026-11-02: Debian trixie (7.1.5), Arch (9.0.2) and Alpine (8.1.3) have it; Fedora's RPM Fusion ffmpeg 7.1.5 and openSUSE's Packman ffmpeg 7.1.5 do not. Homebrew's build has not been checked. Fedora's base `ffmpeg-free` has no libx264 at all, so Fedora needs RPM Fusion either way. Nobody packages `ffsubsync` or `alass`; `check` prints how to install them.
 
+On an image-based host (Fedora Silverblue, Kinoite or CoreOS, the uBlue images such as uCore, Bazzite, Bluefin and Aurora, RHEL image mode) nothing is installed with `dnf`; packages are layered into the image with `rpm-ostree` and need a reboot. `check` detects such a host from the ostree boot marker, the `rpm-ostree` or `bootc` binary or the os-release variant, says so on its platform line, and puts the container route first in its hints, since it needs nothing on the host beyond podman or docker. The layering commands follow as the second option.
+
 ## Install
 
 Clone the repo and run the launcher from the clone. It checks for a suitable `python3` and runs the package from the repo, so nothing needs to be installed to try it:

@@ -38,7 +38,13 @@ OPTIONAL_PROGRAMS = ("par2", "mediainfo", "ffsubsync", "alass")
 FFMPEG_ITEM_NAMES = ("ffmpeg", "ffprobe") + REQUIRED_ENCODERS + REQUIRED_FILTERS + REQUIRED_BSFS
 DVD_ITEM_NAMES = ("dvdvideo", "libdvdread")
 DISTROBOX_SCRIPT = "bin/vidfunnel-setup-distrobox"
+PODMAN_SCRIPT = "bin/vidfunnel-podman"
 OS_RELEASE = "/etc/os-release"
+# An ostree- or bootc-based host (Fedora Silverblue, Kinoite, CoreOS, the uBlue images such as uCore,
+# Bazzite, Bluefin, Aurora; RHEL image mode) creates this at boot. It is the primary signal; the
+# rpm-ostree or bootc binary and the os-release VARIANT_ID are the others.
+OSTREE_MARKER = "/run/ostree-booted"
+IMAGE_VARIANTS = ("coreos", "silverblue", "kinoite", "sericea", "onyx", "iot", "ucore", "bazzite", "bluefin", "aurora")
 
 
 class DependencyError(Exception):
@@ -62,29 +68,44 @@ def _parse_os_release(text):
     return fields
 
 
-def detect_platform(os_release_path=OS_RELEASE, system=None):
-    """{'os': 'linux'|'macos'|'other', 'id', 'like': [...], 'pretty'}.
+def detect_platform(os_release_path=OS_RELEASE, system=None, ostree_marker=OSTREE_MARKER, which=None):
+    """{'os': 'linux'|'macos'|'other', 'id', 'like': [...], 'pretty', 'variant', 'ostree': bool, 'engine'}.
 
-    Linux reads ID, ID_LIKE and PRETTY_NAME from os-release; macOS uses
-    platform.mac_ver(). `os_release_path` and `system` exist for tests.
+    Linux reads ID, ID_LIKE, VARIANT_ID and PRETTY_NAME from os-release; macOS
+    uses platform.mac_ver(). 'ostree' is True on an image-based host (ostree
+    or bootc), where nothing is installed with dnf: the boot marker
+    OSTREE_MARKER exists, or rpm-ostree or bootc is on PATH, or VARIANT_ID is
+    one of IMAGE_VARIANTS. 'engine' is 'podman' or 'docker' when one is on
+    PATH, else None. `os_release_path`, `system`, `ostree_marker` and `which`
+    exist for tests.
     """
     system = system if system is not None else sys.platform
+    which = which if which is not None else shutil.which
+    engine = next((name for name in ("podman", "docker") if which(name)), None)
     if system.startswith("linux"):
         try:
             with open(os_release_path, encoding="utf-8", errors="replace") as handle:
                 fields = _parse_os_release(handle.read())
         except OSError:
             fields = {}
+        variant = fields.get("VARIANT_ID", "")
+        ostree = bool(os.path.exists(ostree_marker) or which("rpm-ostree") or which("bootc")
+                      or variant in IMAGE_VARIANTS)
         return {
             "os": "linux",
             "id": fields.get("ID", ""),
             "like": fields.get("ID_LIKE", "").split(),
             "pretty": fields.get("PRETTY_NAME", "") or fields.get("NAME", "") or "Linux",
+            "variant": variant,
+            "ostree": ostree,
+            "engine": engine,
         }
     if system == "darwin":
         release = platform_module.mac_ver()[0]
-        return {"os": "macos", "id": "macos", "like": [], "pretty": ("macOS " + release).strip()}
-    return {"os": "other", "id": system, "like": [], "pretty": system}
+        return {"os": "macos", "id": "macos", "like": [], "pretty": ("macOS " + release).strip(),
+                "variant": "", "ostree": False, "engine": engine}
+    return {"os": "other", "id": system, "like": [], "pretty": system, "variant": "", "ostree": False,
+            "engine": engine}
 
 
 def platform_family(platform):
@@ -280,6 +301,44 @@ _MEDIAINFO_PACKAGE = {
 }
 
 
+def _container_route(platform):
+    """The lines that point an image-based host at the container image (HANDOFF 8)."""
+    engine = platform.get("engine")
+    if engine:
+        engine_words = "{} is on PATH".format(engine)
+    else:
+        engine_words = "needs podman or docker, neither of which is on PATH"
+    return [
+        "  {} --build".format(PODMAN_SCRIPT),
+        "  {} check".format(PODMAN_SCRIPT),
+        "then use '{}' wherever you would use vidfunnel ({}).".format(PODMAN_SCRIPT, engine_words),
+    ]
+
+
+def _ostree_ffmpeg_hint(platform, family):
+    lines = [
+        "This is an image-based host (ostree or bootc): packages are not installed with dnf, they are",
+        "layered into the image and need a reboot. The container route needs nothing on the host:",
+    ] + _container_route(platform)
+    if family == "fedora":
+        lines += [
+            "To layer ffmpeg into the host image instead (RPM Fusion, then a reboot):",
+            "  sudo rpm-ostree install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm",
+            "  sudo rpm-ostree install ffmpeg",
+            "  systemctl reboot",
+        ]
+    return lines
+
+
+def _layered_package(platform, family, package_line, table):
+    """A par2 or mediainfo line: rpm-ostree on an image-based host, else the family's package command."""
+    if platform.get("ostree"):
+        name = (table.get("fedora") or "").split()[-1] if family == "fedora" else None
+        inside = "the container image has it; to layer it into the host: sudo rpm-ostree install {}, then reboot"
+        return ["  " + (inside.format(name) if name else "the container image has it")]
+    return [package_line]
+
+
 def install_hint(platform, missing_names):
     """The install text for the detected platform, covering only the names given. '' when none."""
     missing = set(missing_names)
@@ -287,13 +346,20 @@ def install_hint(platform, missing_names):
         return ""
     family = platform_family(platform)
     is_linux = platform.get("os") == "linux"
+    ostree = bool(platform.get("ostree"))
     sections = []
     label = platform.get("pretty") or family
     if missing.intersection(FFMPEG_ITEM_NAMES):
-        sections.append(["ffmpeg on {}:".format(label)] + _FFMPEG_HINTS[family])
+        if ostree:
+            sections.append(["ffmpeg on {}:".format(label)] + _ostree_ffmpeg_hint(platform, family))
+        else:
+            sections.append(["ffmpeg on {}:".format(label)] + _FFMPEG_HINTS[family])
     if missing.intersection(DVD_ITEM_NAMES):
         lines = ["dvdvideo (optional, IFO-driven DVD input): " + _DVD_HINTS[family]]
-        if is_linux:
+        if ostree:
+            lines.append("The container image has it:")
+            lines += _container_route(platform)
+        elif is_linux:
             lines.append(
                 "An Alpine distrobox provides it without replacing the host's ffmpeg: run '{}',".format(
                     DISTROBOX_SCRIPT)
@@ -303,11 +369,13 @@ def install_hint(platform, missing_names):
             lines.append("The repo's Containerfile (Alpine) has it.")
         sections.append(lines)
     if "par2" in missing:
-        command = _PAR2_PACKAGE.get(family)
-        sections.append(["par2 (optional, recovery sidecars):", command or "  install par2cmdline"])
+        command = _PAR2_PACKAGE.get(family) or "  install par2cmdline"
+        sections.append(["par2 (optional, recovery sidecars):"]
+                        + _layered_package(platform, family, command, _PAR2_PACKAGE))
     if "mediainfo" in missing:
-        command = _MEDIAINFO_PACKAGE.get(family)
-        sections.append(["mediainfo (optional, richer probe for odd AVI/MOV):", command or "  install mediainfo"])
+        command = _MEDIAINFO_PACKAGE.get(family) or "  install mediainfo"
+        sections.append(["mediainfo (optional, richer probe for odd AVI/MOV):"]
+                        + _layered_package(platform, family, command, _MEDIAINFO_PACKAGE))
     if "ffsubsync" in missing or "alass" in missing:
         lines = [
             "ffsubsync or alass (optional, subtitle sidecar alignment): no distro packages either.",
@@ -334,7 +402,9 @@ def format_check(result):
         for item in result.items
     ]
     widths = [max(len(row[column]) for row in rows + [headers]) for column in range(3)]
-    lines = ["platform: {} ('{}')".format(result.platform.get("pretty", ""), result.platform.get("id", ""))]
+    lines = ["platform: {} ('{}'){}".format(
+        result.platform.get("pretty", ""), result.platform.get("id", ""),
+        ", image-based host (ostree or bootc)" if result.platform.get("ostree") else "")]
 
     def format_row(row):
         return "  ".join(cell.ljust(width) for cell, width in zip(row[:3], widths)) + "  " + row[3]

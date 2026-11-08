@@ -33,11 +33,15 @@ from vidfunnel.deps import (
 HOST_FFMPEG = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"  # Homebrew puts it under /opt/homebrew
 NO_HOST_FFMPEG = "'{}' is absent; integration test skipped".format(HOST_FFMPEG)
 
-TUMBLEWEED = {"os": "linux", "id": "opensuse-tumbleweed", "like": ["opensuse", "suse"], "pretty": "openSUSE Tumbleweed"}
-FEDORA = {"os": "linux", "id": "fedora", "like": [], "pretty": "Fedora Linux 43"}
-TRIXIE = {"os": "linux", "id": "debian", "like": [], "pretty": "Debian GNU/Linux 13 (trixie)"}
-UBUNTU = {"os": "linux", "id": "ubuntu", "like": ["debian"], "pretty": "Ubuntu 24.04"}
-ARCH = {"os": "linux", "id": "arch", "like": [], "pretty": "Arch Linux"}
+TUMBLEWEED = {"os": "linux", "id": "opensuse-tumbleweed", "like": ["opensuse", "suse"], "pretty": "openSUSE Tumbleweed", "variant": "", "ostree": False, "engine": None}
+FEDORA = {"os": "linux", "id": "fedora", "like": [], "pretty": "Fedora Linux 43", "variant": "", "ostree": False, "engine": None}
+TRIXIE = {"os": "linux", "id": "debian", "like": [], "pretty": "Debian GNU/Linux 13 (trixie)", "variant": "", "ostree": False, "engine": None}
+UBUNTU = {"os": "linux", "id": "ubuntu", "like": ["debian"], "pretty": "Ubuntu 24.04", "variant": "", "ostree": False, "engine": None}
+ARCH = {"os": "linux", "id": "arch", "like": [], "pretty": "Arch Linux", "variant": "", "ostree": False, "engine": None}
+UCORE = {"os": "linux", "id": "fedora", "like": [], "pretty": "Fedora CoreOS 43 (uCore)", "variant": "coreos",
+         "ostree": True, "engine": "podman"}
+SILVERBLUE_NO_ENGINE = {"os": "linux", "id": "fedora", "like": [], "pretty": "Fedora Linux 43 (Silverblue)",
+                        "variant": "silverblue", "ostree": True, "engine": None}
 ALPINE = {"os": "linux", "id": "alpine", "like": [], "pretty": "Alpine Linux v3.24"}
 MACOS = {"os": "macos", "id": "macos", "like": [], "pretty": "macOS 15.1"}
 GENTOO = {"os": "linux", "id": "gentoo", "like": [], "pretty": "Gentoo"}
@@ -59,25 +63,25 @@ class PlatformTests(unittest.TestCase):
             'NAME="openSUSE Tumbleweed"\n# VERSION="20261020"\nID="opensuse-tumbleweed"\n'
             'ID_LIKE="opensuse suse"\nPRETTY_NAME="openSUSE Tumbleweed"\n'
         )
-        found = detect_platform(path, system="linux")
+        found = detect_platform(path, system="linux", ostree_marker=os.path.join(self.folder, "no-marker"), which=lambda name: None)
         self.assertEqual(found, TUMBLEWEED)
         self.assertEqual(platform_family(found), "opensuse")
 
     def test_unquoted_values(self):
         path = self.write_os_release("ID=fedora\nPRETTY_NAME='Fedora Linux 43'\n")
-        found = detect_platform(path, system="linux")
+        found = detect_platform(path, system="linux", ostree_marker=os.path.join(self.folder, "no-marker"), which=lambda name: None)
         self.assertEqual(found["id"], "fedora")
         self.assertEqual(found["like"], [])
         self.assertEqual(found["pretty"], "Fedora Linux 43")
 
     def test_missing_os_release(self):
-        found = detect_platform(os.path.join(self.folder, "absent"), system="linux")
+        found = detect_platform(os.path.join(self.folder, "absent"), system="linux", ostree_marker=os.path.join(self.folder, "no-marker"), which=lambda name: None)
         self.assertEqual(found["os"], "linux")
         self.assertEqual(platform_family(found), "unknown")
 
     def test_macos_and_other(self):
-        self.assertEqual(detect_platform(system="darwin")["os"], "macos")
-        self.assertEqual(detect_platform(system="freebsd13")["os"], "other")
+        self.assertEqual(detect_platform(system="darwin", which=lambda name: None)["os"], "macos")
+        self.assertEqual(detect_platform(system="freebsd13", which=lambda name: None)["os"], "other")
 
     def test_families(self):
         self.assertEqual(platform_family(FEDORA), "fedora")
@@ -218,6 +222,56 @@ class HostCheckTests(unittest.TestCase):
             code = run(argparse.Namespace(ffmpeg=HOST_FFMPEG))
         self.assertEqual(code, EXIT_OK)
         self.assertIn("h264_metadata", captured.getvalue())
+
+    def test_image_based_host_is_detected_by_marker_binary_or_variant(self):
+        import tempfile as temporary_files
+        folder = temporary_files.mkdtemp(prefix="vidfunnel-ostree-")
+        self.addCleanup(shutil.rmtree, folder)
+        release = os.path.join(folder, "os-release")
+        with open(release, "w") as handle:
+            handle.write('ID=fedora\nVARIANT_ID=coreos\nPRETTY_NAME="Fedora CoreOS 43"\n')
+        marker = os.path.join(folder, "ostree-booted")
+        nothing = lambda name: None
+        found = detect_platform(release, system="linux", ostree_marker=marker, which=nothing)
+        self.assertTrue(found["ostree"], "VARIANT_ID=coreos alone marks an image-based host")
+        self.assertEqual((found["variant"], found["engine"]), ("coreos", None))
+        with open(release, "w") as handle:
+            handle.write('ID=fedora\nPRETTY_NAME="Fedora Linux 43"\n')
+        found = detect_platform(release, system="linux", ostree_marker=marker, which=nothing)
+        self.assertFalse(found["ostree"], "plain Fedora: no marker, no binary, no image variant")
+        open(marker, "w").close()
+        found = detect_platform(release, system="linux", ostree_marker=marker, which=nothing)
+        self.assertTrue(found["ostree"], "the boot marker alone is enough")
+        os.unlink(marker)
+        found = detect_platform(release, system="linux", ostree_marker=marker,
+                                which=lambda name: "/usr/bin/" + name if name in ("bootc", "podman") else None)
+        self.assertEqual((found["ostree"], found["engine"]), (True, "podman"))
+
+    def test_image_based_host_hint_promotes_the_container_and_never_says_dnf(self):
+        text = install_hint(UCORE, ["ffmpeg", "libx264", "par2", "mediainfo", "dvdvideo"])
+        self.assertIn("image-based host", text)
+        self.assertIn("bin/vidfunnel-podman --build", text)
+        self.assertIn("bin/vidfunnel-podman check", text)
+        self.assertIn("podman is on PATH", text)
+        self.assertIn("sudo rpm-ostree install ffmpeg", text)
+        self.assertIn("rpm-ostree install par2cmdline", text)
+        self.assertIn("rpm-ostree install mediainfo", text)
+        self.assertNotIn("dnf install", text)
+        self.assertNotIn("dnf swap", text)
+        self.assertLess(text.index("vidfunnel-podman --build"), text.index("rpm-ostree install ffmpeg"),
+                        "the container route comes before layering")
+        text = install_hint(SILVERBLUE_NO_ENGINE, ["ffmpeg"])
+        self.assertIn("neither of which is on PATH", text)
+        plain = install_hint(FEDORA, ["ffmpeg", "par2"])
+        self.assertIn("dnf swap ffmpeg-free ffmpeg", plain)
+        self.assertNotIn("rpm-ostree", plain)
+
+    def test_platform_line_names_an_image_based_host(self):
+        from vidfunnel.deps import CheckResult, format_check
+        text = format_check(CheckResult([Item("ffmpeg", True, False, "not found")], False, UCORE, None))
+        self.assertIn("platform: Fedora CoreOS 43 (uCore) ('fedora'), image-based host (ostree or bootc)", text)
+        text = format_check(CheckResult([Item("ffmpeg", True, False, "not found")], False, FEDORA, None))
+        self.assertNotIn("image-based", text)
 
     def test_require_returns_tools(self):
         tools = require(argparse.Namespace(ffmpeg=HOST_FFMPEG))
