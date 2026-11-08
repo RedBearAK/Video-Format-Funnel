@@ -12,6 +12,8 @@ import os
 import shutil
 import tempfile
 import unittest
+import unittest.mock
+from pathlib import Path
 
 from vidfunnel.cli import EXIT_DEPS, EXIT_OK
 from vidfunnel.deps import (
@@ -220,6 +222,34 @@ class HostCheckTests(unittest.TestCase):
     def test_require_returns_tools(self):
         tools = require(argparse.Namespace(ffmpeg=HOST_FFMPEG))
         self.assertEqual(tools.ffmpeg, HOST_FFMPEG)
+
+    def test_require_reads_the_capability_cache_and_check_refreshes_it(self):
+        import vidfunnel.ffmpeg
+        from vidfunnel.ffmpeg import clear_capabilities_cache
+        cache_dir = Path(tempfile.mkdtemp(prefix="vidfunnel-capcache-"))
+        self.addCleanup(shutil.rmtree, str(cache_dir))
+        real_run = vidfunnel.ffmpeg.run
+        listing_calls = []
+
+        def counting(argv, *rest, **options):
+            if len(argv) >= 2 and argv[1] == "-hide_banner":
+                listing_calls.append(list(argv))
+            return real_run(argv, *rest, **options)
+
+        with unittest.mock.patch("vidfunnel.ffmpeg.CAPABILITIES_CACHE_DIR", cache_dir), \
+                unittest.mock.patch("vidfunnel.ffmpeg.run", side_effect=counting), \
+                contextlib.redirect_stdout(io.StringIO()):
+            clear_capabilities_cache()
+            self.addCleanup(clear_capabilities_cache)
+            require(argparse.Namespace(ffmpeg=HOST_FFMPEG))
+            first = len(listing_calls)
+            self.assertGreater(first, 0, "a cold cache is filled by querying")
+            clear_capabilities_cache()
+            require(argparse.Namespace(ffmpeg=HOST_FFMPEG))
+            self.assertEqual(len(listing_calls), first, "a warm cache means no listing calls from require()")
+            clear_capabilities_cache()
+            run(argparse.Namespace(ffmpeg=HOST_FFMPEG))
+            self.assertEqual(len(listing_calls), 2 * first, "check always queries again")
 
 
 if __name__ == "__main__":

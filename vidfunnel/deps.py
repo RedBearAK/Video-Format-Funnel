@@ -133,8 +133,13 @@ def _ffprobe_version(ffprobe):
     return None, "'{}' -version printed no version".format(ffprobe)
 
 
-def check_dependencies(ffmpeg_path=None, platform=None):
-    """Build the required/optional table for this machine. Returns CheckResult."""
+def check_dependencies(ffmpeg_path=None, platform=None, refresh=False):
+    """Build the required/optional table for this machine. Returns CheckResult.
+
+    `refresh` re-queries ffmpeg's capability listings and rewrites their
+    on-disk cache; 'check' passes it, require() (every other stage) reads
+    the cache.
+    """
     platform = platform if platform is not None else detect_platform()
     items = []
     ffmpeg = None
@@ -147,7 +152,7 @@ def check_dependencies(ffmpeg_path=None, platform=None):
         items.append(Item("ffmpeg", True, False, str(error)))
     if ffmpeg is not None:
         try:
-            caps = capabilities(Tools(ffmpeg, None), refresh=True)
+            caps = capabilities(Tools(ffmpeg, None), refresh=refresh)
         except (FfmpegError, ToolNotFound) as error:
             items.append(Item("ffmpeg", True, False, "'{}' could not be queried: {}".format(ffmpeg, error)))
     if caps is not None:
@@ -370,7 +375,7 @@ def add_arguments(parser):
 
 def run(args):
     """`vidfunnel check`: print the table and the hint; EXIT_OK when every required item is present."""
-    result = check_dependencies(getattr(args, "ffmpeg", None))
+    result = check_dependencies(getattr(args, "ffmpeg", None), refresh=True)
     print(format_check(result))
     hint = install_hint(result.platform, missing_names(result))
     if hint:
