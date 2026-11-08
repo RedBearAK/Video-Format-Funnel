@@ -376,7 +376,9 @@ def install_hint(platform, missing_names):
         command = _MEDIAINFO_PACKAGE.get(family) or "  install mediainfo"
         sections.append(["mediainfo (optional, richer probe for odd AVI/MOV):"]
                         + _layered_package(platform, family, command, _MEDIAINFO_PACKAGE))
-    if "ffsubsync" in missing or "alass" in missing:
+    # ffsubsync and alass do the same optional job (--subsync); one present is enough, so advice
+    # appears only when both are missing.
+    if "ffsubsync" in missing and "alass" in missing:
         lines = [
             "ffsubsync or alass (optional, subtitle sidecar alignment): no distro packages either.",
             "ffsubsync installs with pip into a venv:",

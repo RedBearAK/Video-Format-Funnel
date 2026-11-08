@@ -138,6 +138,8 @@ class InstallHintTests(unittest.TestCase):
         text = install_hint(TRIXIE, ["ffsubsync", "alass"])
         self.assertIn("pip install ffsubsync", text)
         self.assertIn("alass-cli", text)
+        self.assertEqual(install_hint(TRIXIE, ["alass"]), "", "ffsubsync present: alass is an alternative, no advice")
+        self.assertEqual(install_hint(TRIXIE, ["ffsubsync"]), "", "alass present: nothing to add")
 
     def test_unknown_platform_still_says_what_is_needed(self):
         text = install_hint(GENTOO, ["libx264"])
