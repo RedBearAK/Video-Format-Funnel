@@ -345,11 +345,33 @@ def _warn(message):
 
 # Files a container runtime leaves in the container's root: podman's and Docker's.
 CONTAINER_MARKERS = ("/run/.containerenv", "/.dockerenv")
+TAKEOVER_FILE = "lock.takeover"  # the regular file the takeover flock is taken on, beside the lock
 
 
 def in_container():
     """True when this process runs inside a podman or Docker container (one of CONTAINER_MARKERS exists)."""
     return any(os.path.exists(marker) for marker in CONTAINER_MARKERS)
+
+
+MACHINE_ID_FILES = ("/etc/machine-id", "/proc/sys/kernel/random/boot_id")
+
+
+def machine_id():
+    """An identity of this machine (and boot) for the lock file: /etc/machine-id, else the kernel boot id, else None.
+
+    Two machines on one share may carry the same host name (fresh installs,
+    images); a pid is judged alive or dead only when the lock was written on
+    this very machine, which the host name alone cannot tell.
+    """
+    for path in MACHINE_ID_FILES:
+        try:
+            with open(path, encoding="ascii", errors="replace") as handle:
+                value = handle.read().strip()
+        except OSError:
+            continue
+        if value:
+            return value
+    return None
 
 
 def pid_alive(pid):
@@ -393,7 +415,7 @@ def _unjudged_reason(host, holder_in_container, ours, pid):
 class FolderLock:
     """Context manager holding '.vidfunnel/lock' for one folder.
 
-    The lock file holds host (socket.gethostname()), pid, started (ISO time)
+    The lock file holds host (socket.gethostname()), machine (machine_id()), pid, started (ISO time)
     and container (True when this run is inside a container: '/run/.containerenv'
     or '/.dockerenv' exists). Every lock is taken over, with a warning, once
     it is 24 h old (stale_seconds); younger ones raise LockHeld. The pid
@@ -413,15 +435,16 @@ class FolderLock:
 
     The lock file is only ever created with O_CREAT | O_EXCL, so of several
     runs that find no lock, one creates it and the others raise LockHeld
-    naming it. Takeovers are serialised by flock() on the '.vidfunnel'
-    directory, which the kernel releases when its holder exits: inside it a
-    run reads and judges the lock, checks that the file is still the one it
-    judged (inode, mtime, size and content), unlinks it and creates its own
-    with O_EXCL; a run that gets the flock after it then judges the new,
-    live lock and raises LockHeld. Where the file system refuses flock() on
-    a directory (some network file systems), the takeover runs without it
-    and only that check and the O_EXCL create guard it. The lock file is
-    removed on exit, including on exception, if it is still ours.
+    naming it. Takeovers are serialised by flock() on the regular file
+    '.vidfunnel/lock.takeover' (else on the directory), which the kernel
+    releases when its holder exits: inside it a run reads and judges the
+    lock, checks that the file is still the one it judged (inode, mtime,
+    size and content), unlinks it and creates its own with O_EXCL; a run
+    that gets the flock after it then judges the new, live lock and raises
+    LockHeld. Where the file system refuses flock() on both, the takeover
+    runs without it and only that check and the O_EXCL create guard it (two
+    racers can then both get in). The lock file is removed on exit, including
+    on exception, if it is still ours.
     """
 
     def __init__(self, folder, warn=None, stale_seconds=LOCK_STALE_SECONDS):
@@ -438,7 +461,9 @@ class FolderLock:
         except RecordError:
             data = {}
         if data is None:
-            return None, None
+            if not self.path.exists():
+                return None, None
+            data = {}  # a lock file holding JSON null is judged by its age like any other unreadable one
         if not isinstance(data, dict):
             data = {}
         started = data.get("started")
@@ -465,16 +490,27 @@ class FolderLock:
 
     @contextlib.contextmanager
     def _takeover_guard(self):
-        """Hold flock(LOCK_EX) on the record directory while one takeover runs; see the class docstring."""
+        """Hold flock(LOCK_EX) while one takeover runs; see the class docstring.
+
+        The flock is taken on the regular file '.vidfunnel/lock.takeover'
+        (created if absent; it stays, empty), which more file systems support
+        than a flock on a directory, NFS among them; the directory is the
+        second choice. When neither works the takeover runs unguarded, with
+        only the identity re-check and the O_EXCL create protecting it.
+        """
         handle = None
         if fcntl is not None:
-            try:
-                handle = os.open(str(record_dir(self.folder)), os.O_RDONLY)
-                fcntl.flock(handle, fcntl.LOCK_EX)
-            except OSError:
-                if handle is not None:
-                    os.close(handle)
-                handle = None
+            targets = ((str(record_dir(self.folder) / TAKEOVER_FILE), os.O_RDWR | os.O_CREAT),
+                       (str(record_dir(self.folder)), os.O_RDONLY))
+            for target, flags in targets:
+                try:
+                    handle = os.open(target, flags, 0o644)
+                    fcntl.flock(handle, fcntl.LOCK_EX)
+                    break
+                except OSError:
+                    if handle is not None:
+                        os.close(handle)
+                    handle = None
         try:
             yield
         finally:
@@ -505,7 +541,7 @@ class FolderLock:
     def acquire(self):
         record_dir(self.folder).mkdir(parents=True, exist_ok=True)
         content = {"host": socket.gethostname(), "pid": os.getpid(), "started": now_iso(),
-                   "container": in_container()}
+                   "container": in_container(), "machine": machine_id()}
         try:
             self._create(content)
         except FileExistsError:
@@ -530,7 +566,9 @@ class FolderLock:
             holder_in_container = holder.get("container") is True
             holder_words = "a container run on host" if holder_in_container else "host"
             liveness = None
-            if host == content["host"] and holder_in_container == content["container"] and pid != content["pid"]:
+            same_machine = content["machine"] is not None and holder.get("machine") == content["machine"]
+            if (host == content["host"] and same_machine and holder_in_container == content["container"]
+                    and pid != content["pid"]):
                 liveness = pid_alive(pid)
             if liveness is False:
                 warning = ("warning: taking over lock '{}': its holder, host '{}' pid {}, no longer runs "
@@ -538,6 +576,9 @@ class FolderLock:
             elif age < self.stale_seconds:
                 if liveness is True:
                     why = "its pid {} is running here; taken over once 24 h old".format(pid)
+                elif host == content["host"] and not same_machine:
+                    why = ("written on another machine with this host name (or before the machine id was "
+                           "recorded), whose pid cannot be checked from here; taken over once 24 h old")
                 else:
                     why = _unjudged_reason(host, holder_in_container, content, pid)
                 raise self._held(holder, age, why)

@@ -242,8 +242,15 @@ def main(argv=None):
         return _report_interrupt(error)
     finally:
         if previous is not None:
-            signal.signal(signal.SIGTERM, previous)
-            _reset_after_sigterm()
+            while True:
+                # A SIGTERM landing here, before the previous handler is back, raises Terminated
+                # inside this finally; dispatch has already returned, so it is swallowed and retried.
+                try:
+                    signal.signal(signal.SIGTERM, previous)
+                    _reset_after_sigterm()
+                    break
+                except Terminated:
+                    continue
 
 
 def _report_interrupt(error):

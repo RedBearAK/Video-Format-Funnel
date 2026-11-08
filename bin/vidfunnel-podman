@@ -335,7 +335,27 @@ sh_install_command() {
 if [ -n "${install_mode}" ]; then
     [ -f "${root}/vidfunnel/installer.py" ] || die "the repo's installer '${root}/vidfunnel/installer.py' is missing"
     if host_python_ok; then
-        exec env PYTHONPATH="${root}${PYTHONPATH:+:$PYTHONPATH}" python3 -m vidfunnel "$@" --launcher "${wrapper}"
+        # Our --launcher goes first, so a trailing subcommand word ('--install-command check')
+        # still parses; a --launcher the user gave is dropped, since this wrapper is the launcher.
+        count=$#
+        i=0
+        skip_value=0
+        while [ "${i}" -lt "${count}" ]; do
+            arg="$1"
+            shift
+            if [ "${skip_value}" -eq 1 ]; then
+                skip_value=0
+            elif is_option_prefix "${arg}" "--launcher" "--l"; then
+                skip_value=1
+            else
+                case "${arg}" in
+                    --*=*) is_option_prefix "${arg%%=*}" "--launcher" "--l" || set -- "$@" "${arg}" ;;
+                    *) set -- "$@" "${arg}" ;;
+                esac
+            fi
+            i=$((i + 1))
+        done
+        exec env PYTHONPATH="${root}${PYTHONPATH:+:$PYTHONPATH}" python3 -m vidfunnel --launcher "${wrapper}" "$@"
     fi
     say "No python3 of 3.9 or newer on the host; using the wrapper's own installer (it edits no shell startup file)."
     sh_install_command "$@"

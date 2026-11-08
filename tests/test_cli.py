@@ -138,6 +138,25 @@ class SigtermTests(unittest.TestCase):
         with unittest.mock.patch.object(cli, "dispatch", side_effect=dispatch):
             return run_main(["check"])
 
+    def test_sigterm_while_the_handler_is_being_restored_still_returns(self):
+        # A SIGTERM landing inside main()'s finally, before the previous handler is back, used to
+        # escape main() as an uncaught Terminated.
+        real_signal = signal.signal
+        fired = []
+
+        def late_sigterm(signum, handler):
+            if signum == signal.SIGTERM and handler is not cli._on_sigterm and not fired:
+                fired.append(True)
+                os.kill(os.getpid(), signal.SIGTERM)
+            return real_signal(signum, handler)
+
+        with unittest.mock.patch.object(cli.signal, "signal", side_effect=late_sigterm):
+            code, _out, err = self.run_with_dispatch(lambda args: 0)
+        self.assertEqual(fired, [True])
+        self.assertEqual(code, cli.EXIT_OK, err)
+        self.assertIs(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+        self.assertFalse(cli._terminating)
+
     def test_handler_is_installed_during_the_command_and_removed_after(self):
         seen = []
         code, _out, err = self.run_with_dispatch(lambda args: seen.append(signal.getsignal(signal.SIGTERM)) or 0)

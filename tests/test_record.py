@@ -17,6 +17,7 @@ from unittest import mock
 from pathlib import Path
 
 from vidfunnel.record import (
+    machine_id,
     FOLDER_FILE,
     LOCK_NAME,
     RECORD_DIR,
@@ -332,7 +333,7 @@ class FolderLockTests(TempDirCase):
         with FolderLock(self.base):
             content = json.loads(self.lock_file().read_text(encoding="utf-8"))
             self.assertEqual(content["pid"], os.getpid())
-            self.assertEqual(sorted(content), ["container", "host", "pid", "started"])
+            self.assertEqual(sorted(content), ["container", "host", "machine", "pid", "started"])
             with self.assertRaises(LockHeld) as caught:
                 with FolderLock(self.base):
                     pass
@@ -363,11 +364,15 @@ class FolderLockTests(TempDirCase):
         self.assertEqual(caught.exception.host, "otherhost")
         self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), foreign)
 
-    def write_lock(self, host, pid, hours_ago, container=None):
+    def write_lock(self, host, pid, hours_ago, container=None, machine="this"):
         started = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours_ago)
         content = {"host": host, "pid": pid, "started": started.strftime("%Y-%m-%dT%H:%M:%SZ")}
         if container is not None:
             content["container"] = container
+        if machine == "this":
+            machine = machine_id()
+        if machine is not None:
+            content["machine"] = machine
         write_bytes(self.lock_file(), json.dumps(content).encode("utf-8"))
         return content
 
@@ -376,6 +381,59 @@ class FolderLockTests(TempDirCase):
         child = subprocess.Popen([sys.executable, "-c", "pass"])
         child.wait()
         return child.pid
+
+    def test_null_lock_file_is_judged_by_age_and_never_loops(self):
+        # A lock file holding JSON null once sent acquire() into an endless loop (the base crashed on it).
+        script = ("import sys; from vidfunnel.record import FolderLock, LockHeld\n"
+                  "try:\n"
+                  "    with FolderLock(sys.argv[1], warn=lambda line: print('WARN', line)):\n"
+                  "        print('ACQUIRED')\n"
+                  "except LockHeld as held:\n"
+                  "    print('HELD', held)\n")
+        write_bytes(self.lock_file(), b"null")
+        result = subprocess.run([sys.executable, "-c", script, str(self.base)], capture_output=True,
+                                universal_newlines=True, timeout=20, env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("HELD", result.stdout, "a fresh unreadable lock is respected by age")
+        old = (datetime.datetime.now() - datetime.timedelta(hours=25)).timestamp()
+        os.utime(str(self.lock_file()), (old, old))
+        result = subprocess.run([sys.executable, "-c", script, str(self.base)], capture_output=True,
+                                universal_newlines=True, timeout=20, env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ACQUIRED", result.stdout, "an old unreadable lock is taken over")
+        self.assertIn("stale lock", result.stdout)
+
+    def test_dead_pid_from_another_machine_with_this_host_name_is_not_judged(self):
+        dead = self.finished_pid()
+        self.write_lock(socket.gethostname(), dead, 0.5, container=False, machine="another-machine-id")
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with self.assertRaises(LockHeld) as held:
+                FolderLock(self.base, warn=lambda line: None).acquire()
+        self.assertIn("another machine with this host name", str(held.exception))
+        self.write_lock(socket.gethostname(), dead, 0.5, container=False, machine=None)
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with self.assertRaises(LockHeld):
+                FolderLock(self.base, warn=lambda line: None).acquire()
+
+    def test_takeover_flock_is_taken_on_a_regular_file(self):
+        dead = self.finished_pid()
+        self.write_lock(socket.gethostname(), dead, 0.5, container=False)
+        opened = []
+        real_open = os.open
+
+        def recording_open(path, flags, *rest):
+            opened.append(str(path))
+            return real_open(path, flags, *rest)
+
+        with mock.patch("vidfunnel.record.in_container", return_value=False), \
+                mock.patch("vidfunnel.record.os.open", side_effect=recording_open):
+            with FolderLock(self.base, warn=lambda line: None):
+                pass
+        takeover = str(self.lock_file().parent / "lock.takeover")
+        self.assertIn(takeover, opened, "the flock is taken on the regular takeover file")
+        last_create = len(opened) - 1 - opened[::-1].index(str(self.lock_file()))
+        self.assertLess(opened.index(takeover), last_create, "the guard is held before our lock file is created")
+        self.assertTrue(Path(takeover).exists())
 
     def test_dead_holder_on_this_host_is_taken_over_at_once(self):
         dead = self.finished_pid()
@@ -525,7 +583,7 @@ class FolderLockTests(TempDirCase):
         seen = []
 
         def probe_flock(pid):
-            handle = os.open(str(self.base / RECORD_DIR), os.O_RDONLY)
+            handle = os.open(str(self.base / RECORD_DIR / "lock.takeover"), os.O_RDWR | os.O_CREAT, 0o644)
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 seen.append("free")

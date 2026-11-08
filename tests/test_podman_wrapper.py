@@ -301,6 +301,13 @@ class InstallScanTests(WrapperTestCase):
         self.assertEqual(self.engine_argv()[-1], "--u")
         self.assertEqual(os.readlink(str(self.user_link)), str(WRAPPER))
 
+    def test_install_option_before_a_subcommand_word_installs_on_the_host(self):
+        # '--launcher' is passed before the user's arguments, so a trailing subcommand word still parses.
+        code, output = self.run_wrapper("--install-command", "--yes", "check")
+        self.assertEqual(code, 0, output)
+        self.assertTrue(self.user_link.is_symlink(), output)
+        self.assertFalse(self.engine_log.exists(), "no container run for an install")
+
     def test_install_option_after_the_subcommand_goes_to_the_container(self):
         code, output = self.run_wrapper("check", "--install-command")
         self.assertEqual(code, 0, output)
