@@ -73,7 +73,8 @@ SUBCOMMANDS = (
     ("stop-all", "vidfunnel.stopfile", "add_arguments", "run",
      "ask every plan, convert, verify and retire run under PATH, on every host, to finish its current items "
      "and start no more "
-     "(--now: stop at once); lifted by 'resume'"),
+     "(--now: stop at the next item or child process start, never discarding a finished encode); "
+     "lifted by 'resume'"),
     ("resume", "vidfunnel.stopfile", "add_resume_arguments", "run_resume",
      "remove the stop file 'stop-all' wrote under PATH, so runs can start there again"),
 )
@@ -389,11 +390,13 @@ def _reset_after_sigterm():
     So a later main() in this process starts clean.
     """
     global _terminating, _stop_signal
-    from vidfunnel.interrupt import drain_tally, draining, interrupted
+    from vidfunnel.interrupt import drain_tally, draining, interrupted, stopped_by_file, stopped_by_signal
     from vidfunnel.stopfile import reset as reset_stop_files
     import vidfunnel.stopfile
     if _terminating or vidfunnel.stopfile.stopped_now:  # both set the interrupt event through stop_workers()
         interrupted.clear()
+        stopped_by_file.clear()
+        stopped_by_signal.clear()
         _terminating = False
         _stop_signal = None
     draining.clear()

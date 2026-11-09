@@ -1334,6 +1334,244 @@ class Par2StandInTest(unittest.TestCase):
         self.assertFalse(self.marker.exists(), "par2 was started under a 'now' stop file")
 
 
+FIRST_NAME = "first_harbour.mkv"     # a copy of SUBTITLE_SOURCE: one subtitle sidecar after its encode
+SECOND_NAME = "second_meadow.mkv"    # a copy of REMUX_SOURCE
+FIRST_REFIT = "first_harbour.avi"    # copies of REFIT_SOURCE, which re-encodes larger than its source
+SECOND_REFIT = "second_meadow.avi"
+
+
+@unittest.skipIf(TOOLS is None or shutil.which("par2") is None,
+                 "ffmpeg or par2 not found on PATH; stop-file-after-encode tests skipped")
+class NowStopFileAfterEncodeTest(unittest.TestCase):
+    """A 'stop-all --now' file written once an item's main encode has returned: the sidecars, PAR2 and the
+    record of that item are kept, and the run stops before the next item."""
+
+    def setUp(self):
+        import vidfunnel.interrupt
+        import vidfunnel.stopfile
+        missing = [name for name in (SUBTITLE_SOURCE, REMUX_SOURCE, REFIT_SOURCE)
+                   if not os.path.exists(os.path.join(FIXTURE_DIR, name))]
+        if missing:
+            self.skipTest("fixtures missing ({}); run tests/make_fixtures.sh".format(", ".join(missing)))
+        for flag in (vidfunnel.interrupt.interrupted, vidfunnel.interrupt.draining):
+            flag.clear()
+            self.addCleanup(flag.clear)
+        vidfunnel.stopfile.reset()
+        self.addCleanup(vidfunnel.stopfile.reset)
+        holder = tempfile.TemporaryDirectory(prefix="vidfunnel-now-after-encode-")
+        self.addCleanup(holder.cleanup)
+        self.root = Path(holder.name) / "library"
+        self.root.mkdir()
+
+    def copy(self, fixture, name):
+        shutil.copy2(os.path.join(FIXTURE_DIR, fixture), str(self.root / name))
+
+    def write_now_file(self):
+        from vidfunnel.record import _write_json_atomic
+        import vidfunnel.stopfile
+        _write_json_atomic(vidfunnel.stopfile.stop_path(str(self.root)),
+                           {"host": "elsewhere", "requested": None, "mode": "now"})
+
+    def main_with_now_file_after_first_encode(self, argv):
+        """cli.main(argv) with the now-file written as the first encode (vidfunnel.encode.run_tool) returns."""
+        from vidfunnel import cli
+        calls = []
+
+        def run_tool(*args, **kwargs):
+            result = ffmpeg_run(*args, **kwargs)
+            calls.append(list(args[0]))
+            if len(calls) == 1:
+                self.write_now_file()
+            return result
+
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=run_tool), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(argv)
+        return code, calls, out.getvalue() + err.getvalue()
+
+    def test_convert_keeps_the_finished_encode_its_sidecar_and_par2_and_stops_before_the_next_item(self):
+        self.copy(SUBTITLE_SOURCE, FIRST_NAME)
+        self.copy(REMUX_SOURCE, SECOND_NAME)
+        plan_paths(TOOLS, [str(self.root)], make_options(), progress=quiet())
+        planned = load_record(self.root / FIRST_NAME)
+        self.assertEqual(planned["status"], "planned")
+        sidecar_names = [Path(entry["path"]).name for entry in planned["stages"]["plan"].get("sidecars") or []]
+        self.assertTrue(sidecar_names, "the subtitle fixture no longer plans a sidecar; pick another")
+
+        code, calls, text = self.main_with_now_file_after_first_encode(["convert", "--par2", "5", str(self.root)])
+        self.assertEqual(code, 1, text)
+        self.assertIn("stopped (a stop file asked for it)", text)
+        self.assertGreaterEqual(len(calls), 1 + len(sidecar_names), "the sidecars were not started\n" + text)
+        first = load_record(self.root / FIRST_NAME)
+        self.assertEqual(first["status"], "converted", text)  # saved; the stop applies again at verify's first child
+        stage = first["stages"]["convert"]
+        self.assertEqual(stage["outcome"], "ok", stage)
+        self.assertEqual(stage["sidecars_written"], sidecar_names, stage)
+        for name in sidecar_names:
+            self.assertTrue((self.root / name).is_file(), name)
+        output = self.root / stage["output_path"]
+        self.assertTrue(output.is_file())
+        self.assertEqual((stage["par2_files"] or [None])[0], output.name + ".par2", stage)
+        for name in stage["par2_files"]:
+            self.assertTrue((self.root / name).is_file(), name)
+        self.assertEqual(first["output"]["size"], output.stat().st_size)
+
+        second = load_record(self.root / SECOND_NAME)
+        self.assertEqual(second["status"], "planned", "the item after the stop was started\n" + text)
+        self.assertNotIn("convert", second.get("stages") or {})
+        self.assertFalse((self.root / "second_meadow.mp4").exists())
+        self.assertEqual([name for name in os.listdir(str(self.root)) if name.endswith(".part")], [])
+
+    def test_refit_keeps_the_finished_refit_and_its_par2_and_stops_before_the_next_item(self):
+        self.copy(REFIT_SOURCE, FIRST_REFIT)
+        self.copy(REFIT_SOURCE, SECOND_REFIT)
+        plan_paths(TOOLS, [str(self.root)], make_options(reencode_video=True), progress=quiet())
+        convert_paths(TOOLS, [str(self.root)], convert_options(par2=5), quiet())
+        for name in (FIRST_REFIT, SECOND_REFIT):
+            record = load_record(self.root / name)
+            self.assertIn("output-larger", record["flags"], "the fixture no longer re-encodes larger; pick another")
+        second_before = load_record(self.root / SECOND_REFIT)
+        second_output = self.root / "second_meadow.mp4"
+        second_bytes = sha256_of(second_output)
+        first_output = self.root / "first_harbour.mp4"
+        first_before = first_output.stat().st_size
+
+        code, calls, text = self.main_with_now_file_after_first_encode(["convert", "--refit", str(self.root)])
+        self.assertEqual(code, 1, text)
+        self.assertIn("stopped (a stop file asked for it)", text)
+        self.assertEqual(len(calls), 1, text)
+        first = load_record(self.root / FIRST_REFIT)
+        refit = first["stages"]["refit"]
+        self.assertEqual(refit["outcome"], "replaced", refit)
+        self.assertEqual(first["status"], "converted", text)  # saved; the stop applies again at verify's first child
+        self.assertEqual(first["output"]["size"], first_output.stat().st_size)
+        self.assertLess(first_output.stat().st_size, first_before)
+        self.assertEqual((refit.get("par2_files") or [None])[0], first_output.name + ".par2", refit)
+        for name in refit["par2_files"]:
+            self.assertTrue((self.root / name).is_file(), name)
+        self.assertNotIn("par2-stale", first["flags"])
+
+        second = load_record(self.root / SECOND_REFIT)
+        self.assertNotIn("refit", second.get("stages") or {}, "the item after the stop was started\n" + text)
+        self.assertEqual(second["status"], second_before["status"])
+        self.assertEqual(sha256_of(second_output), second_bytes)
+        self.assertEqual([name for name in os.listdir(str(self.root)) if name.endswith(".part")], [])
+
+    def test_convert_with_jobs_keeps_a_finished_encode_when_another_worker_finds_the_now_file(self):
+        """--jobs 2: the now-file is written as the first encode returns; the second worker finds it at its
+        own encode start while the first item's PAR2 runs. That par2 is not stopped, the first item's record
+        is saved 'converted' with its PAR2, and the second item is never started."""
+        import threading
+        import time
+        import vidfunnel.ffmpeg
+        real_par2 = shutil.which("par2")
+        fake_bin = self.root.parent / "slow_bin"
+        fake_bin.mkdir()
+        wrapper = fake_bin / "par2"
+        # par2 that waits a second before it works, so the stop lands while it runs.
+        wrapper.write_text("#!/bin/sh\nsleep 1\nexec '{}' \"$@\"\n".format(real_par2))
+        os.chmod(str(wrapper), 0o755)
+        self.copy(REMUX_SOURCE, FIRST_NAME)
+        self.copy(REMUX_SOURCE, SECOND_NAME)
+        plan_paths(TOOLS, [str(self.root)], make_options(), progress=quiet())
+        for name in (FIRST_NAME, SECOND_NAME):
+            self.assertEqual(load_record(self.root / name)["status"], "planned")
+
+        lock = threading.Lock()
+        encodes = []
+        first_written = threading.Event()
+        problems = []
+
+        def finishing_par2_running():
+            with vidfunnel.ffmpeg._children_lock:
+                return any("par2" in os.path.basename(str(process.args[0]))
+                           for process in vidfunnel.ffmpeg._finishing_children)
+
+        def run_tool(argv, *rest, **values):
+            if not str(argv[-1]).endswith(".part"):
+                return ffmpeg_run(argv, *rest, **values)
+            with lock:
+                order = len(encodes)
+                encodes.append(str(argv[-1]))
+            if order == 0:
+                result = ffmpeg_run(argv, *rest, **values)
+                self.write_now_file()
+                first_written.set()
+                return result
+            deadline = time.monotonic() + 60
+            while not (first_written.is_set() and finishing_par2_running()):
+                if time.monotonic() > deadline:
+                    problems.append("the first item's par2 was not seen running within 60 s")
+                    break
+                time.sleep(0.01)
+            return ffmpeg_run(argv, *rest, **values)  # its stop file check finds 'now'
+
+        from vidfunnel import cli
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=run_tool), \
+                unittest.mock.patch.dict(os.environ, {"PATH": "{}:{}".format(fake_bin, os.environ.get("PATH", ""))}), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(["convert", "--jobs", "2", "--par2", "5", str(self.root)])
+        text = out.getvalue() + err.getvalue()
+        self.assertEqual(problems, [], text)
+        self.assertEqual(code, 1, text)
+        self.assertIn("stopped (a stop file asked for it)", text)
+        self.assertEqual(len(encodes), 2, text)
+        records = {name: load_record(self.root / name) for name in (FIRST_NAME, SECOND_NAME)}
+        finished = [name for name, record in records.items() if record["status"] != "planned"]
+        self.assertEqual(len(finished), 1, text)
+        first = records[finished[0]]
+        self.assertEqual(first["status"], "converted", text)  # saved; the stop applied again at its verify
+        stage = first["stages"]["convert"]
+        self.assertEqual(stage["outcome"], "ok", stage)
+        self.assertNotIn("par2-failed", first.get("flags") or [], stage)
+        output = self.root / stage["output_path"]
+        self.assertTrue(output.is_file())
+        self.assertEqual(first["output"]["size"], output.stat().st_size)
+        self.assertEqual((stage["par2_files"] or [None])[0], output.name + ".par2", stage)
+        for name in stage["par2_files"]:
+            self.assertTrue((self.root / name).is_file(), name)
+
+        second_name = SECOND_NAME if finished[0] == FIRST_NAME else FIRST_NAME
+        second = records[second_name]
+        self.assertNotIn("convert", second.get("stages") or {}, text)
+        self.assertFalse((self.root / (Path(second_name).stem + ".mp4")).exists(), text)
+        self.assertEqual([name for name in os.listdir(str(self.root)) if name.endswith(".part")], [])
+
+    def test_a_now_file_seen_before_the_main_encode_still_stops_at_that_child_start(self):
+        """Written after the item's start check (check_item, as the loops call it): the encode is not started."""
+        import vidfunnel.stopfile
+        self.copy(SUBTITLE_SOURCE, FIRST_NAME)
+        plan_paths(TOOLS, [str(self.root)], make_options(), progress=quiet())
+        record = load_record(self.root / FIRST_NAME)
+        self.assertIsNone(vidfunnel.stopfile.check_item(str(self.root)))
+        self.write_now_file()
+        with unittest.mock.patch("sys.stderr", io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                convert_one(TOOLS, self.root / FIRST_NAME, record, convert_options(), progress=quiet())
+        self.assertEqual(load_record(self.root / FIRST_NAME)["status"], "planned")
+        self.assertFalse((self.root / "first_harbour.mp4").exists())
+        self.assertEqual([name for name in os.listdir(str(self.root)) if name.endswith((".part", ".srt"))], [])
+
+    def test_a_now_file_seen_before_the_refit_encode_still_stops_at_that_child_start(self):
+        import vidfunnel.stopfile
+        self.copy(REFIT_SOURCE, FIRST_REFIT)
+        plan_paths(TOOLS, [str(self.root)], make_options(reencode_video=True), progress=quiet())
+        convert_paths(TOOLS, [str(self.root)], convert_options(), quiet())
+        output = self.root / "first_harbour.mp4"
+        before = sha256_of(output)
+        key = self.root / FIRST_REFIT
+        self.assertIsNone(vidfunnel.stopfile.check_item(str(self.root)))
+        self.write_now_file()
+        with unittest.mock.patch("sys.stderr", io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                refit_one(TOOLS, key, load_record(key), convert_options(refit=True), quiet())
+        self.assertNotIn("refit", load_record(key).get("stages") or {})
+        self.assertEqual(sha256_of(output), before)
+        self.assertEqual([name for name in os.listdir(str(self.root)) if name.endswith(".part")], [])
+
+
 class LineStreamPipeTest(unittest.TestCase):
     def test_a_tagged_line_stream_over_a_closed_pipe_ends_quietly(self):
         """The reader of stdout is gone: the lines are dropped and the run exits 0, without Python's

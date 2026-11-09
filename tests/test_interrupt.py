@@ -261,6 +261,93 @@ class ChildRegistryTests(unittest.TestCase):
         self.assertEqual(process.wait(5), -signal.SIGTERM)
 
 
+class FinishingTests(unittest.TestCase):
+    """A 'now' stop file spares a thread whose item has finished its encode; Ctrl+C and the signals do not."""
+
+    def setUp(self):
+        vidfunnel.interrupt._clear_stop()
+        self.addCleanup(vidfunnel.interrupt._clear_stop)
+        self.sleeper = shutil.which("sleep")
+        if self.sleeper is None:
+            self.skipTest("'sleep' not on PATH; finishing tests skipped")
+
+    def on_thread(self, action, finishing):
+        """action() on a new thread, finishing or not; returns what it returned or the exception it raised."""
+        outcome = []
+
+        def worker():
+            if finishing:
+                vidfunnel.interrupt.begin_finishing()
+            try:
+                outcome.append(action())
+            except BaseException as error:  # recorded for the assertions
+                outcome.append(error)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        return outcome[0]
+
+    def sleeping_child(self, finishing):
+        process = subprocess.Popen([self.sleeper, "30"])
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        self.addCleanup(vidfunnel.ffmpeg.forget_child, process)
+        self.on_thread(lambda: vidfunnel.ffmpeg.register_child(process), finishing)
+        return process
+
+    def test_a_stop_file_spares_the_children_of_a_finishing_thread(self):
+        spared_child = self.sleeping_child(finishing=True)
+        stopped_child = self.sleeping_child(finishing=False)
+        vidfunnel.interrupt.stop_workers(from_stopfile=True)
+        self.assertEqual(stopped_child.wait(5), -signal.SIGTERM)
+        time.sleep(0.3)
+        self.assertIsNone(spared_child.poll(), "a finishing thread's child was stopped by a stop file")
+        vidfunnel.interrupt.stop_workers()  # a signal after the stop file spares nothing
+        self.assertEqual(spared_child.wait(5), -signal.SIGTERM)
+
+    def test_a_signal_stops_the_children_of_a_finishing_thread(self):
+        finishing_child = self.sleeping_child(finishing=True)
+        vidfunnel.interrupt.stop_workers()
+        self.assertEqual(finishing_child.wait(5), -signal.SIGTERM)
+
+    def test_check_spares_a_finishing_thread_only_after_a_stop_file(self):
+        check = vidfunnel.interrupt.check
+        vidfunnel.interrupt.stop_workers(from_stopfile=True)
+        self.assertIsNone(self.on_thread(check, finishing=True))
+        self.assertIsInstance(self.on_thread(check, finishing=False), Interrupted)
+        self.assertFalse(self.on_thread(lambda: vidfunnel.interrupt.child_interrupted(1), finishing=True))
+        vidfunnel.interrupt.stop_workers()  # Ctrl+C or a stop signal after the stop file
+        self.assertIsInstance(self.on_thread(check, finishing=True), Interrupted)
+        self.assertTrue(self.on_thread(lambda: vidfunnel.interrupt.child_interrupted(1), finishing=True))
+
+    def test_the_pool_applies_a_finishing_task_before_it_raises_for_a_stop_file(self):
+        stopped = threading.Event()
+        done = []
+
+        def finishing_task():
+            vidfunnel.interrupt.begin_finishing()
+            stopped.wait(10)
+            time.sleep(0.2)  # still running after the other task's Interrupted reached the pool
+            vidfunnel.interrupt.check()
+            return "saved"
+
+        def stopping_task():
+            vidfunnel.interrupt.stop_workers(from_stopfile=True)
+            stopped.set()
+            raise Interrupted("a stop file asks this run to stop now")
+
+        with self.assertRaises(KeyboardInterrupt):
+            run_pool(2, [finishing_task, stopping_task], lambda index, value: done.append((index, value)))
+        self.assertEqual(done, [(0, "saved")])
+        self.assertFalse(interrupted.is_set(), "the event outlived the pool")
+
+    def test_check_raises_on_a_finishing_thread_after_a_signal_alone(self):
+        vidfunnel.interrupt.stop_workers()
+        self.assertIsInstance(self.on_thread(vidfunnel.interrupt.check, finishing=True), Interrupted)
+
+
 class PoolTests(unittest.TestCase):
     """run_pool: Ctrl+C on the main thread sets the event, cancels what has not started and is raised again."""
 

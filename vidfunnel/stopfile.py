@@ -21,7 +21,16 @@ report, find, index, stop-all, resume) have no items and do not look:
   retire looks before each item only (vidfunnel.retire.run calls
   forget_item once an item has started), since its one child, par2, runs
   after the original has been moved and stopping it then would leave that
-  item half done.
+  item half done. convert (and --refit) forgets the item once its main
+  encode has succeeded (forget_item) and remembers it again before verify
+  (remember_item), after the record is saved: the sidecars and PAR2 of a
+  finished encode are never cut off, so the encode is never discarded, and
+  a 'now' file stops the run at verify's first child or the next item.
+  Between the two the thread is "finishing" (vidfunnel.interrupt), so a
+  'now' file another worker of a --jobs run finds does not stop it either:
+  its children are not sent SIGTERM, vidfunnel.interrupt.check() does not
+  raise on it, and the pool waits for its record before the run ends.
+  Ctrl+C and the stop signals spare no thread.
 
 A stop, once seen, holds for the rest of the run: removing the file does
 not undo it. A stage that is about to start (plan, convert, verify,
@@ -132,13 +141,16 @@ def _announce(path, data):
 def check_item(folder):
     """Before an item in `folder` starts: None, 'drain' or 'now' from the nearest stop file.
 
-    Remembers `folder` for check_now() on this thread. 'drain' sets
-    vidfunnel.interrupt.draining; 'now' calls stop_workers() (the interrupt
-    event and SIGTERM to the children). Each is announced once per run.
-    The caller starts no item after either.
+    Remembers `folder` for check_now() on this thread, which is no longer
+    finishing (vidfunnel.interrupt.end_finishing). 'drain' sets
+    vidfunnel.interrupt.draining; 'now' calls
+    stop_workers(from_stopfile=True) (the interrupt event and SIGTERM to the
+    children, except those of finishing threads). Each is announced once
+    per run. The caller starts no item after either.
     """
-    from vidfunnel.interrupt import draining, stop_workers
+    from vidfunnel.interrupt import draining, end_finishing, stop_workers
     _current.folder = folder
+    end_finishing()
     path, data = find_stop(folder)
     if path is None:
         return None
@@ -146,7 +158,7 @@ def check_item(folder):
     _announce(path, data)
     if data.get("mode") == "now":
         stopped_now = True
-        stop_workers()
+        stop_workers(from_stopfile=True)
         return "now"
     draining.set()
     return "drain"
@@ -179,17 +191,36 @@ def raise_if_stopped_now(what):
 
 
 def forget_item():
-    """This thread works on no item any more."""
+    """This thread's item no longer stops at a 'now' file; returns its folder (None when none).
+
+    The thread is finishing (vidfunnel.interrupt.begin_finishing) until
+    remember_item() or the next check_item().
+    """
+    from vidfunnel.interrupt import begin_finishing
+    folder = getattr(_current, "folder", None)
     _current.folder = None
+    begin_finishing()
+    return folder
+
+
+def remember_item(folder):
+    """This thread works on the item in `folder` again (a folder forget_item returned), for check_now();
+    it is no longer finishing."""
+    from vidfunnel.interrupt import end_finishing
+    _current.folder = folder
+    end_finishing()
 
 
 def reset():
-    """Forget the announcements and stopped_now, so a later run in this process starts clean."""
+    """Forget the announcements, stopped_now and vidfunnel.interrupt.stopped_by_file, so a later run in this
+    process starts clean."""
+    from vidfunnel.interrupt import stopped_by_file
     global stopped_now
+    stopped_by_file.clear()
     with _announced_lock:
         _announced.clear()
     stopped_now = False
-    forget_item()
+    remember_item(None)
 
 
 def refusal(paths):
@@ -215,7 +246,8 @@ def add_arguments(parser):
                         help="folders whose runs to stop: every plan, convert, verify or retire run working "
                         "at or below PATH, on any host")
     parser.add_argument("--now", action="store_true",
-                        help="stop at once (as Ctrl+C), instead of finishing the items in progress")
+                        help="stop at the next item or child process start, instead of finishing the items in "
+                        "progress; a finished encode is never discarded")
 
 
 def run(args):

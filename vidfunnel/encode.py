@@ -72,7 +72,7 @@ from vidfunnel.ffmpeg import run as run_tool
 from vidfunnel.interrupt import Interrupted, child_interrupted, drain_after_item, drain_before_next, run_pool
 from vidfunnel.interrupt import check as check_interrupted
 from vidfunnel.progress import Progress, StageSummary, ffmpeg_progress_callback, item_tag, say, tagged
-from vidfunnel.stopfile import raise_if_stopped_now
+from vidfunnel.stopfile import forget_item, raise_if_stopped_now, remember_item
 from vidfunnel.record import (
     RECORD_DIR,
     FolderLock,
@@ -507,6 +507,9 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
     finally:
         _remove(temp)
     elapsed = time.monotonic() - started
+    # The encode is done: a 'now' stop file no longer cuts this item at its sidecar or PAR2
+    # child starts, which would throw the finished encode away; it applies again at verify.
+    item_folder = forget_item()
 
     first_source = _source_files(folder, record)[0][0]
     try:
@@ -574,6 +577,7 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
     save_record(key, record)
     say("  converted '{}' ({} bytes, {:.0f} % of the source) in {:.1f} s".format(
         output_path.name, output_size, 100.0 * ratio if ratio is not None else 0.0, elapsed), stream)
+    remember_item(item_folder)
     _verify(tools, key, record, options, progress, stream)
     return record["stages"]["convert"]
 
@@ -910,6 +914,9 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
         return "failed", str(error)
     attempt["elapsed_s"] = round(time.monotonic() - started, 3)
     attempt["ffmpeg_stderr"] = _tail(completed.stderr)
+    # The encode is done: a 'now' stop file no longer cuts this item at the checks' ffprobe or
+    # the PAR2 child start, which would throw the finished refit away; it applies again at verify.
+    item_folder = forget_item()
 
     try:
         new_size = temp.stat().st_size
@@ -1001,6 +1008,7 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
         label, result_words, output_path.name, new_size, plan["output_size"],
         "" if new_size <= plan["source_size"] else "; still larger than the source, '{}' kept".format(
             OUTPUT_LARGER_FLAG)), stream)
+    remember_item(item_folder)
     _verify(tools, key, record, options, progress, stream)
     if record.get("status") == "failed":
         return "failed", "verify failed after the refit"

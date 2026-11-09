@@ -38,6 +38,21 @@ children and `interrupted` stays clear, so their results are applied as
 usual. The main thread counts, in `drain_tally`, the tasks that were still
 running when the drain began and the items never started, for the line
 vidfunnel.cli.main prints at the end.
+
+A 'now' stop file (vidfunnel.stopfile.check_item) stops the run as Ctrl+C
+does, with one exception: a thread whose item has finished its encode is
+"finishing" (begin_finishing(), from vidfunnel.stopfile.forget_item, until
+end_finishing()) until that item's record is saved. While the stop came
+from a stop file alone (stop_workers(from_stopfile=True), and no signal
+since), check() does not raise on a finishing thread, child_interrupted()
+does not take its children's exits for an interruption, and the children
+it registered (vidfunnel.ffmpeg.register_child notes whether it was
+finishing) are not sent SIGTERM; run_pool() starts no further task, waits
+for the finishing ones and applies their results before it raises
+KeyboardInterrupt. So a stop file never discards a finished encode. Ctrl+C
+and the stop signals call stop_workers() without from_stopfile, which sets
+`stopped_by_signal`: from then on every thread raises and every child is
+terminated, finishing or not.
 """
 
 VERSION = "20261109"
@@ -88,6 +103,40 @@ interrupted = Flag()
 
 # Set by the SIGUSR1 handler (vidfunnel.cli): start no further item; see the module docstring.
 draining = Flag()
+
+# Why `interrupted` was set, by stop_workers() (each before `interrupted`): a 'now' stop file, or Ctrl+C or a
+# stop signal. Cleared with `interrupted`. Finishing threads are spared only while the second is clear.
+stopped_by_file = Flag()
+stopped_by_signal = Flag()
+
+# Per thread: True while its item has finished its encode and its record is not yet saved.
+_thread_state = threading.local()
+
+
+def begin_finishing():
+    """This thread's item has finished its encode: a stop file's stop spares it until end_finishing()."""
+    _thread_state.finishing = True
+
+
+def end_finishing():
+    """This thread's item is no longer spared by a stop file's stop (its record is saved, or a new item starts)."""
+    _thread_state.finishing = False
+
+
+def finishing():
+    """True when this thread is between begin_finishing() and end_finishing()."""
+    return getattr(_thread_state, "finishing", False)
+
+
+def spared():
+    """True when this thread is finishing and the stop, if any, came from a stop file alone (no signal)."""
+    return finishing() and stopped_by_file.is_set() and not stopped_by_signal.is_set()
+
+
+def _clear_stop():
+    interrupted.clear()
+    stopped_by_file.clear()
+    stopped_by_signal.clear()
 
 
 class DrainTally:
@@ -149,8 +198,8 @@ class Interrupted(Exception):
 
 
 def check():
-    """Raise Interrupted when the event is set; a no-op otherwise."""
-    if interrupted.is_set():
+    """Raise Interrupted when the event is set; a no-op otherwise, and on a thread a stop file spares (spared())."""
+    if interrupted.is_set() and not spared():
         raise Interrupted("interrupted by the user")
 
 
@@ -163,22 +212,29 @@ def child_interrupted(returncode):
     event clear, a signal-like status on a worker thread waits up to
     GRACE_SECONDS for the main thread to set it; on the main thread, which
     receives KeyboardInterrupt itself, nothing waits and nothing changes.
+    On a thread a stop file spares (spared()), whose children that stop did
+    not signal, the event counts only once a signal has set it too: a
+    signal-like status waits for stopped_by_signal instead.
     """
     if returncode == 0:
         return False
-    if interrupted.is_set():
+    spare = spared()
+    if interrupted.is_set() and not spare:
         return True
     if returncode < 0 or returncode in _SIGNAL_STATUSES:
         if threading.current_thread() is not threading.main_thread():
-            return interrupted.wait(GRACE_SECONDS)
+            return (stopped_by_signal if spare else interrupted).wait(GRACE_SECONDS)
     return False
 
 
-def stop_workers():
+def stop_workers(from_stopfile=False):
     """Set `interrupted` and send SIGTERM to the registered children; never in a signal handler.
 
     Called on the main thread after Ctrl+C or a stop signal, and on any
-    thread that finds a 'now' stop file (vidfunnel.stopfile.check_item).
+    thread that finds a 'now' stop file (vidfunnel.stopfile.check_item),
+    which passes from_stopfile=True: that sets `stopped_by_file` and spares
+    the children registered by a finishing thread; otherwise
+    `stopped_by_signal` is set and every child is sent SIGTERM.
 
     A KeyboardInterrupt (a further Ctrl+C, or a SIGTERM after a Ctrl+C) raised while it runs
     is dropped and the steps run again, so both are done when it returns;
@@ -188,8 +244,9 @@ def stop_workers():
     from vidfunnel.ffmpeg import terminate_children  # here: vidfunnel.ffmpeg imports this module
     while True:
         try:
+            (stopped_by_file if from_stopfile else stopped_by_signal).set()
             interrupted.set()
-            terminate_children()
+            terminate_children(spare_finishing=from_stopfile)
             return
         except KeyboardInterrupt:
             continue
@@ -222,7 +279,11 @@ def run_pool(jobs, tasks, on_done, sizes=None, folders=None):
     first checks the stop files above its folder (vidfunnel.stopfile.check_item):
     on 'drain' or 'now' it puts the task back untouched and takes no more;
     'now' has also set `interrupted` and signalled the children, so this
-    function then raises KeyboardInterrupt as after Ctrl+C.
+    function then raises KeyboardInterrupt as after Ctrl+C. A task that
+    raised Interrupted while such a stop applies alone (stopped_by_file set,
+    stopped_by_signal clear) does not end the wait: the other running tasks,
+    finishing ones among them, run to their end and their results are
+    applied first, then KeyboardInterrupt is raised.
     """
     weights = list(sizes) if sizes is not None else [1] * len(tasks)
     pending = queue.Queue()
@@ -251,7 +312,7 @@ def run_pool(jobs, tasks, on_done, sizes=None, folders=None):
         finally:
             finished.put(None)  # this worker takes no further task
 
-    interrupted.clear()
+    _clear_stop()
     threads = []
     try:
         try:
@@ -260,6 +321,7 @@ def run_pool(jobs, tasks, on_done, sizes=None, folders=None):
                 threads.append(thread)
                 thread.start()
             working = len(threads)
+            stopped_task = None
             while working:
                 result = finished.get()
                 if result is None:
@@ -267,10 +329,16 @@ def run_pool(jobs, tasks, on_done, sizes=None, folders=None):
                     continue
                 index, ok, value, while_draining = result
                 if not ok:
+                    if isinstance(value, Interrupted) and stopped_by_file.is_set() \
+                            and not stopped_by_signal.is_set():
+                        stopped_task = stopped_task or value  # a stop file: wait for the finishing tasks
+                        continue
                     raise value
                 if while_draining:
                     drain_tally.finished += weights[index]
                 on_done(index, value)
+            if stopped_task is not None:
+                raise KeyboardInterrupt() from stopped_task
             if interrupted.is_set():  # a 'now' stop file, found by a worker before any task raised
                 raise KeyboardInterrupt()
             if draining.is_set():
@@ -293,7 +361,7 @@ def run_pool(jobs, tasks, on_done, sizes=None, folders=None):
     finally:
         # A second Ctrl+C can cut the joins short; the event then stays set for the workers still alive.
         if not any(thread.is_alive() for thread in threads):
-            interrupted.clear()
+            _clear_stop()
 
 
 # End of File #

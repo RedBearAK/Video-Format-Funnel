@@ -7,7 +7,7 @@ same name pattern, so a pair of distrobox wrappers in a directory of their own
 works without shadowing the host's tools.
 """
 
-VERSION = "20261108"
+VERSION = "20261109"
 
 import hashlib
 import json
@@ -21,7 +21,7 @@ import threading
 from collections import namedtuple
 from pathlib import Path
 
-from vidfunnel.interrupt import Interrupted, child_interrupted, interrupted
+from vidfunnel.interrupt import Interrupted, child_interrupted, finishing, interrupted, spared
 from vidfunnel.interrupt import check as check_interrupted
 from vidfunnel.progress import say
 from vidfunnel.record import held_lock_fds
@@ -413,7 +413,9 @@ def clear_capabilities_cache():
 # Every child started by run() (and encode.write_par2) while it runs, so a SIGTERM to vidfunnel alone,
 # which unlike Ctrl+C in a terminal does not reach the children, can pass it on (terminate_children).
 # Reentrant, which costs nothing; the SIGTERM handler itself no longer takes it (see vidfunnel.cli._on_sigterm).
+# _finishing_children: those of them registered by a finishing thread (vidfunnel.interrupt.finishing).
 _children = set()
+_finishing_children = set()
 _children_lock = threading.RLock()
 
 
@@ -422,11 +424,15 @@ def register_child(process):
 
     A child registered after the interrupt event was set (a SIGTERM that
     arrived between its Popen and this call) is sent SIGTERM at once, since
-    terminate_children() ran before it was in the set.
+    terminate_children() ran before it was in the set, unless a stop file's
+    stop spares this thread (vidfunnel.interrupt.spared). Notes whether this
+    thread is finishing, for terminate_children(spare_finishing=True).
     """
     with _children_lock:
         _children.add(process)
-    if interrupted.is_set():
+        if finishing():
+            _finishing_children.add(process)
+    if interrupted.is_set() and not spared():
         try:
             process.send_signal(signal.SIGTERM)
         except OSError:
@@ -436,12 +442,16 @@ def register_child(process):
 def forget_child(process):
     with _children_lock:
         _children.discard(process)
+        _finishing_children.discard(process)
 
 
-def terminate_children(signum=signal.SIGTERM):
-    """Send `signum` to every registered child that is still running; returns how many were signalled."""
+def terminate_children(signum=signal.SIGTERM, spare_finishing=False):
+    """Send `signum` to every registered child that is still running; returns how many were signalled.
+
+    With spare_finishing (a 'now' stop file), the children registered by a finishing thread are left alone.
+    """
     with _children_lock:
-        running = list(_children)
+        running = list(_children - _finishing_children if spare_finishing else _children)
     sent = 0
     for process in running:
         try:
@@ -579,7 +589,9 @@ def run(argv, progress=None, check=True):
     reported: both raise Interrupted, whatever `check` says (see
     vidfunnel.interrupt.child_interrupted). A 'now' stop file above the
     item this thread works on stops it the same way before the child starts
-    (vidfunnel.stopfile.raise_if_stopped_now).
+    (vidfunnel.stopfile.raise_if_stopped_now). A thread whose item has
+    finished its encode is spared by a stop file's stop (see
+    vidfunnel.interrupt), not by a signal's.
     """
     argv = [os.fspath(part) for part in argv]
     check_interrupted()
