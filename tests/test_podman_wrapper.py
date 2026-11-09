@@ -5,13 +5,16 @@ and exits 0, so no container is started. HOME is a temporary folder in every
 test; nothing here reads or writes the real ~/.local or any rc file.
 """
 
-VERSION = "20261107"
+VERSION = "20261108"
 
+import hashlib
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -20,9 +23,127 @@ WRAPPER = REPO_ROOT / "bin" / "vidfunnel-podman"
 PLAIN_LAUNCHER = REPO_ROOT / "bin" / "vidfunnel"
 SHELL_BINARY = shutil.which("sh")
 
-FAKE_ENGINE = """#!/bin/sh
-if [ "$1" = info ]; then printf '%s\\n' "${FAKE_RUNTIME:-crun}"; exit 0; fi
-for argument in "$@"; do printf '%s\\n' "$argument"; done > "$FAKE_ENGINE_LOG"
+# The fake engine writes the arguments of 'run' and 'build' one per line to
+# FAKE_ENGINE_LOG and appends every invocation, one line each, to FAKE_CALL_LOG.
+# Containers are folders under FAKE_STATE_DIR: 'run -d' makes one (status, exit
+# code, labels and output from the FAKE_RUN_* variables), and ps, inspect, logs,
+# wait, rm, stop and kill answer from and act on those folders. 'logs -f' follows
+# while the status is 'running' (at most about 30 seconds) and, like podman's own,
+# ends early when a stop was requested, unless it was started with --since.
+FAKE_ENGINE = r"""#!/bin/sh
+state="${FAKE_STATE_DIR:-/nonexistent-fake-state}"
+printf '%s\n' "$*" >> "${FAKE_CALL_LOG:-/dev/null}"
+last_argument() { for argument in "$@"; do last="$argument"; done; printf '%s' "$last"; }
+missing() { printf 'Error: no container with name or ID "%s" found: no such container\n' "$1" >&2; exit 125; }
+case "$1" in
+    info) printf '%s\n' "${FAKE_RUNTIME:-crun}"; exit 0 ;;
+    run|build)
+        for argument in "$@"; do printf '%s\n' "$argument"; done > "$FAKE_ENGINE_LOG"
+        if [ "$1" != run ] || [ "$2" != -d ]; then exit "${FAKE_ATTACHED_EXIT:-0}"; fi
+        previous=""
+        for argument in "$@"; do
+            [ "$previous" = --name ] && name="$argument"
+            previous="$argument"
+        done
+        box="$state/$name"
+        mkdir -p "$box"
+        previous=""
+        for argument in "$@"; do
+            if [ "$previous" = --label ]; then
+                printf '%s' "${argument#*=}" > "$box/label.${argument%%=*}"
+            fi
+            previous="$argument"
+        done
+        printf '%s\n' "${FAKE_RUN_STATUS:-exited}" > "$box/status"
+        printf '%s\n' "${FAKE_RUN_EXIT:-0}" > "$box/exit_code"
+        printf '%s\n' "${FAKE_RUN_OUTPUT:-fake vidfunnel output}" > "$box/log"
+        echo 0123456789abcdef
+        exit 0
+        ;;
+    ps)
+        [ -d "$state" ] && ls "$state"
+        exit 0
+        ;;
+    inspect)
+        name=$(last_argument "$@")
+        box="$state/$name"
+        [ -d "$box" ] || missing "$name"
+        format=""; previous=""
+        for argument in "$@"; do
+            [ "$previous" = --format ] && format="$argument"
+            previous="$argument"
+        done
+        case "$format" in
+            *State.Status*) cat "$box/status" ;;
+            *ExitCode*) cat "$box/exit_code" ;;
+            *Labels*)
+                key="${format#*\"}"; key="${key%%\"*}"
+                [ -f "$box/label.$key" ] && cat "$box/label.$key"; echo
+                ;;
+        esac
+        exit 0
+        ;;
+    logs)
+        name=$(last_argument "$@")
+        box="$state/$name"
+        [ -d "$box" ] || missing "$name"
+        follow=0; since=""; tail_count=""; previous=""
+        for argument in "$@"; do
+            [ "$argument" = -f ] && follow=1
+            [ "$previous" = --since ] && since="$argument"
+            [ "$previous" = --tail ] && tail_count="$argument"
+            previous="$argument"
+        done
+        if [ -n "$tail_count" ]; then tail -n "$tail_count" "$box/log"; else cat "$box/log"; fi
+        [ "$follow" -eq 1 ] || exit 0
+        rounds=0
+        while [ "$(cat "$box/status" 2>/dev/null)" = running ] && [ "$rounds" -lt 300 ]; do
+            if [ -z "$since" ] && [ -e "$box/stop_requested" ]; then exit 1; fi
+            sleep 0.1
+            rounds=$((rounds + 1))
+        done
+        [ -n "$since" ] && [ -f "$box/after_stop" ] && cat "$box/after_stop"
+        exit 0
+        ;;
+    wait)
+        name=$(last_argument "$@")
+        box="$state/$name"
+        [ -d "$box" ] || missing "$name"
+        rounds=0
+        while [ "$(cat "$box/status")" = running ] && [ "$rounds" -lt 300 ]; do
+            sleep 0.1
+            rounds=$((rounds + 1))
+        done
+        cat "$box/exit_code"
+        exit 0
+        ;;
+    rm)
+        name=$(last_argument "$@")
+        box="$state/$name"
+        [ -d "$box" ] || missing "$name"
+        if [ "$(cat "$box/status")" = running ]; then
+            echo "Error: cannot remove container $name as it is running" >&2
+            exit 2
+        fi
+        rm -r "$box"
+        printf '%s\n' "$name"
+        exit 0
+        ;;
+    stop|kill)
+        name=$(last_argument "$@")
+        box="$state/$name"
+        [ -d "$box" ] || missing "$name"
+        [ -n "${FAKE_STOP_IGNORED:-}" ] && exit 0
+        touch "$box/stop_requested"
+        printf '%s\n' "${FAKE_STOP_OUTPUT:-fake output after the stop}" > "$box/after_stop"
+        sleep "${FAKE_STOP_DELAY:-0}"
+        if [ "$1" = stop ]; then code="${FAKE_STOP_EXIT:-143}"; else code="${FAKE_DRAIN_EXIT:-0}"; fi
+        printf '%s\n' "$code" > "$box/exit_code"
+        printf 'exited\n' > "$box/status"
+        printf '%s\n' "$name"
+        exit 0
+        ;;
+esac
 exit 0
 """
 
@@ -44,6 +165,9 @@ class WrapperTestCase(unittest.TestCase):
         self.fake_bin = base / "fake-bin"
         self.fake_bin.mkdir()
         self.engine_log = base / "engine-argv.txt"
+        self.call_log = base / "engine-calls.txt"
+        self.state = base / "fake-containers"
+        self.state.mkdir()
         self.write_script("podman", FAKE_ENGINE)
         # The host python the wrapper finds is the one running these tests.
         os.symlink(sys.executable, str(self.fake_bin / "python3"))
@@ -65,6 +189,8 @@ class WrapperTestCase(unittest.TestCase):
         env = {
             "PATH": "{}:/usr/bin:/bin".format(self.fake_bin),
             "FAKE_ENGINE_LOG": str(self.engine_log),
+            "FAKE_CALL_LOG": str(self.call_log),
+            "FAKE_STATE_DIR": str(self.state),
             "SHELL": shell,
             "LC_ALL": "C",
         }
@@ -700,6 +826,427 @@ class PathOptionTests(WrapperTestCase):
         code, output = self.run_wrapper("plan", "retire", "--q={}".format(quarantine))
         self.assertEqual(code, 0, output)
         self.assertFalse(quarantine.exists())
+
+
+class ContainerTestCase(WrapperTestCase):
+    """Helpers for the detached runs, 'attach' and 'stop', against the fake engine's container folders."""
+
+    def calls(self):
+        if not self.call_log.exists():
+            return []
+        return self.call_log.read_text().splitlines()
+
+    def expected_name(self, stage, first_path=""):
+        digest = hashlib.sha256("{}\n{}\n".format(self.workdir, first_path).encode()).hexdigest()
+        return "vidfunnel-{}-{}".format(stage, digest[:12])
+
+    def make_container(self, name, status="running", exit_code=0, stage="convert", cwd=None,
+                       paths="", started="2026-11-08T10:00:00Z", output="earlier output"):
+        box = self.state / name
+        box.mkdir()
+        (box / "status").write_text(status + "\n")
+        (box / "exit_code").write_text("{}\n".format(exit_code))
+        (box / "log").write_text(output + "\n")
+        labels = {"vidfunnel": "1", "vidfunnel.stage": stage,
+                  "vidfunnel.cwd": str(self.workdir if cwd is None else cwd),
+                  "vidfunnel.paths": paths, "vidfunnel.started": started}
+        for key, value in labels.items():
+            (box / "label.{}".format(key)).write_text(value)
+        return box
+
+    def run_with(self, arguments, **variables):
+        env = dict(self.environment(), **variables)
+        result = subprocess.run(
+            [SHELL_BINARY, str(WRAPPER)] + list(arguments), cwd=str(self.workdir), env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True)
+        return result.returncode, result.stdout, result.stderr
+
+    def start_in_background(self, arguments, **variables):
+        env = dict(self.environment(), **variables)
+        process = subprocess.Popen(
+            [SHELL_BINARY, str(WRAPPER)] + list(arguments), cwd=str(self.workdir), env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, start_new_session=True)
+        self.addCleanup(self.end_process, process)
+        return process
+
+    def end_process(self, process):
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+
+    def wait_for_call(self, prefix, process, count=1):
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if sum(1 for line in self.calls() if line.startswith(prefix)) >= count:
+                return
+            if process.poll() is not None:
+                self.fail("the wrapper exited ({}) before '{}': {}".format(
+                    process.returncode, prefix, process.communicate()))
+            time.sleep(0.05)
+        self.fail("no call starting with '{}' within 15 seconds: {}".format(prefix, self.calls()))
+
+    def finish(self, process):
+        try:
+            stdout, stderr = process.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            self.fail("the wrapper did not exit within 20 seconds: {}".format(self.calls()))
+        return process.returncode, stdout, stderr
+
+
+class DetachedRunTests(ContainerTestCase):
+    def test_convert_runs_detached_follows_and_exits_with_the_container_code(self):
+        library = self.workdir / "library"
+        library.mkdir()
+        name = self.expected_name("convert", str(library))
+        code, stdout, stderr = self.run_with(["convert", "--jobs", "2", "library"], FAKE_RUN_EXIT="3")
+        self.assertEqual(code, 3, stdout + stderr)
+        argv = self.engine_argv()
+        self.assertEqual(argv[:6], ["run", "-d", "--name", name, "--label", "vidfunnel=1"])
+        self.assertNotIn("--rm", argv)
+        self.assertNotIn("-it", argv)
+        self.assert_pair(argv, "--label", "vidfunnel.stage=convert")
+        self.assert_pair(argv, "--label", "vidfunnel.cwd={}".format(self.workdir))
+        self.assert_pair(argv, "--label", "vidfunnel.paths={}".format(library))
+        self.assertTrue(any(part.startswith("vidfunnel.started=20") for part in argv), argv)
+        self.assertEqual(argv[-4:], ["convert", "--jobs", "2", "library"])
+        calls = [line for line in self.calls() if not line.startswith("inspect ")]
+        run_index = next(index for index, line in enumerate(calls) if line.startswith("run -d"))
+        self.assertEqual(calls[run_index + 1:], [
+            "logs -f {}".format(name), "wait {}".format(name), "rm {}".format(name)])
+        self.assertIn("fake vidfunnel output", stdout)
+        self.assertIn("running detached as '{}'".format(name), stderr)
+        self.assertFalse((self.state / name).exists())
+
+    def test_plan_verify_and_refit_are_detached_too(self):
+        for arguments in (["plan"], ["verify"], ["convert", "--refit"]):
+            code, stdout, stderr = self.run_with(arguments)
+            self.assertEqual(code, 0, stdout + stderr)
+            self.assertEqual(self.engine_argv()[:2], ["run", "-d"], arguments)
+
+    def test_check_stays_attached(self):
+        code, stdout, stderr = self.run_with(["check"])
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertEqual(self.engine_argv()[:2], ["run", "--rm"])
+        self.assertNotIn("-d", self.engine_argv())
+        self.assertEqual([line.split()[0] for line in self.calls()], ["info", "run"])
+
+    def test_help_for_a_long_stage_stays_attached(self):
+        code, stdout, stderr = self.run_with(["convert", "--help"])
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertEqual(self.engine_argv()[:2], ["run", "--rm"])
+
+    def test_attached_escape_hatch(self):
+        code, stdout, stderr = self.run_with(["convert"], VIDFUNNEL_ATTACHED="1")
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertEqual(self.engine_argv()[:2], ["run", "--rm"])
+        self.assertNotIn("--name", self.engine_argv())
+
+    def test_unknown_escape_hatch_value_is_refused(self):
+        code, stdout, stderr = self.run_with(["convert"], VIDFUNNEL_ATTACHED="yes")
+        self.assertEqual(code, 1)
+        self.assertIn("VIDFUNNEL_ATTACHED is 'yes'", stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_name_is_stable_for_the_same_folder_and_path_and_differs_for_another_path(self):
+        (self.workdir / "first-library").mkdir()
+        (self.workdir / "second-library").mkdir()
+        names = []
+        for library in ("first-library", "first-library", "second-library"):
+            code, stdout, stderr = self.run_with(["plan", library])
+            self.assertEqual(code, 0, stdout + stderr)
+            names.append(self.engine_argv()[3])
+        self.assertEqual(names[0], names[1])
+        self.assertNotEqual(names[0], names[2])
+        self.assertEqual(names[0], self.expected_name("plan", str(self.workdir / "first-library")))
+        self.assertEqual(names[2], self.expected_name("plan", str(self.workdir / "second-library")))
+
+    def test_exited_container_of_the_same_name_is_reported_and_removed_first(self):
+        name = self.expected_name("convert")
+        self.make_container(name, status="exited", exit_code=7, output="the last words of the earlier run")
+        code, stdout, stderr = self.run_with(["convert"])
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertIn("an earlier '{}'".format(name), stderr)
+        self.assertIn("exit code 7", stderr)
+        self.assertIn("    the last words of the earlier run", stderr)
+        calls = self.calls()
+        self.assertLess(calls.index("rm {}".format(name)),
+                        next(index for index, line in enumerate(calls) if line.startswith("run -d")))
+        self.assertIn("logs --tail 20 {}".format(name), calls)
+
+    def test_running_container_on_the_same_paths_refuses_a_second_start(self):
+        self.make_container("vidfunnel-convert-elsewhere", status="running", cwd="/somewhere/else",
+                            paths=str(self.workdir))
+        code, stdout, stderr = self.run_with(["plan"])
+        self.assertEqual(code, 1, stdout + stderr)
+        self.assertIn("'vidfunnel-convert-elsewhere' (convert, started 2026-11-08T10:00:00Z) is already running",
+                      stderr)
+        self.assertIn("attach vidfunnel-convert-elsewhere", stderr)
+        self.assertFalse(any(line.startswith("run") for line in self.calls()), self.calls())
+
+    def test_running_container_with_the_same_folder_and_paths_refuses(self):
+        (self.workdir / "library").mkdir()
+        self.make_container("vidfunnel-plan-samefolder", status="running",
+                            paths=str(self.workdir / "library"))
+        code, stdout, stderr = self.run_with(["convert", "library"])
+        self.assertEqual(code, 1, stdout + stderr)
+        self.assertIn("is already running", stderr)
+        self.assertFalse(any(line.startswith("run") for line in self.calls()), self.calls())
+
+    def test_running_container_of_the_same_name_refuses(self):
+        name = self.expected_name("convert")
+        self.make_container(name, status="running", paths="/not/the/same")
+        code, stdout, stderr = self.run_with(["convert"])
+        self.assertEqual(code, 1, stdout + stderr)
+        self.assertIn("'{}' (convert, started 2026-11-08T10:00:00Z) is already running".format(name), stderr)
+        self.assertFalse(any(line.startswith(("run", "rm", "logs")) for line in self.calls()), self.calls())
+
+    def test_running_container_on_other_paths_does_not_refuse(self):
+        (self.workdir / "library").mkdir()
+        self.make_container("vidfunnel-convert-otherpaths", status="running", paths="/srv/other")
+        code, stdout, stderr = self.run_with(["convert", "library"])
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertEqual(self.engine_argv()[:2], ["run", "-d"])
+
+
+class FollowSignalTests(ContainerTestCase):
+    def test_ctrl_c_stops_the_container_and_follows_it_to_its_exit(self):
+        name = self.expected_name("convert")
+        process = self.start_in_background(["convert"], FAKE_RUN_STATUS="running", FAKE_STOP_DELAY="1")
+        self.wait_for_call("logs -f {}".format(name), process)
+        os.killpg(process.pid, signal.SIGINT)
+        code, stdout, stderr = self.finish(process)
+        self.assertEqual(code, 143, stdout + stderr)
+        calls = self.calls()
+        self.assertEqual(calls.count("stop -t 30 {}".format(name)), 1, calls)
+        self.assertTrue(any(line.startswith("logs -f --since ") and line.endswith(name) for line in calls),
+                        calls)
+        self.assertEqual(calls[-2:], ["wait {}".format(name), "rm {}".format(name)])
+        self.assertIn("stopping '{}'".format(name), stderr)
+        self.assertIn("fake output after the stop", stdout)
+
+    def test_second_ctrl_c_detaches_without_another_stop(self):
+        name = self.expected_name("convert")
+        process = self.start_in_background(["convert"], FAKE_RUN_STATUS="running", FAKE_STOP_IGNORED="1")
+        self.wait_for_call("logs -f {}".format(name), process)
+        os.killpg(process.pid, signal.SIGINT)
+        self.wait_for_call("stop ", process)
+        os.killpg(process.pid, signal.SIGINT)
+        code, stdout, stderr = self.finish(process)
+        self.assertEqual(code, 130, stdout + stderr)
+        calls = self.calls()
+        self.assertEqual(sum(1 for line in calls if line.startswith("stop ")), 1, calls)
+        self.assertNotIn("wait {}".format(name), calls)
+        self.assertNotIn("rm {}".format(name), calls)
+        self.assertIn("stopped following '{}' (Ctrl+C again)".format(name), stderr)
+        self.assertEqual((self.state / name / "status").read_text(), "running\n")
+
+    def test_closed_terminal_detaches_and_leaves_the_container_alone(self):
+        name = self.expected_name("convert")
+        process = self.start_in_background(["convert"], FAKE_RUN_STATUS="running")
+        self.wait_for_call("logs -f {}".format(name), process)
+        os.killpg(process.pid, signal.SIGHUP)
+        code, stdout, stderr = self.finish(process)
+        self.assertEqual(code, 129, stdout + stderr)
+        calls = self.calls()
+        self.assertFalse(any(line.startswith(("stop", "kill", "wait", "rm")) for line in calls), calls)
+        self.assertEqual((self.state / name / "status").read_text(), "running\n")
+
+
+class AttachTests(ContainerTestCase):
+    def test_attach_without_argument_lists_the_containers(self):
+        self.make_container("vidfunnel-plan-listedfirst", status="running", stage="plan", cwd="/srv/one",
+                            paths="/srv/one/films")
+        self.make_container("vidfunnel-convert-listedsecond", status="exited", exit_code=2, cwd="/srv/two")
+        code, stdout, stderr = self.run_with(["attach"])
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertIn("'vidfunnel-plan-listedfirst': plan, running, started 2026-11-08T10:00:00Z", stdout)
+        self.assertIn("    in '/srv/one', paths '/srv/one/films'", stdout)
+        self.assertIn("'vidfunnel-convert-listedsecond': convert, exited, exit code 2", stdout)
+        self.assertIn("ps -a --filter label=vidfunnel=1 --format {{.Names}}", self.calls())
+        self.assertFalse(any(line.startswith("logs") for line in self.calls()))
+
+    def test_attach_without_argument_and_no_containers(self):
+        code, stdout, stderr = self.run_with(["attach"])
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertIn("No vidfunnel containers on this host", stdout)
+
+    def test_attach_without_argument_follows_the_one_started_here(self):
+        self.make_container("vidfunnel-convert-startedhere", status="exited", exit_code=4,
+                            output="replayed from the start")
+        self.make_container("vidfunnel-plan-startedelsewhere", status="running", cwd="/srv/other")
+        code, stdout, stderr = self.run_with(["attach"])
+        self.assertEqual(code, 4, stdout + stderr)
+        self.assertIn("replayed from the start", stdout)
+        self.assertIn("logs -f vidfunnel-convert-startedhere", self.calls())
+        self.assertIn("rm vidfunnel-convert-startedhere", self.calls())
+
+    def test_attach_by_name_follows_and_removes(self):
+        self.make_container("vidfunnel-convert-byname", status="exited", exit_code=5, cwd="/srv/other",
+                            output="the whole log")
+        code, stdout, stderr = self.run_with(["attach", "vidfunnel-convert-byname"])
+        self.assertEqual(code, 5, stdout + stderr)
+        self.assertIn("the whole log", stdout)
+        calls = [line for line in self.calls() if not line.startswith("inspect ")]
+        self.assertEqual(calls[-3:], ["logs -f vidfunnel-convert-byname", "wait vidfunnel-convert-byname",
+                                      "rm vidfunnel-convert-byname"])
+        self.assertIn("'vidfunnel-convert-byname' exited with code 5; removed it", stderr)
+
+    def test_attach_by_unique_prefix(self):
+        self.make_container("vidfunnel-convert-uniquely", status="exited", cwd="/srv/other")
+        self.make_container("vidfunnel-plan-another", status="exited", cwd="/srv/other")
+        code, stdout, stderr = self.run_with(["attach", "vidfunnel-conv"])
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertIn("logs -f vidfunnel-convert-uniquely", self.calls())
+
+    def test_attach_by_ambiguous_prefix_names_both(self):
+        self.make_container("vidfunnel-convert-ambiguousone", status="running", cwd="/srv/other")
+        self.make_container("vidfunnel-convert-ambiguoustwo", status="running", cwd="/srv/other")
+        code, stdout, stderr = self.run_with(["attach", "vidfunnel-convert-ambig"])
+        self.assertEqual(code, 1, stdout + stderr)
+        self.assertIn("'vidfunnel-convert-ambiguousone'", stderr)
+        self.assertIn("'vidfunnel-convert-ambiguoustwo'", stderr)
+        self.assertFalse(any(line.startswith("logs") for line in self.calls()))
+
+    def test_attach_to_an_unknown_name(self):
+        code, stdout, stderr = self.run_with(["attach", "vidfunnel-nothing"])
+        self.assertEqual(code, 1, stdout + stderr)
+        self.assertIn("no vidfunnel container on this host is named 'vidfunnel-nothing'", stderr)
+
+    def test_attach_clean_removes_only_the_exited_ones(self):
+        self.make_container("vidfunnel-plan-finished", status="exited", exit_code=3, stage="plan",
+                            cwd="/srv/other")
+        self.make_container("vidfunnel-convert-busy", status="running", cwd="/srv/other")
+        code, stdout, stderr = self.run_with(["attach", "--clean"])
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertIn("'vidfunnel-plan-finished' (plan, started 2026-11-08T10:00:00Z) exited with exit code 3",
+                      stdout)
+        self.assertIn("rm vidfunnel-plan-finished", self.calls())
+        self.assertNotIn("rm vidfunnel-convert-busy", self.calls())
+        self.assertFalse((self.state / "vidfunnel-plan-finished").exists())
+        self.assertTrue((self.state / "vidfunnel-convert-busy").exists())
+
+    def test_attach_follows_a_running_container_and_ctrl_c_stops_it(self):
+        self.make_container("vidfunnel-verify-running", status="running", stage="verify", cwd="/srv/other")
+        process = self.start_in_background(["attach", "vidfunnel-verify-running"], FAKE_STOP_DELAY="1")
+        self.wait_for_call("logs -f vidfunnel-verify-running", process)
+        os.killpg(process.pid, signal.SIGINT)
+        code, stdout, stderr = self.finish(process)
+        self.assertEqual(code, 143, stdout + stderr)
+        self.assertIn("stop -t 30 vidfunnel-verify-running", self.calls())
+
+
+class StopTests(ContainerTestCase):
+    def test_stop_by_name_drains_and_follows(self):
+        self.make_container("vidfunnel-convert-draining", status="running", cwd="/srv/other")
+        code, stdout, stderr = self.run_with(["stop", "vidfunnel-convert-draining"],
+                                             FAKE_STOP_OUTPUT="vidfunnel: drained")
+        self.assertEqual(code, 0, stdout + stderr)
+        calls = self.calls()
+        kill_index = calls.index("kill --signal USR1 vidfunnel-convert-draining")
+        follow = [line for line in calls[kill_index + 1:] if line.startswith(("logs", "wait", "rm"))]
+        self.assertEqual(len(follow), 3, calls)
+        self.assertTrue(follow[0].startswith("logs -f --since "), calls)
+        self.assertEqual(follow[1:], ["wait vidfunnel-convert-draining", "rm vidfunnel-convert-draining"])
+        self.assertFalse(any(line.startswith("stop") for line in calls), calls)
+        self.assertIn("vidfunnel: drained", stdout)
+        self.assertIn("asked 'vidfunnel-convert-draining' to drain", stderr)
+
+    def test_stop_now_sends_sigterm_and_follows(self):
+        self.make_container("vidfunnel-convert-stopnow", status="running", cwd="/srv/other")
+        code, stdout, stderr = self.run_with(["stop", "--now", "vidfunnel-convert-stopnow"])
+        self.assertEqual(code, 143, stdout + stderr)
+        calls = self.calls()
+        self.assertIn("stop -t 30 vidfunnel-convert-stopnow", calls)
+        self.assertFalse(any(line.startswith("kill") for line in calls), calls)
+        self.assertEqual(calls[-2:], ["wait vidfunnel-convert-stopnow", "rm vidfunnel-convert-stopnow"])
+
+    def test_stop_without_name_picks_the_one_running_here(self):
+        self.make_container("vidfunnel-plan-runninghere", status="running", stage="plan")
+        self.make_container("vidfunnel-plan-finishedhere", status="exited")
+        self.make_container("vidfunnel-plan-runningelsewhere", status="running", cwd="/srv/other")
+        code, stdout, stderr = self.run_with(["stop"])
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertIn("kill --signal USR1 vidfunnel-plan-runninghere", self.calls())
+
+    def test_stop_without_name_and_none_here_lists_and_fails(self):
+        self.make_container("vidfunnel-plan-runningelsewhere", status="running", cwd="/srv/other")
+        code, stdout, stderr = self.run_with(["stop"])
+        self.assertEqual(code, 1, stdout + stderr)
+        self.assertIn("no vidfunnel container started in '{}' is running".format(self.workdir), stderr)
+        self.assertIn("'vidfunnel-plan-runningelsewhere': convert, running", stdout)
+        self.assertFalse(any(line.startswith(("kill", "stop")) for line in self.calls()))
+
+    def test_stop_without_name_and_several_here_lists_and_fails(self):
+        self.make_container("vidfunnel-plan-firsthere", status="running")
+        self.make_container("vidfunnel-verify-secondhere", status="running")
+        code, stdout, stderr = self.run_with(["stop"])
+        self.assertEqual(code, 1, stdout + stderr)
+        self.assertIn("2 vidfunnel containers started in", stderr)
+        self.assertIn("'vidfunnel-plan-firsthere'", stdout)
+        self.assertIn("'vidfunnel-verify-secondhere'", stdout)
+        self.assertFalse(any(line.startswith(("kill", "stop")) for line in self.calls()))
+
+    def test_stop_with_ambiguous_prefix_names_both(self):
+        self.make_container("vidfunnel-convert-ambiguousone", status="running")
+        self.make_container("vidfunnel-convert-ambiguoustwo", status="running")
+        code, stdout, stderr = self.run_with(["stop", "--now", "vidfunnel-convert-amb"])
+        self.assertEqual(code, 1, stdout + stderr)
+        self.assertIn("'vidfunnel-convert-ambiguousone', 'vidfunnel-convert-ambiguoustwo'", stderr)
+        self.assertFalse(any(line.startswith(("kill", "stop")) for line in self.calls()))
+
+    def test_stop_with_a_folder_is_refused_with_the_stop_all_advice(self):
+        library = self.workdir / "library"
+        library.mkdir()
+        elsewhere = self.workdir.parent / "library-elsewhere"
+        elsewhere.mkdir()
+        self.make_container("vidfunnel-convert-library", status="running")
+        for arguments in (["stop", "library"], ["stop", "--now", "library"], ["stop", str(elsewhere)],
+                          ["stop", "/srv/not-here"]):
+            code, stdout, stderr = self.run_with(arguments)
+            self.assertEqual(code, 1, stdout + stderr)
+            self.assertIn("To stop every host's runs under a path use: vidfunnel stop-all {}".format(
+                arguments[-1]), stderr)
+            self.assertFalse(self.engine_log.exists(), arguments)
+            self.assertFalse(any(line.startswith(("kill", "stop", "logs", "run")) for line in self.calls()),
+                             self.calls())
+        self.assertEqual((self.state / "vidfunnel-convert-library" / "status").read_text(), "running\n")
+
+    def test_stop_all_and_resume_go_to_vidfunnel_attached(self):
+        library = self.workdir / "library"
+        library.mkdir()
+        elsewhere = self.workdir.parent / "library-elsewhere"
+        elsewhere.mkdir()
+        for arguments in (["stop-all", "library"], ["stop-all", "--now", str(elsewhere)],
+                          ["resume", "library", str(elsewhere)]):
+            if self.call_log.exists():
+                self.call_log.unlink()
+            code, stdout, stderr = self.run_with(arguments)
+            self.assertEqual(code, 0, stdout + stderr)
+            argv = self.engine_argv()
+            self.assertEqual(argv[:2], ["run", "--rm"], arguments)
+            self.assertEqual(argv[-len(arguments):], arguments)
+            self.assert_pair(argv, "-v", "{0}:{0}".format(self.workdir))
+            if str(elsewhere) in arguments:
+                self.assert_pair(argv, "-v", "{0}:{0}".format(elsewhere))
+            self.assertFalse(any(line.startswith(("kill", "stop", "logs", "ps")) for line in self.calls()),
+                             self.calls())
+
+    def test_stop_with_a_name_that_is_no_folder_stays_local(self):
+        self.make_container("vidfunnel-convert-notafolder", status="running")
+        code, stdout, stderr = self.run_with(["stop", "vidfunnel-convert-notafolder"])
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertIn("kill --signal USR1 vidfunnel-convert-notafolder", self.calls())
+        self.assertFalse(self.engine_log.exists())
+
+    def test_stop_of_an_exited_container_is_refused(self):
+        self.make_container("vidfunnel-convert-alreadydone", status="exited", exit_code=0)
+        code, stdout, stderr = self.run_with(["stop", "vidfunnel-convert-alreadydone"])
+        self.assertEqual(code, 1, stdout + stderr)
+        self.assertIn("'vidfunnel-convert-alreadydone' is not running", stderr)
+        self.assertFalse(any(line.startswith(("kill", "stop")) for line in self.calls()))
 
 
 if __name__ == "__main__":

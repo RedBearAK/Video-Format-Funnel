@@ -7,6 +7,8 @@
 # created on the host first and mounted. HOME is passed in, with its vidfunnel
 # state and cache folders mounted. --ffmpeg is refused. --install-command and
 # --uninstall-command run on the host and link 'vidfunnel' to this wrapper.
+# plan, convert and verify run in a detached, labelled container that the wrapper
+# follows; 'attach' follows one again and 'stop' drains or stops one.
 # See HANDOFF.md section 8.
 
 VERSION="20261108"
@@ -19,6 +21,7 @@ VIDFUNNEL_IMAGE_DIGEST=""
 
 IMAGE="${VIDFUNNEL_IMAGE:-localhost/vidfunnel:latest}"
 BUILD=0
+STOP_GRACE_SECONDS=30
 
 usage() {
     cat <<EOF2
@@ -79,7 +82,8 @@ What the wrapper does:
   writes nothing else under HOME. Both folders are also mounted at their
   physical path when ~/.cache or ~/.local/state is a symlink to another disk.
   An unset or empty HOME stops the wrapper.
-  The container runs with --rm, --userns=keep-id (podman) or --user uid:gid
+  The container runs with --rm (attached runs; detached ones are removed by the
+  wrapper, see below), --userns=keep-id (podman) or --user uid:gid
   (docker) so files are owned by you, and --security-opt label=disable for SELinux
   hosts. It gets a terminal (-it) only when both stdin and stdout are terminals;
   piped ('| less', '| tee', '> file') it gets no terminal and no stdin at all, so
@@ -111,10 +115,67 @@ Installing the command:
   to this wrapper or to bin/vidfunnel. The repo's installer removes only a
   symlink to this wrapper.
 
+Long runs (plan, convert, verify) are detached:
+  These stages run in a detached container (podman run -d) named
+  vidfunnel-STAGE-HASH (HASH: the first 12 hex digits of the sha256 of the
+  working directory and the first path argument) and labelled vidfunnel=1 with
+  the stage, working directory, path arguments and start time. The wrapper then
+  follows its output (podman logs -f) and, when the container exits, removes it
+  and exits with the container's exit code. The run therefore survives the
+  terminal: if the wrapper, its terminal or a '| tee' after it dies, the
+  container goes on, and 'attach' follows it again. Detached containers get no
+  terminal and no stdin, so progress arrives as whole lines, also when you run
+  in a terminal. Other subcommands, any help request, and retire's prompt run
+  attached as described above.
+  Ctrl+C while following stops the container (podman stop: SIGTERM, which
+  vidfunnel handles like Ctrl+C) and keeps following until it has exited; a
+  second Ctrl+C stops following and leaves the container to finish its stop on
+  its own. A closed terminal (SIGHUP), SIGTERM or SIGQUIT to the wrapper stop
+  only the following; the container keeps running.
+  A container of the same name that has exited (its wrapper died before
+  removing it) is reported with its exit code and last 20 lines, removed, and
+  the new run starts. A run is refused (exit 1) while a container of the same
+  name, or one working on the same paths (the path arguments, or the working
+  directory when there are none), is running on this host; the message names
+  it. Containers on other hosts are not visible to podman here: between hosts,
+  the folder locks on the share keep two runs out of the same folder.
+  VIDFUNNEL_ATTACHED=1 runs these stages attached, as the other subcommands.
+
+Wrapper commands (handled by the wrapper, not passed to vidfunnel):
+  attach             lists the vidfunnel containers on this host (running and
+                     exited, with stage, folder, paths, start time, status);
+                     when exactly one of them was started in the current
+                     directory (a running one preferred), follows that one
+  attach NAME        follows the container NAME, or the one whose name starts
+                     with NAME; the whole log is replayed first, so
+                     'attach NAME | tee -a LOG' fills in what a dead '| tee LOG'
+                     missed. When the container has exited, its exit code is
+                     the wrapper's and the container is removed.
+  attach --clean     removes the exited vidfunnel containers, printing each
+                     one's exit code first
+  stop [NAME]        this host's run: asks it to drain (podman kill --signal
+                     USR1): the items in progress finish, no new ones start,
+                     and vidfunnel exits normally, so the server can be
+                     rebooted without losing the encodes in progress; then
+                     follows its output until it exits. Without NAME, the one
+                     running container started in the current directory;
+                     otherwise the list is printed and a NAME is needed.
+  stop --now [NAME]  stops it at once (podman stop: SIGTERM, SIGKILL after
+                     ${STOP_GRACE_SECONDS} seconds), then follows it
+  Following in attach and stop handles Ctrl+C, SIGHUP and SIGTERM as above.
+  'stop' is for this host only: a path argument (an existing file or folder, or
+  anything with a '/') is refused. vidfunnel's own 'stop-all PATH...' stops
+  every run under PATH on every host, through the share, and 'resume PATH...'
+  lifts that (deleting PATH/.vidfunnel/stop does the same); both run in the
+  container, attached, like 'check'.
+  Installed as 'vidfunnel', these are 'vidfunnel attach' and 'vidfunnel stop'.
+
 Environment:
   VIDFUNNEL_IMAGE          image name, overridden by --image
   VIDFUNNEL_NICE           if set, run the container command under nice -n VALUE
   VIDFUNNEL_IONICE_CLASS   if set and ionice exists, run under ionice -c VALUE
+  VIDFUNNEL_ATTACHED       1 runs plan, convert and verify attached (no detached
+                           container, no name, no attach)
 
 Pinning: the variable VIDFUNNEL_IMAGE_DIGEST near the top of this script is empty
 by default. When it holds a digest (sha256:...), the wrapper runs IMAGE@DIGEST, so
@@ -134,6 +195,11 @@ while [ $# -gt 0 ]; do
         *) break ;;
     esac
 done
+
+case "${VIDFUNNEL_ATTACHED:-}" in
+    ""|0|1) ;;
+    *) die "VIDFUNNEL_ATTACHED is '${VIDFUNNEL_ATTACHED}'; set it to 1 to run plan, convert and verify attached, or leave it unset" ;;
+esac
 
 self="$0"
 while [ -L "$self" ]; do
@@ -372,6 +438,407 @@ fi
 
 [ -n "${ENGINE:-}" ] || find_engine
 
+# Detached runs, 'attach' and 'stop'. plan, convert and verify run in a detached,
+# named and labelled container that the wrapper follows with 'logs -f', so the run
+# survives the terminal, the wrapper and a '| tee' after it. The container is not
+# started with --rm: podman's own cleanup would remove it as it exits, racing the
+# 'wait' that reads its exit code (seen with podman 6.1.4 and the k8s-file log
+# driver), and an exited container whose wrapper died is what 'attach' replays.
+# The wrapper removes it once it has the exit code.
+
+NEWLINE='
+'
+
+command_name() {
+    shown=$(basename "$0")
+    if [ "$(command -v "${shown}" 2>/dev/null || true)" = "$0" ]; then
+        printf '%s' "${shown}"
+    else
+        printf '%s' "$0"
+    fi
+}
+
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+container_field() {
+    "${ENGINE}" inspect --type container --format "$2" "$1" 2>/dev/null || true
+}
+
+container_label() {
+    container_field "$1" "{{index .Config.Labels \"$2\"}}"
+}
+
+container_status() {
+    c_state=$(container_field "$1" '{{.State.Status}}')
+    printf '%s' "${c_state:-gone}"
+}
+
+# The paths a run works on: its path arguments, or the folder it was started in.
+container_targets() {
+    t_paths=$(container_label "$1" vidfunnel.paths)
+    if [ -n "${t_paths}" ]; then
+        printf '%s' "${t_paths}"
+    else
+        container_label "$1" vidfunnel.cwd
+    fi
+}
+
+status_is_running() {
+    case "$1" in
+        created|configured|initialized|exited|stopped|dead|removing|gone|"") return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+labelled_containers() {
+    "${ENGINE}" ps -a --filter label=vidfunnel=1 --format '{{.Names}}' \
+        || die "'${ENGINE} ps' failed; cannot list the vidfunnel containers on this host"
+}
+
+describe_container() {
+    d_status=$(container_status "$1")
+    d_stage=$(container_label "$1" vidfunnel.stage)
+    d_cwd=$(container_label "$1" vidfunnel.cwd)
+    d_paths=$(container_label "$1" vidfunnel.paths)
+    d_started=$(container_label "$1" vidfunnel.started)
+    if ! status_is_running "${d_status}"; then
+        d_status="${d_status}, exit code $(container_field "$1" '{{.State.ExitCode}}')"
+    fi
+    say "'$1': ${d_stage:-unknown stage}, ${d_status}, started ${d_started:-at an unknown time}"
+    if [ -n "${d_paths}" ]; then
+        say "    in '${d_cwd}', paths '${d_paths}'"
+    else
+        say "    in '${d_cwd}', no path arguments (that folder)"
+    fi
+}
+
+list_containers() {
+    l_names=$(labelled_containers)
+    if [ -z "${l_names}" ]; then
+        say "No vidfunnel containers on this host (containers started on other hosts are not visible here)."
+        return 0
+    fi
+    oldifs="$IFS"
+    IFS="${NEWLINE}"
+    for l_name in ${l_names}; do
+        describe_container "${l_name}"
+    done
+    IFS="$oldifs"
+    say "Follow one with '$(command_name) attach NAME' (the start of a name is enough), drain one with '$(command_name) stop NAME', remove the exited ones with '$(command_name) attach --clean'."
+}
+
+# Sets RESOLVED to the labelled container named $1, or the only one whose name starts with $1.
+resolve_container() {
+    [ -n "$1" ] || die "an empty container name was given"
+    r_names=$(labelled_containers)
+    RESOLVED=""
+    r_matches=""
+    r_count=0
+    oldifs="$IFS"
+    IFS="${NEWLINE}"
+    for r_name in ${r_names}; do
+        if [ "${r_name}" = "$1" ]; then
+            RESOLVED="${r_name}"
+            IFS="$oldifs"
+            return 0
+        fi
+        case "${r_name}" in
+            "$1"*)
+                RESOLVED="${r_name}"
+                r_matches="${r_matches}${r_matches:+, }'${r_name}'"
+                r_count=$((r_count + 1))
+                ;;
+        esac
+    done
+    IFS="$oldifs"
+    if [ "${r_count}" -eq 0 ]; then
+        die "no vidfunnel container on this host is named '$1' or has a name starting with it; list them with '$(command_name) attach'"
+    fi
+    if [ "${r_count}" -gt 1 ]; then
+        die "'$1' starts the names of more than one vidfunnel container: ${r_matches}; give more of the name"
+    fi
+    return 0
+}
+
+# Sets PICKED and PICKED_COUNT from the labelled containers started in CWD ($1: running or any).
+pick_by_cwd() {
+    PICKED=""
+    PICKED_COUNT=0
+    p_names=$(labelled_containers)
+    oldifs="$IFS"
+    IFS="${NEWLINE}"
+    for p_name in ${p_names}; do
+        [ "$(container_label "${p_name}" vidfunnel.cwd)" = "${CWD}" ] || continue
+        if [ "$1" = running ]; then
+            status_is_running "$(container_status "${p_name}")" || continue
+        fi
+        PICKED="${p_name}"
+        PICKED_COUNT=$((PICKED_COUNT + 1))
+    done
+    IFS="$oldifs"
+}
+
+FOLLOW_NAME=""
+FOLLOWER_PID=""
+FOLLOW_SINCE=""
+FOLLOW_STOPPING=0
+FOLLOW_RESTARTED=0
+
+start_follower() {
+    if [ -n "${FOLLOW_SINCE}" ]; then
+        "${ENGINE}" logs -f --since "${FOLLOW_SINCE}" "${FOLLOW_NAME}" </dev/null &
+    else
+        "${ENGINE}" logs -f "${FOLLOW_NAME}" </dev/null &
+    fi
+    FOLLOWER_PID=$!
+}
+
+request_stop() {
+    "${ENGINE}" stop -t "${STOP_GRACE_SECONDS}" "$1" >/dev/null </dev/null &
+}
+
+detach_follow() {
+    kill "${FOLLOWER_PID}" 2>/dev/null || true
+    say "vidfunnel-podman: stopped following '${FOLLOW_NAME}' ($2); $3; follow it again with '$(command_name) attach ${FOLLOW_NAME}'" >&2 || true
+    exit "$1"
+}
+
+# Ctrl+C reaches the wrapper and the follower ('podman logs -f' ends on it). The first
+# one stops the container and the output is followed on from that moment; the next
+# one only stops following. A run that is already stopping detaches at once.
+on_follow_interrupt() {
+    if [ "${FOLLOW_STOPPING}" -eq 1 ]; then
+        detach_follow 130 "Ctrl+C again" "the container still finishes stopping"
+    fi
+    FOLLOW_STOPPING=1
+    FOLLOW_SINCE=$(now_utc)
+    FOLLOW_RESTARTED=0
+    say "vidfunnel-podman: stopping '${FOLLOW_NAME}' (Ctrl+C again stops following; the container still finishes stopping)" >&2 || true
+    request_stop "${FOLLOW_NAME}"
+}
+
+# Follows $1 until it exits, then removes it and exits with its exit code. With $2
+# 'report', a line names the exit code (attach and stop).
+follow_container() {
+    FOLLOW_NAME="$1"
+    trap 'on_follow_interrupt' INT
+    trap 'detach_follow 129 "the terminal closed" "it keeps running"' HUP
+    trap 'detach_follow 143 "SIGTERM" "it keeps running"' TERM
+    trap 'detach_follow 131 "SIGQUIT" "it keeps running"' QUIT
+    start_follower
+    while :; do
+        follower_status=0
+        wait "${FOLLOWER_PID}" || follower_status=$?
+        if kill -0 "${FOLLOWER_PID}" 2>/dev/null; then
+            continue
+        fi
+        if ! status_is_running "$(container_status "${FOLLOW_NAME}")"; then
+            break
+        fi
+        if [ -n "${FOLLOW_SINCE}" ] && [ "${FOLLOW_RESTARTED}" -eq 0 ]; then
+            FOLLOW_RESTARTED=1
+            start_follower
+            continue
+        fi
+        if [ "${FOLLOW_STOPPING}" -eq 1 ]; then
+            break
+        fi
+        say "vidfunnel-podman: the output of '${FOLLOW_NAME}' ended while it still runs ('${ENGINE} logs -f' exited with code ${follower_status}); it keeps running; follow it again with '$(command_name) attach ${FOLLOW_NAME}'" >&2
+        exit 1
+    done
+    exit_code=$("${ENGINE}" wait "${FOLLOW_NAME}" 2>/dev/null) || exit_code=""
+    case "${exit_code}" in
+        ""|*[!0-9]*)
+            say "vidfunnel-podman: could not read the exit code of '${FOLLOW_NAME}' ('${ENGINE} wait' printed '${exit_code}'); exiting with 1" >&2
+            exit_code=1
+            ;;
+    esac
+    if ! "${ENGINE}" rm "${FOLLOW_NAME}" >/dev/null 2>&1; then
+        if [ "$(container_status "${FOLLOW_NAME}")" != gone ]; then
+            say "vidfunnel-podman: could not remove the exited container '${FOLLOW_NAME}'; remove it with '${ENGINE} rm ${FOLLOW_NAME}'" >&2
+        fi
+    fi
+    if [ "${2:-}" = report ]; then
+        say "vidfunnel-podman: '${FOLLOW_NAME}' exited with code ${exit_code}; removed it" >&2
+    fi
+    trap - INT HUP TERM QUIT
+    exit "${exit_code}"
+}
+
+clean_containers() {
+    k_names=$(labelled_containers)
+    k_removed=0
+    k_failed=0
+    oldifs="$IFS"
+    IFS="${NEWLINE}"
+    for k_name in ${k_names}; do
+        k_status=$(container_status "${k_name}")
+        if status_is_running "${k_status}" || [ "${k_status}" = gone ]; then
+            continue
+        fi
+        say "'${k_name}' ($(container_label "${k_name}" vidfunnel.stage), started $(container_label "${k_name}" vidfunnel.started)) ${k_status} with exit code $(container_field "${k_name}" '{{.State.ExitCode}}'); removing it"
+        if "${ENGINE}" rm "${k_name}" >/dev/null; then
+            k_removed=$((k_removed + 1))
+        else
+            say "vidfunnel-podman: could not remove '${k_name}'" >&2
+            k_failed=1
+        fi
+    done
+    IFS="$oldifs"
+    [ "${k_removed}" -gt 0 ] || [ "${k_failed}" -eq 1 ] || say "No exited vidfunnel containers to remove."
+    return "${k_failed}"
+}
+
+attach_command() {
+    if [ $# -gt 1 ]; then
+        die "attach takes one container name (or the start of one), or --clean; '$*' is more than that"
+    fi
+    if [ $# -eq 1 ]; then
+        case "$1" in
+            --clean) clean_containers; exit $? ;;
+            -*) die "attach takes a container name (or the start of one), or --clean; '$1' is not understood" ;;
+        esac
+        resolve_container "$1"
+        follow_container "${RESOLVED}" report
+    fi
+    pick_by_cwd running
+    if [ "${PICKED_COUNT}" -eq 0 ]; then
+        pick_by_cwd any
+    fi
+    if [ "${PICKED_COUNT}" -eq 1 ]; then
+        say "vidfunnel-podman: following '${PICKED}', started in this folder" >&2
+        follow_container "${PICKED}" report
+    fi
+    list_containers
+    exit 0
+}
+
+stop_command() {
+    s_now=0
+    s_target=""
+    for s_arg in "$@"; do
+        case "${s_arg}" in
+            --now) s_now=1 ;;
+            -*) die "stop takes --now and a container name (or the start of one); '${s_arg}' is not understood" ;;
+            */*)
+                die "'${s_arg}' is a path; 'stop' stops a run on this host by its container name. To stop every host's runs under a path use: vidfunnel stop-all ${s_arg}"
+                ;;
+            *)
+                if [ -e "${s_arg}" ]; then
+                    die "'${s_arg}' is a path; 'stop' stops a run on this host by its container name. To stop every host's runs under a path use: vidfunnel stop-all ${s_arg}"
+                fi
+                [ -z "${s_target}" ] || die "stop takes one container name; '${s_target}' and '${s_arg}' were given"
+                s_target="${s_arg}"
+                ;;
+        esac
+    done
+    if [ -z "${s_target}" ]; then
+        pick_by_cwd running
+        if [ "${PICKED_COUNT}" -ne 1 ]; then
+            if [ "${PICKED_COUNT}" -eq 0 ]; then
+                say "vidfunnel-podman: no vidfunnel container started in '${CWD}' is running on this host; name the one to stop with '$(command_name) stop NAME'" >&2
+            else
+                say "vidfunnel-podman: ${PICKED_COUNT} vidfunnel containers started in '${CWD}' are running on this host; name the one to stop with '$(command_name) stop NAME'" >&2
+            fi
+            list_containers
+            exit 1
+        fi
+        s_target="${PICKED}"
+    else
+        resolve_container "${s_target}"
+        s_target="${RESOLVED}"
+    fi
+    s_status=$(container_status "${s_target}")
+    if ! status_is_running "${s_status}"; then
+        die "'${s_target}' is not running (${s_status}, exit code $(container_field "${s_target}" '{{.State.ExitCode}}')); see its output with '$(command_name) attach ${s_target}'"
+    fi
+    FOLLOW_SINCE=$(now_utc)
+    if [ "${s_now}" -eq 1 ]; then
+        say "vidfunnel-podman: stopping '${s_target}' now (SIGTERM; Ctrl+C stops following, the container still finishes stopping)" >&2
+        FOLLOW_STOPPING=1
+        request_stop "${s_target}"
+    else
+        "${ENGINE}" kill --signal USR1 "${s_target}" >/dev/null \
+            || die "could not send USR1 to '${s_target}'"
+        say "vidfunnel-podman: asked '${s_target}' to drain: the items in progress finish and no new ones start (Ctrl+C stops it at once instead)" >&2
+    fi
+    follow_container "${s_target}" report
+}
+
+if [ $# -gt 0 ] && { [ "$1" = attach ] || [ "$1" = stop ]; }; then
+    CWD=$(pwd)
+    wrapper_command="$1"
+    shift
+    if [ "${wrapper_command}" = attach ]; then
+        attach_command "$@"
+    else
+        stop_command "$@"
+    fi
+fi
+
+short_hash() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        h_digest=$(printf '%s\n%s\n' "$1" "$2" | sha256sum)
+    elif command -v shasum >/dev/null 2>&1; then
+        h_digest=$(printf '%s\n%s\n' "$1" "$2" | shasum -a 256)
+    elif command -v openssl >/dev/null 2>&1; then
+        h_digest=$(printf '%s\n%s\n' "$1" "$2" | openssl dgst -sha256 -r)
+    else
+        die "none of sha256sum, shasum or openssl is on PATH; the detached container's name needs one (or set VIDFUNNEL_ATTACHED=1)"
+    fi
+    printf '%s' "${h_digest}" | cut -c1-12
+}
+
+refuse_duplicate() {
+    say "vidfunnel-podman: '$1' ($(container_label "$1" vidfunnel.stage), started $(container_label "$1" vidfunnel.started)) is already running on this host for '$(container_targets "$1")'; not starting another. Follow it with '$(command_name) attach $1', or drain it with '$(command_name) stop $1'." >&2
+    exit 1
+}
+
+report_stale() {
+    {
+        say "vidfunnel-podman: an earlier '$1' ($(container_label "$1" vidfunnel.stage), started $(container_label "$1" vidfunnel.started)) has $(container_status "$1") with exit code $(container_field "$1" '{{.State.ExitCode}}') and was not removed (its wrapper did not see it end); its last lines:"
+        "${ENGINE}" logs --tail 20 "$1" 2>&1 | sed 's/^/    /'
+    } >&2
+    "${ENGINE}" rm "$1" >/dev/null || die "could not remove the earlier container '$1'; remove it with '${ENGINE} rm $1'"
+    say "vidfunnel-podman: removed the earlier '$1'" >&2
+}
+
+check_before_start() {
+    b_names=$(labelled_containers)
+    oldifs="$IFS"
+    IFS="${NEWLINE}"
+    for b_name in ${b_names}; do
+        b_status=$(container_status "${b_name}")
+        if [ "${b_name}" = "${RUN_NAME}" ]; then
+            if status_is_running "${b_status}"; then
+                refuse_duplicate "${b_name}"
+            fi
+            if [ "${b_status}" != gone ]; then
+                report_stale "${b_name}"
+            fi
+            continue
+        fi
+        if status_is_running "${b_status}" && [ "$(container_targets "${b_name}")" = "${RUN_TARGETS}" ]; then
+            refuse_duplicate "${b_name}"
+        fi
+    done
+    IFS="$oldifs"
+}
+
+start_detached() {
+    check_before_start
+    run_status=0
+    "$@" >/dev/null || run_status=$?
+    if [ "${run_status}" -ne 0 ]; then
+        if [ "$(container_status "${RUN_NAME}")" != gone ]; then
+            "${ENGINE}" rm "${RUN_NAME}" >/dev/null 2>&1 || true
+        fi
+        die "'${ENGINE} run -d' failed with code ${run_status}; nothing is running as '${RUN_NAME}'"
+    fi
+    say "vidfunnel-podman: running detached as '${RUN_NAME}'; Ctrl+C stops it; '$(command_name) attach ${RUN_NAME}' follows it again from another terminal" >&2
+    follow_container "${RUN_NAME}"
+}
+
 state_dir="${HOME}/.local/state/vidfunnel"
 cache_dir="${HOME}/.cache/vidfunnel"
 
@@ -513,6 +980,17 @@ prepare_option_value() {
     esac
 }
 
+HELP_GIVEN=0
+FIRST_PATH=""
+PATH_LABEL=""
+
+# The path arguments of a detached run, made absolute, name it and label it.
+add_path_argument() {
+    a_path=$(abs_path "$1") || die "cannot resolve '$1' to an absolute path"
+    [ -n "${FIRST_PATH}" ] || FIRST_PATH="${a_path}"
+    PATH_LABEL="${PATH_LABEL}${PATH_LABEL:+ }${a_path}"
+}
+
 count=$#
 i=0
 pending=""
@@ -538,9 +1016,16 @@ while [ "${i}" -lt "${count}" ]; do
                 elif [ -z "${SUBCOMMAND}" ] && is_option_prefix "${arg}" "--launcher" "--l"; then
                     skip_value=1
                 fi
+                case "${arg}" in
+                    -h|--h|--he|--hel|--help|--version) HELP_GIVEN=1 ;;
+                esac
                 ;;
             *)
-                [ -n "${SUBCOMMAND}" ] || SUBCOMMAND="${arg}"
+                if [ -z "${SUBCOMMAND}" ]; then
+                    SUBCOMMAND="${arg}"
+                elif [ -e "${arg}" ]; then
+                    add_path_argument "${arg}"
+                fi
                 ;;
         esac
     fi
@@ -612,10 +1097,25 @@ fi
 # terminal: the two race for every key, and podman leaves echo off on exit when its
 # stdout is not the terminal. In a pipeline nothing in vidfunnel needs stdin: its one
 # prompt (retire --destroy-originals-now) refuses without a terminal unless --yes.
-if [ -t 0 ] && [ -t 1 ]; then
-    set -- -it "$@"
+DETACH=0
+case "${SUBCOMMAND}" in
+    plan|convert|verify) DETACH=1 ;;
+esac
+if [ "${HELP_GIVEN}" -eq 1 ] || [ "${VIDFUNNEL_ATTACHED:-}" = 1 ]; then
+    DETACH=0
 fi
-set -- "${ENGINE}" run --rm "$@"
+if [ "${DETACH}" -eq 1 ]; then
+    RUN_NAME="vidfunnel-${SUBCOMMAND}-$(short_hash "${CWD}" "${FIRST_PATH}")"
+    RUN_TARGETS="${PATH_LABEL:-${CWD}}"
+    set -- "${ENGINE}" run -d --name "${RUN_NAME}" --label vidfunnel=1 \
+        --label "vidfunnel.stage=${SUBCOMMAND}" --label "vidfunnel.cwd=${CWD}" \
+        --label "vidfunnel.paths=${PATH_LABEL}" --label "vidfunnel.started=$(now_utc)" "$@"
+else
+    if [ -t 0 ] && [ -t 1 ]; then
+        set -- -it "$@"
+    fi
+    set -- "${ENGINE}" run --rm "$@"
+fi
 
 if [ -n "${VIDFUNNEL_IONICE_CLASS:-}" ] && command -v ionice >/dev/null 2>&1; then
     set -- ionice -c "${VIDFUNNEL_IONICE_CLASS}" "$@"
@@ -624,6 +1124,9 @@ if [ -n "${VIDFUNNEL_NICE:-}" ]; then
     set -- nice -n "${VIDFUNNEL_NICE}" "$@"
 fi
 
+if [ "${DETACH}" -eq 1 ]; then
+    start_detached "$@"
+fi
 exec "$@"
 
 # End of File #
