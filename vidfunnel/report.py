@@ -23,6 +23,11 @@ group. Groups are ordered by the position of their worst row in the sort order
 below, and rows inside a group keep that order, so the worst row of the whole
 report is still the first row printed. It cannot be read back with --from.
 
+A quarantined or failed row carries a one-line 'reason' (see _reason): a
+'reason:' line under the row in text, a Reasons section after the table in
+Markdown (which --from skips, as it skips everything but the table and the
+Folders section), a 'reason' field in JSON and a 'reason' column in CSV.
+
 Text and Markdown show each record ID as its first 8 characters (longer only
 when two of the records collected, before any filter, would share them), which
 'vidfunnel find' accepts as a prefix. '--from' resolves such prefixes against the records it finds; a
@@ -79,7 +84,7 @@ HEADER_COMMENT_END = " -->"
 # Row fields, in CSV column order. 'logs' is added only with --with-logs.
 ROW_FIELDS = (
     "id", "score", "band", "status", "action", "flags", "quarantine_reason",
-    "source_size", "output_size", "ratio", "path", "output_name", "changed_since",
+    "source_size", "output_size", "ratio", "path", "output_name", "changed_since", "reason",
 )
 LOG_KEYS = ("stderr", "log", "run_log")
 MD_COLUMNS = ("ID", "score", "band", "status", "action", "flags", "source", "size")
@@ -89,6 +94,7 @@ SHORT_ID_LENGTH = 8
 # A row's real folder as a number (rows_from_records); not part of the JSON or CSV output.
 FOLDER_GROUP_KEY = "_folder_group"
 FOLDERS_HEADING = "## Folders"
+REASONS_HEADING = "## Reasons"
 TEXT_TITLE = "vidfunnel report"
 
 
@@ -248,6 +254,55 @@ def _logs(record):
     return entries
 
 
+def _first_line(text):
+    """The first non-empty line of text, with ' ...' when more non-empty lines follow; None for none."""
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    if not lines:
+        return None
+    return lines[0] + (" ..." if len(lines) > 1 else "")
+
+
+def _reason(record):
+    """Why a quarantined or failed record is so, on one line; None for any other status.
+
+    Quarantined: the plan stage's collision_reason (set when a later source's plan
+    quarantined this planned record, whose plan reason is still its planning reason),
+    else the plan stage's reason when its action is 'quarantine', prefixed with the
+    quarantine_reason code when the text does not start with it; the code alone when
+    neither is stored. Failed: the 'error' of the last stage (in record.STAGES order,
+    unknown stages after) that stored one, prefixed with the stage name, as its first
+    line plus ' ...' when it has more; else the first line of that stage's stderr.
+    """
+    status = record.get("status")
+    stages = record.get("stages") or {}
+    if status == "quarantined":
+        code = record.get("quarantine_reason")
+        plan = stages.get("plan") if isinstance(stages.get("plan"), dict) else {}
+        text = plan.get("collision_reason")
+        if not (isinstance(text, str) and text.strip()):
+            text = plan.get("reason") if plan.get("action") == "quarantine" else None
+        if not (isinstance(text, str) and text.strip()):
+            return _one_line(code) if code else None
+        text = _one_line(text).strip()
+        if code and not text.startswith(str(code)):
+            text = "{}: {}".format(code, text)
+        return text
+    if status == "failed":
+        order = [name for name in STAGES if name in stages]
+        order.extend(sorted(name for name in stages if name not in STAGES))
+        for stage in reversed(order):
+            section = stages.get(stage)
+            if not isinstance(section, dict):
+                continue
+            for key in ("error", "stderr"):
+                value = section.get(key)
+                if isinstance(value, list):
+                    value = "\n".join(str(line) for line in value)
+                if isinstance(value, str) and value.strip():
+                    return "{}: {}".format(stage, _first_line(value))
+    return None
+
+
 def rows_from_records(items, redactor=None, with_logs=False, args=None):
     """One row dict per (folder, record); with a redactor, rows come from redacted copies.
 
@@ -321,6 +376,7 @@ def rows_from_records(items, redactor=None, with_logs=False, args=None):
             "path": clean(path),
             "output_name": clean(output_name),
             "changed_since": None,
+            "reason": clean(_reason(record)),
             FOLDER_GROUP_KEY: group,
         }
         if with_logs:
@@ -544,7 +600,8 @@ def render_text(header, rows, shown=None):
 
     shown: {full ID: shown ID} from short_ids(); computed over rows when not given.
     Every field is kept on its line (carriage returns and newlines become spaces);
-    only log text keeps its own lines.
+    only log text keeps its own lines. A quarantined or failed row gets a 'reason:'
+    line under its name line, before 'changed since' and any logs.
     """
     lines = [TEXT_TITLE, "", _one_line(header.get("hint", "")), ""]
     lines.extend(_one_line(line) for line in _header_lines(header))
@@ -573,6 +630,8 @@ def render_text(header, rows, shown=None):
             if row.get("output_name"):
                 second += "  ->  " + _one_line(row["output_name"])
             lines.append(second + "   (" + _sizes(row) + ")")
+            if row.get("reason"):
+                lines.append(indent + "reason: " + _one_line(row["reason"]))
             if row.get("changed_since"):
                 lines.append(indent + "changed since: " + _one_line(row["changed_since"]))
             for entry in row.get("logs") or ():
@@ -585,7 +644,7 @@ def render_text(header, rows, shown=None):
 
 
 def render_markdown(header, rows, shown=None):
-    """Hint line, header list, machine-readable header comment, table, then logs if any.
+    """Hint line, header list, machine-readable header comment, table, reasons, folders, then logs if any.
 
     shown: {full ID: shown ID} from short_ids(); computed over rows when not given.
     """
@@ -613,6 +672,11 @@ def render_markdown(header, rows, shown=None):
                  status, row.get("action") or "--", ", ".join(row.get("flags") or ()) or "--", source,
                  _sizes(row))
         lines.append("| " + " | ".join(_cell(cell) for cell in cells) + " |")
+    explained = [row for row in rows if row.get("reason")]
+    if explained:
+        lines.extend(["", REASONS_HEADING, ""])
+        for row in explained:
+            lines.append("- {}: {}".format(shown.get(str(row.get("id") or "")), _one_line(row["reason"])))
     if rows:
         lines.extend(["", FOLDERS_HEADING, ""])
         for folder, members in _group_by_folder(rows):
@@ -921,6 +985,7 @@ def produce(args, stored=None, from_report_id=None):
     # Shown IDs are made unique over everything collected, before any filter, which is
     # also what --from matches them against (resolve_stored_rows).
     shown = short_ids([{"id": record.get("id")} for _folder, record in items])
+    collected = items
     stored_rows = {}
     if stored is not None:
         stored_rows, unmatched = resolve_stored_rows(stored["rows"], items)
@@ -936,6 +1001,10 @@ def produce(args, stored=None, from_report_id=None):
         if not roots and items:
             roots = [os.path.commonpath([str(Path(folder).absolute()) for folder, _record in items])]
         redactor = Redactor(roots=roots, redact_dates=getattr(args, "redact_dates", False))
+        # Every collected record is learned, filtered out or not: a reason or log of a row
+        # may name another record's file (an output collision names the other source).
+        for _folder, record in collected:
+            redactor.learn(record)
     rows = rows_from_records(items, redactor=redactor, with_logs=getattr(args, "with_logs", False), args=args)
     if stored is not None:
         missing = mark_changed(rows, stored_rows)

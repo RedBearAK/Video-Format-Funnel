@@ -197,6 +197,7 @@ class ReportTree(unittest.TestCase):
             "<root>/o____e_w__k/",
             "   0  hold    quarantined  quarantine  --                {}".format(self.short("broken")),
             "      g____n_p___y.swf   (28 B -> --)",
+            "      reason: swf-vector",
             "  --  --      planned      reencode    --                {}".format(self.short("meeting")),
             "      c____t_m_____g.mkv   (29 B -> --)",
             "",
@@ -424,6 +425,139 @@ class ReportTree(unittest.TestCase):
         self.assertEqual({"status": "verified", "score": 95}, stored["rows"][self.short("beach")])
         self.assertEqual({self.short("beach"): "<root>/s____r_h______s/",
                           self.short("mountain"): "<root>/s____r_h______s/"}, stored["folders"])
+
+    # reasons of quarantined and failed rows
+
+    def quarantine_broken_as_collision(self):
+        broken = self.records["broken"]
+        broken["quarantine_reason"] = "output-collision"
+        broken["flags"] = ["output-collision"]
+        broken["output"]["name"] = "garden_party.mp4"
+        broken["stages"]["plan"] = {
+            "action": "quarantine", "collision": "foreign-output",
+            "reason": "'garden_party.mp4' already exists and is not ours (no vidfunnel tag with this source's src)",
+        }
+        self.save_all()
+
+    def fail_meeting(self, error):
+        meeting = self.records["meeting"]
+        meeting["status"] = "failed"
+        meeting["stages"]["plan"] = {"action": None, "error": error, "stderr": error}
+        self.save_all()
+
+    def test_quarantined_row_shows_its_plan_reason_in_text_and_markdown(self):
+        self.quarantine_broken_as_collision()
+        expected = ("output-collision: 'g____n_p___y.mp4' already exists and is not ours "
+                    "(no vidfunnel tag with this source's src)")
+        _code, text, _errors = self.run_report([str(self.base)])
+        lines = text.splitlines()
+        broken = next(number for number, line in enumerate(lines) if line.endswith(self.short("broken")))
+        self.assertEqual("      g____n_p___y.swf  ->  g____n_p___y.mp4   (28 B -> --)", lines[broken + 1])
+        self.assertEqual("      reason: " + expected, lines[broken + 2])
+        self.assertNotIn("garden", text)
+        _code, text, _errors = self.run_report(["--format", "md", str(self.base)])
+        reasons = text.split("\n## Reasons\n\n", 1)[1].split("\n\n", 1)[0].splitlines()
+        self.assertEqual(["- {}: {}".format(self.short("broken"), expected)], reasons)
+        self.assertLess(text.index("## Reasons"), text.index("## Folders"))
+
+    def test_quarantined_row_without_a_plan_reason_shows_its_code(self):
+        _code, text, _errors = self.run_report([str(self.base)])
+        self.assertIn("\n      reason: swf-vector\n", text)
+
+    def test_record_quarantined_by_a_later_claim_shows_the_collision_reason(self):
+        broken = self.records["broken"]
+        broken["quarantine_reason"] = "output-collision"
+        broken["stages"]["plan"] = {"action": "remux", "reason": "remux eligible", "collision": "same-stem",
+                                    "collision_reason": "'other_party.avi' would also be converted to "
+                                                        "'garden_party.mp4' (found when it was planned)"}
+        self.save_all()
+        _code, text, _errors = self.run_report(["--reveal", str(self.base)])
+        self.assertIn("\n      reason: output-collision: 'other_party.avi' would also be converted to "
+                      "'garden_party.mp4' (found when it was planned)\n", text)
+        self.assertNotIn("remux eligible", text)
+
+    def test_reason_naming_a_filtered_out_record_is_redacted(self):
+        # A later source's plan quarantines a planned record and names the verified record whose
+        # output it would overwrite; --status quarantined leaves that record out of the rows.
+        broken = self.records["broken"]
+        broken["quarantine_reason"] = "output-collision"
+        broken["stages"]["plan"] = {"action": "remux", "reason": "remux eligible", "collision": "same-stem",
+                                    "collision_reason": "'client_meeting.mkv' is already the output of "
+                                                        "'garden_party.swf' (verified); a person picks one"}
+        self.save_all()
+        _code, text, _errors = self.run_report(["--status", "quarantined", str(self.base)])
+        self.assertIn("reason: output-collision: 'c____t_m_____g.mkv' is already the output of "
+                      "'g____n_p___y.swf'", text)
+        self.assertNotIn("client", text)
+
+    def test_failed_row_shows_the_first_line_of_its_error(self):
+        self.fail_meeting("ffprobe could not read 'client_meeting.mkv' (status 1): [mpeg @ 0x1] header damaged\n"
+                          "Invalid data found when processing input\n")
+        _code, text, _errors = self.run_report([str(self.base)])
+        lines = text.splitlines()
+        meeting = next(number for number, line in enumerate(lines) if line.endswith(self.short("meeting")))
+        self.assertEqual("      reason: plan: ffprobe could not read 'c____t_m_____g.mkv' (status 1): "
+                         "[mpeg @ 0x1] header damaged ...", lines[meeting + 2])
+        self.assertNotIn("Invalid data", text, "only the first line, without --with-logs")
+        _code, text, _errors = self.run_report(["--with-logs", str(self.base)])
+        lines = text.splitlines()
+        meeting = next(number for number, line in enumerate(lines) if line.endswith(self.short("meeting")))
+        self.assertTrue(lines[meeting + 2].startswith("      reason: plan: "))
+        self.assertEqual("      plan stderr:", lines[meeting + 3], "the reason comes before the logs")
+
+    def test_failed_row_with_a_one_line_error_has_no_ellipsis(self):
+        self.fail_meeting("'client_meeting.mkv' exists and is not this record's output")
+        _code, text, _errors = self.run_report(["--reveal", "--format", "md", str(self.base)])
+        self.assertIn("\n- {}: plan: 'client_meeting.mkv' exists and is not this record's output\n".format(
+            self.short("meeting")), text)
+
+    def test_planned_and_verified_rows_have_no_reason(self):
+        _code, text, _errors = self.run_report([str(self.base)])
+        self.assertEqual(["      reason: swf-vector"], [line for line in text.splitlines() if "reason:" in line])
+        _code, text, _errors = self.run_report(["--format", "md", str(self.base)])
+        reasons = text.split("\n## Reasons\n\n", 1)[1].split("\n\n", 1)[0].splitlines()
+        self.assertEqual(["- {}: swf-vector".format(self.short("broken"))], reasons)
+        self.records["broken"]["status"] = "planned"
+        self.save_all()
+        _code, text, _errors = self.run_report(["--format", "md", str(self.base)])
+        self.assertNotIn("## Reasons", text)
+
+    def test_json_and_csv_carry_the_reason(self):
+        self.quarantine_broken_as_collision()
+        self.fail_meeting("ffmpeg exited with status 1\nmore detail")
+        _code, text, _errors = self.run_report(["--format", "json", str(self.base)])
+        reasons = {row["id"]: row["reason"] for row in json.loads(text)["rows"]}
+        self.assertTrue(reasons[self.records["broken"]["id"]].startswith("output-collision: 'g____n_p___y.mp4'"))
+        self.assertEqual("plan: ffmpeg exited with status 1 ...", reasons[self.records["meeting"]["id"]])
+        self.assertIsNone(reasons[self.records["beach"]["id"]])
+        self.assertIsNone(reasons[self.records["mountain"]["id"]])
+        self.assertEqual(4, len(parse_report_header(text)["rows"]))
+        _code, text, _errors = self.run_report(["--format", "csv", str(self.base)])
+        lines = list(csv.reader(io.StringIO(text, newline="")))
+        column = lines[0].index("reason")
+        values = {line[0]: line[column] for line in lines[1:]}
+        self.assertEqual("plan: ffmpeg exited with status 1 ...", values[self.records["meeting"]["id"]])
+        self.assertEqual("", values[self.records["beach"]["id"]])
+
+    def test_from_reads_a_markdown_report_with_a_reasons_section(self):
+        broken = self.records["broken"]
+        broken["quarantine_reason"] = "output-collision"
+        broken["stages"]["plan"] = {"action": "quarantine",
+                                    "reason": "## Folders\n- /elsewhere/: deadbeef\n| deadbeef | 1 | hold |"}
+        self.save_all()
+        self.fail_meeting("broken\n| deadbeef | 1 | hold | failed | -- | -- | x.avi | -- |")
+        report_file, text = self.write_report(["--format", "md", str(self.base)], "with_reasons.md")
+        self.assertIn("\n## Reasons\n", text)
+        stored = parse_report_header(text)
+        self.assertEqual({self.short(word) for word in self.records}, set(stored["rows"]))
+        self.assertEqual({"status": "failed", "score": None}, stored["rows"][self.short("meeting")])
+        self.assertEqual({self.short(word) for word in self.records}, set(stored["folders"]))
+        self.assertNotIn("deadbeef", stored["folders"])
+        self.assertNotIn("/elsewhere/", stored["folders"].values())
+        code, again, errors = self.run_report(["--from", str(report_file), "--format", "json", str(self.base)])
+        self.assertEqual(0, code, errors)
+        changed = {row["id"]: row["changed_since"] for row in json.loads(again)["rows"]}
+        self.assertEqual({None}, set(changed.values()))
 
     # JSON and CSV
 

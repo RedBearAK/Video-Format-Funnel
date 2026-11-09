@@ -265,7 +265,7 @@ vidfunnel report "Home Videos"
 
 `report` reads the records and prints them, worst scores at the top and unscored rows (planned, failed, quarantined) below them. It never probes or encodes. Names and paths are redacted by default; the top-level path becomes `<root>`. Each record ID is shown as its first 8 characters, which `vidfunnel find` takes as a prefix (more characters only when two of the records the report read, including rows a filter left out, share those 8).
 
-The default format, `text`, is for reading in a terminal. Rows are grouped by folder, and the folder line is printed once per group; the folders come in the order of their worst row, and the rows inside a folder keep the report's order, so the first row printed is still the worst one. Groups follow the real folders, so two folders whose redacted names look alike (`Christmas 1998` and `Christmas 2001` are both `C_______s ####`) stay two groups under the same heading. Each record takes two lines: score, band, status, action, flags and ID, then the source name, the output name and the sizes. The output name is the name the output has or will have: the interim `<stem>.vidfunnel.mp4` until `retire` renames it, and still after a `retire` whose rename failed. A line break inside a name is printed as a space, so each row keeps its two lines.
+The default format, `text`, is for reading in a terminal. Rows are grouped by folder, and the folder line is printed once per group; the folders come in the order of their worst row, and the rows inside a folder keep the report's order, so the first row printed is still the worst one. Groups follow the real folders, so two folders whose redacted names look alike (`Christmas 1998` and `Christmas 2001` are both `C_______s ####`) stay two groups under the same heading. Each record takes two lines: score, band, status, action, flags and ID, then the source name, the output name and the sizes. The output name is the name the output has or will have: the interim `<stem>.vidfunnel.mp4` until `retire` renames it, and still after a `retire` whose rename failed. A quarantined or failed record gets a third line, `reason:`, with why: the plan's reason for a quarantine (for example `decode-failed: ...` or `output-collision: ...`, or the quarantine code alone when the record stores no more), and for a failure the stage and the first line of its stored error, followed by ` ...` when the error has more lines (`--with-logs` prints all of it). The reason is shown with or without `--with-logs`, redacted like the rest. A line break inside a name is printed as a space, so each row keeps its lines.
 
 The examples below come from a library of six fixture files from `tests/make_fixtures.sh` copied under realistic names: `h264_avi_mp3.avi` as `Family Tapes/Wedding Day reception 2004-06-12 part 2.avi`, `h264_long_gop_mkv_aac.mkv` as `Family Tapes/Birthday party at Grandmother's.mkv`, `mpeg2_ps_ntsc_dar_4x3_ac3.mpg` as `Christmas 1998/Christmas Night - December 1998 pt1.mpg`, `h264_mp4_aac.mp4` as `Christmas 1998/Presents opening.mp4`, and the two files of `collision_pair/` as `Christmas 1998/Sledding.avi` and `Sledding.mkv`. The library was planned, and `Family Tapes` converted, before `vidfunnel report --no-index "Home Videos"`:
 
@@ -274,39 +274,41 @@ vidfunnel report
 
 Names in this report are redacted. To see them, re-run the same command with --reveal; for a report that --from can read back, use --format md. To locate one row: vidfunnel find <ID>.
 
-report ID: 02d73a65-812c-4b07-90fd-aa970418ed52
-generated at: 2026-11-08T23:43:46Z
+report ID: 4fbd7b47-1e53-428f-934c-56975917925d
+generated at: 2026-11-09T02:33:52Z
 tool version: 20261108
 invocation: vidfunnel report --format text --no-index -- '<root>'
 redacted: yes
 records: 6
 
 <root>/F____y T___s/
-   90  ok  verified     remux       decode-warnings         f1603baa
+   90  ok  verified     remux       decode-warnings         50c73ca6
        W_____g D__ r_______n ####-##-## p__t #.avi  ->  W_____g D__ r_______n ####-##-## p__t #.mp4   (115 KiB -> 101 KiB)
-  100  ok  verified     remux       long-gop, remux-larger  56796d04
+  100  ok  verified     remux       long-gop, remux-larger  b789e3c4
        B______y p___y a_ G_________r's.mkv  ->  B______y p___y a_ G_________r's.mp4   (238 KiB -> 241 KiB)
 
 <root>/C_______s ####/
-   --  --  planned      reencode    --                      c65f97b4
+   --  --  planned      reencode    --                      b205a2d9
        C_______s N___t - D______r #### p_#.mpg  ->  C_______s N___t - D______r #### p_#.mp4   (662 KiB -> --)
-   --  --  planned      remux       --                      5c6de98f
+   --  --  planned      remux       --                      a668761e
        P______s o_____g.mp4  ->  P______s o_____g.v_______l.mp4   (102 KiB -> --)
-   --  --  quarantined  quarantine  output-collision        e16bd9c8
+   --  --  quarantined  quarantine  output-collision        7fead68d
        S______g.avi  ->  S______g.mp4   (217 KiB -> --)
-   --  --  quarantined  quarantine  output-collision        80be76cf
+       reason: output-collision: another source in this folder would also be converted to 'S______g.mp4'; a person picks one
+   --  --  quarantined  quarantine  output-collision        fa1bc930
        S______g.mkv  ->  S______g.mp4   (100 KiB -> --)
+       reason: output-collision: another source in this folder would also be converted to 'S______g.mp4'; a person picks one
 ```
 
-With `--format md` the same records make a Markdown table to paste into a note or an issue (shown here without the one machine-readable header comment that `--from` uses). The `source` column shows the output name only when it is not the source's stem plus `.mp4`, as for an MP4 source converted under its interim name; the folders are listed once, after the table, with the IDs of their rows:
+With `--format md` the same records make a Markdown table to paste into a note or an issue (shown here without the one machine-readable header comment that `--from` uses). The `source` column shows the output name only when it is not the source's stem plus `.mp4`, as for an MP4 source converted under its interim name; the reasons of quarantined and failed rows follow the table in a Reasons section, and the folders are listed once after that, with the IDs of their rows:
 
 ```
 # vidfunnel report
 
 > Names in this report are redacted. To see them, re-run the same command with --reveal, or vidfunnel report --from <this file> --reveal. To locate one row: vidfunnel find <ID>.
 
-- report ID: 52527d4b-2154-4ab9-9448-99b65da43a13
-- generated at: 2026-11-08T23:43:46Z
+- report ID: 7427b2b0-bfae-4068-bf9b-d3da23df4563
+- generated at: 2026-11-09T02:33:52Z
 - tool version: 20261108
 - invocation: vidfunnel report --format md --no-index -- '<root>'
 - redacted: yes
@@ -314,23 +316,28 @@ With `--format md` the same records make a Markdown table to paste into a note o
 
 | ID | score | band | status | action | flags | source | size |
 |---|---|---|---|---|---|---|---|
-| f1603baa | 90 | ok | verified | remux | decode-warnings | W_____g D__ r_______n ####-##-## p__t #.avi | 115 KiB -> 101 KiB |
-| 56796d04 | 100 | ok | verified | remux | long-gop, remux-larger | B______y p___y a_ G_________r's.mkv | 238 KiB -> 241 KiB |
-| c65f97b4 | -- | -- | planned | reencode | -- | C_______s N___t - D______r #### p_#.mpg | 662 KiB -> -- |
-| 5c6de98f | -- | -- | planned | remux | -- | P______s o_____g.mp4 -> P______s o_____g.v_______l.mp4 | 102 KiB -> -- |
-| e16bd9c8 | -- | -- | quarantined | quarantine | output-collision | S______g.avi | 217 KiB -> -- |
-| 80be76cf | -- | -- | quarantined | quarantine | output-collision | S______g.mkv | 100 KiB -> -- |
+| 50c73ca6 | 90 | ok | verified | remux | decode-warnings | W_____g D__ r_______n ####-##-## p__t #.avi | 115 KiB -> 101 KiB |
+| b789e3c4 | 100 | ok | verified | remux | long-gop, remux-larger | B______y p___y a_ G_________r's.mkv | 238 KiB -> 241 KiB |
+| b205a2d9 | -- | -- | planned | reencode | -- | C_______s N___t - D______r #### p_#.mpg | 662 KiB -> -- |
+| a668761e | -- | -- | planned | remux | -- | P______s o_____g.mp4 -> P______s o_____g.v_______l.mp4 | 102 KiB -> -- |
+| 7fead68d | -- | -- | quarantined | quarantine | output-collision | S______g.avi | 217 KiB -> -- |
+| fa1bc930 | -- | -- | quarantined | quarantine | output-collision | S______g.mkv | 100 KiB -> -- |
+
+## Reasons
+
+- 7fead68d: output-collision: another source in this folder would also be converted to 'S______g.mp4'; a person picks one
+- fa1bc930: output-collision: another source in this folder would also be converted to 'S______g.mp4'; a person picks one
 
 ## Folders
 
-- <root>/F____y T___s/: f1603baa, 56796d04
-- <root>/C_______s ####/: c65f97b4, 5c6de98f, e16bd9c8, 80be76cf
+- <root>/F____y T___s/: 50c73ca6, b789e3c4
+- <root>/C_______s ####/: b205a2d9, a668761e, 7fead68d, fa1bc930
 ```
 
 Options:
 
 - `--reveal` shows the real names and paths. `--redact-dates` truncates creation times and mtimes to the year.
-- `--format text|md|json|csv`: text (the default) is for reading; Markdown pastes into a note or an issue; JSON and CSV are for processing and keep the full record IDs. CSV writes its header to stderr. Only Markdown and JSON reports can be read back with `--from`, so the hint of a redacted text or CSV report points to `--format md` instead of `--from`.
+- `--format text|md|json|csv`: text (the default) is for reading; Markdown pastes into a note or an issue; JSON and CSV are for processing and keep the full record IDs; they carry the reason line as a `reason` field (null in JSON and empty in CSV for rows without one). CSV writes its header to stderr. Only Markdown and JSON reports can be read back with `--from`, so the hint of a redacted text or CSV report points to `--format md` instead of `--from`.
 - `--min-score N`, `--max-score N` and `--status S` (repeatable) filter the rows.
 - `--with-logs` adds the stored ffmpeg error output and run log of each row, redacted like the rest. This is the bundle to post when asking why a file misbehaved.
 - `--from REPORT` re-runs the invocation recorded in an earlier Markdown or JSON report, with whatever options you add, so a redacted report that was sent out can be reissued with `--reveal`. A row whose status has moved on since that report is marked as changed. The ID prefixes of a Markdown report are matched against the records found now; a prefix that matches more than one record is an error that names both. Because a redacted report records its paths as `<root>`, give the PATH arguments again, or have the central index available. A text report cannot be read back, and `--from` says so, also when the file was saved with the progress lines from stderr in front of it. A revealed Markdown report whose invocation names no PATH (one made from the index) reads the whole index again and keeps the rows that report lists, wherever their folders are now; only when no index can be read (`--no-index`, or no database file) does it read the folders listed in its Folders section, skipping with a warning any folder that no longer exists. Markdown reports written before version 20261108, with full IDs and a `path` column, are still read.
@@ -339,7 +346,7 @@ Options:
 To map a row of a redacted report back to a real file on your own machine:
 
 ```
-vidfunnel find f1603baa
+vidfunnel find 50c73ca6
 ```
 
 `find` takes a record ID or any unique prefix and prints the ID, status, score, action, and the real source, output and record paths. It uses the index when there is one and otherwise searches the records under `--root` (default: the current directory).
