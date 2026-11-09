@@ -16,13 +16,15 @@ import os
 import socket
 import sys
 import tempfile
+import threading
+import time
 import uuid
 from pathlib import Path
 
 try:
     import fcntl
-except ImportError:  # not on Windows, which vidfunnel does not support; the takeover is then unserialised
-    fcntl = None
+except ImportError:  # not on Windows, which vidfunnel does not support; takeovers are then unserialised
+    fcntl = None     # and no lock carries a flock
 
 import vidfunnel
 from vidfunnel.interrupt import check as check_interrupted
@@ -380,6 +382,83 @@ def machine_id():
     return "node-{:012x}".format(node)
 
 
+BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"
+
+
+def boot_id():
+    """The running kernel's boot id (Linux), or None when it cannot be read (macOS has no such file).
+
+    Every process on one kernel reads the same value, inside a container or
+    not, and the value changes at every boot. Two lock files with the same
+    boot id were written on this kernel since it booted, so a flock() on one
+    of them is the same lock for both runs (see FolderLock).
+    """
+    try:
+        with open(BOOT_ID_FILE, encoding="ascii", errors="replace") as handle:
+            value = handle.read().strip()
+    except OSError:
+        return None
+    return value or None
+
+
+# Descriptor -> (st_dev, st_ino) of every lock file this process holds; see held_lock_fds().
+_held_locks = {}
+_held_locks_guard = threading.Lock()
+
+
+@contextlib.contextmanager
+def held_lock_fds():
+    """Yield the sorted descriptors of the lock files this process holds, for Popen(pass_fds=...).
+
+    vidfunnel.ffmpeg.run and encode.write_par2 start every child inside this
+    block, so each ffmpeg, ffprobe and par2 inherits every folder lock's
+    descriptor, and with it the lock's flock, which belongs to the open file
+    and not to a process: the lock is free when the last process holding the
+    descriptor exits, so an encoder orphaned by a killed vidfunnel keeps its
+    folder locked until it ends. With --jobs a child may also inherit the
+    lock of a folder it does not work on; that lock is held by this process
+    too, so it is freed no later than it would be anyway, unless the child
+    outlives this process. The guard is held until the block ends, and
+    FolderLock.release() closes a descriptor only under it, so no descriptor
+    is closed (or its number reused) between this snapshot and the child's
+    start, which would make Popen fail with EBADF.
+    """
+    with _held_locks_guard:
+        yield tuple(sorted(_held_locks))
+
+
+def _held_here(device, inode):
+    """True when this process holds the lock file with this st_dev and st_ino."""
+    with _held_locks_guard:
+        return (device, inode) in _held_locks.values()
+
+
+FLOCK_RETRY_SECONDS = 1.0
+
+
+def _take_flock(handle):
+    """True once flock(LOCK_EX) is held on the new lock file's descriptor; False when it cannot be had.
+
+    False without fcntl, or when the file system refuses flock (any OSError
+    but a busy lock). A busy lock on a file this run has just created is a
+    judge's momentary LOCK_SH test (see FolderLock._flock_judgement); it is
+    retried for FLOCK_RETRY_SECONDS, then given up as refused.
+    """
+    if fcntl is None:
+        return False
+    deadline = time.monotonic() + FLOCK_RETRY_SECONDS
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+        except OSError:
+            return False
+
+
 def pid_alive(pid):
     """True when a process with this pid exists here, False when none does, None when that cannot be told.
 
@@ -399,6 +478,11 @@ def pid_alive(pid):
     except (OSError, OverflowError, ValueError):
         return None
     return True
+
+
+def _identity_of(status):
+    """(device, inode, mtime in ns, size) of an os.stat_result: the identity a takeover re-checks."""
+    return (status.st_dev, status.st_ino, status.st_mtime_ns, status.st_size)
 
 
 def _whole_seconds(age):
@@ -421,23 +505,45 @@ def _unjudged_reason(host, holder_in_container, ours, pid):
 class FolderLock:
     """Context manager holding '.vidfunnel/lock' for one folder.
 
-    The lock file holds host (socket.gethostname()), machine (machine_id()), pid, started (ISO time)
-    and container (True when this run is inside a container: '/run/.containerenv'
-    or '/.dockerenv' exists). Every lock is taken over, with a warning, once
-    it is 24 h old (stale_seconds); younger ones raise LockHeld. The pid
-    can only shorten that wait, never lengthen it: when the lock was written
-    on this host name and on the same side of the container boundary, a
-    holder that no longer runs (os.kill(pid, 0) raises ProcessLookupError)
-    is taken over at once with a message naming the dead pid and the lock's
-    age. A live pid (or one we may not signal, PermissionError) is
-    respected until the lock is stale, like any other; after 24 h it is
-    taken for a reused pid. Our own pid, or one that cannot be checked,
-    counts as unknown, and the lock is judged by age alone. A lock from
-    another host name is judged by age alone too, since its pid means
-    nothing here: a container run shows the container id as its host name
-    and has a pid namespace of its own; so is a lock with the same host
-    name written by a run inside a container, and a lock written on the
-    host when this run is inside a container.
+    The lock file holds host (socket.gethostname()), machine (machine_id()),
+    pid, started (ISO time), container (True when this run is inside a
+    container: '/run/.containerenv' or '/.dockerenv' exists), boot (boot_id()),
+    device (the lock file's st_dev as the holder sees it) and flock (True
+    when the holder holds flock(LOCK_EX) on the lock file).
+
+    The holder keeps the descriptor it created the file with open for the
+    whole run and takes flock(LOCK_EX) on it before it writes the contents,
+    so a file whose contents say flock: true is flocked. The kernel releases
+    that flock when the last descriptor of the open file is closed: when the
+    holder and every child it started (they inherit the descriptor, see
+    held_lock_fds) have exited, however they ended. A judge whose boot id
+    equals the lock's (the same kernel, inside a container or not) therefore
+    tests the flock itself, with flock(LOCK_SH | LOCK_NB) on a descriptor of
+    its own: a busy flock raises LockHeld whatever the lock's age, since the
+    kernel, not a pid, says a process holds it; a free one means every
+    holder has exited, and the lock is taken over at once with a message
+    naming the holder. The judge also requires the lock's device to be the
+    one it sees the file on, so both runs reach the file through the same
+    mounted file system (a bind mount into a container shares it). A flock
+    does not cross kernels (another machine, a Mac's podman VM), so a lock
+    with another boot id, without one, on another device, or with flock:
+    false (fcntl missing, or a file system that refuses flock) is judged by
+    the rules below.
+
+    Every such lock is taken over, with a warning, once it is 24 h old
+    (stale_seconds); younger ones raise LockHeld. The pid can only shorten
+    that wait, never lengthen it: when the lock was written on this host
+    name and on the same side of the container boundary, a holder that no
+    longer runs (os.kill(pid, 0) raises ProcessLookupError) is taken over at
+    once with a message naming the dead pid and the lock's age. A live pid
+    (or one we may not signal, PermissionError) is respected until the lock
+    is stale, like any other; after 24 h it is taken for a reused pid. Our
+    own pid, or one that cannot be checked, counts as unknown, and the lock
+    is judged by age alone. A lock from another host name is judged by age
+    alone too, since its pid means nothing here: a container run shows the
+    container id as its host name and has a pid namespace of its own; so is
+    a lock with the same host name written by a run inside a container, and
+    a lock written on the host when this run is inside a container.
 
     The lock file is only ever created with O_CREAT | O_EXCL, so of several
     runs that find no lock, one creates it and the others raise LockHeld
@@ -450,7 +556,13 @@ class FolderLock:
     LockHeld. Where the file system refuses flock() on both, the takeover
     runs without it and only that check and the O_EXCL create guard it (two
     racers can then both get in). The lock file is removed on exit, including
-    on exception, if it is still ours.
+    on exception, if it is still ours: unlinked first and its descriptor
+    closed after, so the file never exists with its flock free while this
+    run holds it. The holder never opens and closes its own lock file while
+    it holds it (a judge in this process that finds a lock file this process
+    holds raises LockHeld without opening it, and release() reads the file
+    through the kept descriptor), since on NFS, where Linux emulates flock
+    with POSIX locks, closing any descriptor of a file can drop them.
     """
 
     def __init__(self, folder, warn=None, stale_seconds=LOCK_STALE_SECONDS):
@@ -459,6 +571,7 @@ class FolderLock:
         self.warn = warn if warn is not None else _warn
         self.stale_seconds = stale_seconds
         self.content = None
+        self.handle = None  # the descriptor of our lock file while we hold it
 
     def _holder(self):
         """(content dict, age in seconds) of the current lock file, or (None, None) if absent."""
@@ -487,12 +600,12 @@ class FolderLock:
         return data, age
 
     def _identity(self):
-        """(inode, mtime in ns, size) of the lock file, or None when it does not exist."""
+        """(device, inode, mtime in ns, size) of the lock file, or None when it does not exist."""
         try:
             status = os.stat(str(self.path))
         except FileNotFoundError:
             return None
-        return (status.st_ino, status.st_mtime_ns, status.st_size)
+        return _identity_of(status)
 
     @contextlib.contextmanager
     def _takeover_guard(self):
@@ -524,10 +637,32 @@ class FolderLock:
                 os.close(handle)  # closing the descriptor releases the flock
 
     def _create(self, content):
-        """Create the lock file with our entry; FileExistsError when any lock file exists."""
-        handle = os.open(str(self.path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(_dump_json(content))
+        """Create the lock file, flock it, write our entry; FileExistsError when any lock file exists.
+
+        Sets content["flock"] to whether the flock was taken and
+        content["device"] to the file's st_dev, and keeps the descriptor open in self.handle and in the registry of held_lock_fds()
+        until release(). A file whose entry could not be written is unlinked
+        before its descriptor is closed.
+        """
+        handle = os.open(str(self.path), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            content["flock"] = _take_flock(handle)
+            status = os.fstat(handle)
+            content["device"] = status.st_dev
+            data = _dump_json(content).encode("utf-8")
+            while data:
+                data = data[os.write(handle, data):]
+        except BaseException:
+            try:
+                os.unlink(str(self.path))
+            except OSError:
+                pass
+            os.close(handle)
+            raise
+        with _held_locks_guard:
+            _held_locks[handle] = (status.st_dev, status.st_ino)
+        self.handle = handle
+        self.content = content
 
     def _held(self, holder, age, why):
         host = holder.get("host")
@@ -547,7 +682,7 @@ class FolderLock:
     def acquire(self):
         record_dir(self.folder).mkdir(parents=True, exist_ok=True)
         content = {"host": socket.gethostname(), "pid": os.getpid(), "started": now_iso(),
-                   "container": in_container(), "machine": machine_id()}
+                   "container": in_container(), "machine": machine_id(), "boot": boot_id()}
         try:
             self._create(content)
         except FileExistsError:
@@ -560,6 +695,9 @@ class FolderLock:
         """Judge the existing lock; take it over (unlink, then O_EXCL create) or raise LockHeld."""
         while True:
             judged = self._identity()
+            if judged is not None and _held_here(judged[0], judged[1]):
+                raise LockHeld("folder '{}' is locked by this run itself, which already holds lock file '{}'".format(
+                    self.folder, self.path), host=content["host"], pid=content["pid"], age_seconds=None)
             holder, age = self._holder()
             if holder is None or judged is None:  # released meanwhile: create it, or judge the next one
                 try:
@@ -571,12 +709,22 @@ class FolderLock:
             pid = holder.get("pid")
             holder_in_container = holder.get("container") is True
             holder_words = "a container run on host" if holder_in_container else "host"
+            judgement = self._flock_judgement(holder, content, judged)
+            if judgement == "replaced":
+                continue
+            if judgement == "held":
+                raise self._held(holder, age, "its holder, or a process it started, still holds the lock file's "
+                                 "flock on this machine; not taken over while it does, whatever its age")
             liveness = None
             same_machine = content["machine"] is not None and holder.get("machine") == content["machine"]
-            if (host == content["host"] and same_machine and holder_in_container == content["container"]
-                    and pid != content["pid"]):
+            if (judgement is None and host == content["host"] and same_machine
+                    and holder_in_container == content["container"] and pid != content["pid"]):
                 liveness = pid_alive(pid)
-            if liveness is False:
+            if judgement == "free":
+                warning = ("warning: taking over lock '{}': its holder, {} '{}' pid {}, has exited (nothing "
+                           "holds the lock file's flock; lock written {} s ago)".format(
+                               self.path, holder_words, host, pid, _whole_seconds(age)))
+            elif liveness is False:
                 warning = ("warning: taking over lock '{}': its holder, host '{}' pid {}, no longer runs "
                            "(lock written {} s ago)".format(self.path, host, pid, _whole_seconds(age)))
             elif age < self.stale_seconds:
@@ -605,21 +753,85 @@ class FolderLock:
             self.warn(warning)
             return
 
+    def _flock_judgement(self, holder, content, judged):
+        """'held' or 'free' from the lock file's flock, 'replaced', or None when it cannot be tested here.
+
+        Tested only when the lock says flock: true, carries our boot id (the
+        same kernel) and names the device the file is on here (the same
+        mounted file system: a share mounted twice, each mount keeping its
+        locks to itself as sshfs does, shows two devices).
+        'held': another open file holds the flock, so its holder or a child
+        of it is alive. 'free': none does, so every one of them has exited
+        (the flock is taken before the contents that say flock: true are
+        written). 'replaced': the file at the path is no longer the one
+        judged; the caller judges again. The test descriptor is closed in
+        every case, which also releases the shared flock a 'free' test took.
+        """
+        if fcntl is None or holder.get("flock") is not True:
+            return None
+        if content["boot"] is None or holder.get("boot") != content["boot"] or holder.get("device") != judged[0]:
+            return None
+        try:
+            test = os.open(str(self.path), os.O_RDONLY)
+        except FileNotFoundError:
+            return "replaced"
+        except OSError:
+            return None
+        try:
+            if _identity_of(os.fstat(test)) != judged:
+                return "replaced"
+            try:
+                fcntl.flock(test, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return "held"
+            except OSError:
+                return None
+            return "free"
+        finally:
+            os.close(test)
+
+    def _still_ours(self):
+        """True when the file at the lock path is the one we created and still holds our entry.
+
+        Read through our own descriptor, never by opening the path (see the
+        class docstring); any error reading it counts as not ours.
+        """
+        try:
+            ours = os.fstat(self.handle)
+            there = os.stat(str(self.path))
+            if (ours.st_dev, ours.st_ino) != (there.st_dev, there.st_ino):
+                return False
+            os.lseek(self.handle, 0, os.SEEK_SET)
+            chunks = []
+            while True:
+                chunk = os.read(self.handle, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return json.loads(b"".join(chunks).decode("utf-8")) == self.content
+        except (OSError, ValueError):
+            return False
+
     def release(self):
+        """Unlink the lock file if it is still ours, then close its descriptor (which frees our flock)."""
         if self.content is None:
             return
+        handle = self.handle
         try:
-            current = _read_json(self.path)
-        except RecordError:
-            current = None
-        if current == self.content:
-            try:
-                self.path.unlink()
-            except FileNotFoundError:
-                pass
-        else:
-            self.warn("warning: lock '{}' no longer holds this run's entry; left in place".format(self.path))
-        self.content = None
+            if handle is not None and self._still_ours():
+                try:
+                    os.unlink(str(self.path))
+                except FileNotFoundError:
+                    pass
+            else:
+                self.warn("warning: lock '{}' no longer holds this run's entry; left in place".format(self.path))
+        finally:
+            self.content = None
+            self.handle = None
+            if handle is not None:
+                with _held_locks_guard:
+                    _held_locks.pop(handle, None)
+                    os.close(handle)
 
     def __enter__(self):
         return self.acquire()

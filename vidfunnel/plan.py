@@ -43,7 +43,7 @@ analyze_input(), which runs the same passes with an input-argument list and
 returns the same dict shape, built from analyze's own pure rules.
 """
 
-VERSION = "20261107"
+VERSION = "20261108"
 
 import hashlib
 import json
@@ -81,7 +81,7 @@ from vidfunnel.ffmpeg import DecodeResult, FfmpegError, classify_messages, ffpro
 from vidfunnel.ffmpeg import capabilities as ffmpeg_capabilities
 from vidfunnel.ffmpeg import run as run_tool
 from vidfunnel.interrupt import check as check_interrupted
-from vidfunnel.interrupt import run_pool
+from vidfunnel.interrupt import drain_after_item, drain_before_next, run_pool
 from vidfunnel.probe import (
     classify,
     decodable_codecs,
@@ -1430,23 +1430,34 @@ def _plan_sequential(tools, options, progress, stream, summary, capabilities, fo
     """One folder after another, one item after another; returns the table rows."""
     position = 0
     rows = []
-    for folder in folders:
+    for folder_number, folder in enumerate(folders):
         entries = by_folder[folder]
+        if drain_before_next(sum(len(by_folder[later]) for later in folders[folder_number:]), folder):
+            break
         lock = _take_folder_lock(folder, entries, summary, stream)
         if lock is None:
             position += len(entries)
             continue
+        drained = False
         try:
-            for work, found in entries:
+            for entry_number, (work, found) in enumerate(entries):
+                later = sum(len(by_folder[after]) for after in folders[folder_number + 1:])
+                if drain_before_next(len(entries) - entry_number + later, folder):
+                    drained = True
+                    break
                 position += 1
                 outcome, record = _plan_entry(tools, work, found, options, siblings.get(folder, []), capabilities,
                                               progress, stream, position, total)
+                drain_after_item()
                 summary.add(outcome)
                 if record is not None:
                     rows.append(_table_row(outcome, record))
-            _update_folder_file(folder, [work for work, _found in entries])
+            if not drained:
+                _update_folder_file(folder, [work for work, _found in entries])
         finally:
             lock.release()
+        if drained:
+            break
     return rows
 
 
@@ -1517,7 +1528,8 @@ def _plan_parallel(tools, options, progress, stream, summary, capabilities, fold
                 _update_folder_file(folder, [work for work, _found in by_folder[folder]])
                 folder_locks.pop(folder).release()
 
-        run_pool(jobs, [lambda members=groups[key]: plan_group(members) for key in order], group_done)
+        run_pool(jobs, [lambda members=groups[key]: plan_group(members) for key in order], group_done,
+                 sizes=[len(groups[key]) for key in order], folders=[groups[key][0][0] for key in order])
         rows = []
         for _number, (outcome, record) in sorted(results, key=lambda entry: entry[0]):
             summary.add(outcome)

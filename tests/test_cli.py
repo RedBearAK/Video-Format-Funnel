@@ -1,8 +1,9 @@
 """Tests for the command-line entry points: --version, dispatch, the launcher."""
 
-VERSION = "20261107"
+VERSION = "20261108"
 
 import contextlib
+import errno
 import io
 import os
 import pathlib
@@ -130,9 +131,12 @@ class SigtermTests(unittest.TestCase):
     """main() handles SIGTERM like Ctrl+C while a command runs, and puts the previous handler back."""
 
     def setUp(self):
-        previous = signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT, signal.SIGUSR1):
+            previous = signal.signal(signum, signal.SIG_DFL)
+            self.addCleanup(signal.signal, signum, previous)
         self.addCleanup(vidfunnel.interrupt.interrupted.clear)
+        self.addCleanup(vidfunnel.interrupt.draining.clear)
+        self.addCleanup(vidfunnel.interrupt.drain_tally.reset)
 
     def run_with_dispatch(self, dispatch):
         with unittest.mock.patch.object(cli, "dispatch", side_effect=dispatch):
@@ -288,13 +292,188 @@ class SigtermTests(unittest.TestCase):
         self.assertEqual(seen, [own_handler])
         self.assertIs(signal.getsignal(signal.SIGTERM), own_handler)
 
+    def stopped_by(self, signum):
+        def dispatch(args):
+            os.kill(os.getpid(), signum)
+            time.sleep(5)  # the handler raises Terminated before this ends
+            return cli.EXIT_OK
+
+        started = time.monotonic()
+        code, _out, err = self.run_with_dispatch(dispatch)
+        self.assertLess(time.monotonic() - started, 4)
+        return code, err
+
+    def test_sigquit_and_sighup_stop_the_command_like_sigterm_and_are_named(self):
+        for signum, name in ((signal.SIGQUIT, "SIGQUIT"), (signal.SIGHUP, "SIGHUP"), (signal.SIGTERM, "SIGTERM")):
+            with self.subTest(signal=name):
+                code, err = self.stopped_by(signum)
+                self.assertEqual(code, cli.EXIT_ERROR)
+                self.assertIn("vidfunnel: terminated ({})".format(name), err)
+                self.assertFalse(cli._terminating)
+                self.assertIsNone(cli._stop_signal)
+                for restored in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT, signal.SIGUSR1):
+                    self.assertIs(signal.getsignal(restored), signal.SIG_DFL)
+
+    def test_a_sighup_ignored_as_nohup_does_is_left_alone(self):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        seen = []
+        self.run_with_dispatch(lambda args: seen.append((signal.getsignal(signal.SIGHUP),
+                                                         signal.getsignal(signal.SIGQUIT))) or 0)
+        self.assertEqual(seen, [(signal.SIG_IGN, cli._on_sigterm)])
+        self.assertIs(signal.getsignal(signal.SIGHUP), signal.SIG_IGN)
+        self.assertIs(signal.getsignal(signal.SIGQUIT), signal.SIG_DFL)
+
+    def test_a_hangup_whose_stderr_is_gone_still_cleans_up(self):
+        """After a hangup, writing the last line fails (EIO on a closed terminal); main() still returns 1 and restores."""
+        broken = unittest.mock.Mock()
+        broken.write.side_effect = OSError(errno.EIO, "Input/output error")
+        broken.fileno.side_effect = OSError(errno.EBADF, "no descriptor")
+
+        def dispatch(args):
+            sys.stderr = broken
+            os.kill(os.getpid(), signal.SIGHUP)
+            time.sleep(5)
+            return cli.EXIT_OK
+
+        with unittest.mock.patch.object(sys, "stderr", sys.stderr):
+            with unittest.mock.patch.object(cli, "dispatch", side_effect=dispatch):
+                code = cli.main(["check"])
+        self.assertEqual(code, cli.EXIT_ERROR)
+        self.assertTrue(broken.write.called, "the final line was attempted")
+        self.assertFalse(cli._terminating)
+        self.assertIs(signal.getsignal(signal.SIGHUP), signal.SIG_DFL)
+
+    def test_a_closed_stderr_does_not_cut_the_cleanup_short(self):
+        closed = io.StringIO()
+        closed.close()
+
+        def dispatch(args):
+            sys.stderr = closed
+            os.kill(os.getpid(), signal.SIGHUP)
+            time.sleep(5)
+            return cli.EXIT_OK
+
+        with unittest.mock.patch.object(sys, "stderr", sys.stderr):
+            with unittest.mock.patch.object(cli, "dispatch", side_effect=dispatch):
+                code = cli.main(["check"])
+        self.assertEqual(code, cli.EXIT_ERROR)
+        self.assertFalse(cli._terminating)
+        self.assertIs(signal.getsignal(signal.SIGHUP), signal.SIG_DFL)
+
+    def test_a_pipe_whose_reader_is_gone_is_pointed_at_dev_null(self):
+        """EPIPE on the final line (tee killed with the run): the descriptor goes to /dev/null, so the flush at exit
+        cannot fail either."""
+        reader, writer = os.pipe()
+        os.close(reader)
+        stream = open(writer, "w", buffering=1)
+        self.addCleanup(stream.close)
+
+        def dispatch(args):
+            sys.stderr = stream
+            os.kill(os.getpid(), signal.SIGQUIT)
+            time.sleep(5)
+            return cli.EXIT_OK
+
+        with unittest.mock.patch.object(sys, "stderr", sys.stderr):
+            with unittest.mock.patch.object(cli, "dispatch", side_effect=dispatch):
+                code = cli.main(["check"])
+        self.assertEqual(code, cli.EXIT_ERROR)
+        self.assertEqual(os.path.realpath("/proc/self/fd/{}".format(writer)) if os.path.exists("/proc/self/fd")
+                         else os.devnull, os.devnull)
+        stream.write("later line\n")
+        stream.flush()
+
+    def capture_fd2(self):
+        """Point file descriptor 2 at a temporary file until cleanup; returns a function reading it."""
+        import tempfile
+        holder = tempfile.TemporaryFile()
+        saved = os.dup(2)
+        os.dup2(holder.fileno(), 2)
+
+        def restore():
+            os.dup2(saved, 2)
+            os.close(saved)
+            holder.close()
+
+        self.addCleanup(restore)
+
+        def read():
+            holder.seek(0)
+            return holder.read().decode("utf-8")
+
+        return read
+
+    def test_sigusr1_starts_a_drain_and_says_so_once(self):
+        read = self.capture_fd2()
+        self.assertIsNone(cli._on_sigusr1(signal.SIGUSR1, None))
+        self.assertTrue(vidfunnel.interrupt.draining.is_set())
+        self.assertFalse(vidfunnel.interrupt.interrupted.is_set())
+        cli._on_sigusr1(signal.SIGUSR1, None)
+        self.assertEqual(read(), cli.DRAIN_NOTICE)
+        self.assertIn("finishing the items in progress, starting no more", read())
+
+    def test_the_drain_handler_takes_no_lock(self):
+        self.capture_fd2()
+        refuse = unittest.mock.Mock(side_effect=AssertionError("the SIGUSR1 handler took a lock"))
+        with unittest.mock.patch.object(threading.Event, "set", refuse), \
+                unittest.mock.patch.object(threading.Event, "wait", refuse), \
+                unittest.mock.patch.object(sys, "stderr", unittest.mock.Mock(write=refuse, flush=refuse)), \
+                unittest.mock.patch("vidfunnel.ffmpeg.terminate_children", refuse):
+            cli._on_sigusr1(signal.SIGUSR1, None)
+        refuse.assert_not_called()
+
+    def test_a_drained_command_keeps_its_exit_code_and_reports_the_counts(self):
+        read = self.capture_fd2()
+
+        def dispatch(args):
+            os.kill(os.getpid(), signal.SIGUSR1)
+            self.assertTrue(vidfunnel.interrupt.draining.is_set())
+            vidfunnel.interrupt.drain_after_item()
+            self.assertTrue(vidfunnel.interrupt.drain_before_next(3))
+            return 0
+
+        with unittest.mock.patch.object(cli, "dispatch", side_effect=dispatch):
+            code, _out, err = run_main(["convert"])
+        self.assertEqual(code, 0)
+        self.assertIn("vidfunnel: drained: finished 1 in progress, started no more (3 left planned)", err)
+        self.assertIn(cli.DRAIN_NOTICE, read())
+        self.assertFalse(vidfunnel.interrupt.draining.is_set(), "the drain outlived the command")
+        self.assertIs(signal.getsignal(signal.SIGUSR1), signal.SIG_DFL)
+
+    def test_a_command_that_does_not_drain_says_it_ran_to_its_end(self):
+        self.capture_fd2()
+
+        def dispatch(args):
+            os.kill(os.getpid(), signal.SIGUSR1)
+            return 0
+
+        code, _out, err = self.run_with_dispatch(dispatch)
+        self.assertEqual(code, 0)
+        self.assertIn("'check' does not stop between items; it ran to its end", err)
+
+    def test_sigterm_during_a_drain_stops_now(self):
+        self.capture_fd2()
+
+        def dispatch(args):
+            os.kill(os.getpid(), signal.SIGUSR1)
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(5)
+            return 0
+
+        code, _out, err = self.run_with_dispatch(dispatch)
+        self.assertEqual(code, cli.EXIT_ERROR)
+        self.assertIn("vidfunnel: terminated (SIGTERM)", err)
+        self.assertNotIn("drained", err)
+        self.assertFalse(vidfunnel.interrupt.draining.is_set())
+
     def test_nothing_is_installed_off_the_main_thread(self):
         result = []
         thread = threading.Thread(target=lambda: result.append(cli.install_sigterm_handler()))
         thread.start()
         thread.join()
         self.assertEqual(result, [None])
-        self.assertIs(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT, signal.SIGUSR1):
+            self.assertIs(signal.getsignal(signum), signal.SIG_DFL)
 
 
 class LauncherTests(unittest.TestCase):

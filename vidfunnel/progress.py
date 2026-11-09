@@ -12,8 +12,10 @@ The clock and the output stream are injectable so that tests can drive the
 throttling deterministically.
 """
 
-VERSION = "20261102"
+VERSION = "20261108"
 
+import errno
+import os
 import sys
 import time
 
@@ -43,16 +45,51 @@ def is_tty(stream=None):
         return False
 
 
+# A write that fails with one of these finds its reader gone: a closed terminal (EIO) or a pipe whose reader
+# has exited (EPIPE), as after a hangup, or Ctrl+C or Ctrl+Backslash to a run piped through tee.
+_GONE_ERRNOS = (errno.EIO, errno.EPIPE)
+
+
 def _write(stream, text):
-    """Write text and flush. Characters the stream cannot encode are escaped, not dropped."""
+    """Write text and flush. Characters the stream cannot encode are escaped, not dropped.
+
+    When the reader is gone (_GONE_ERRNOS), the text is dropped and the
+    stream's file descriptor is pointed at /dev/null (discard_output), so
+    neither this nor any later line, nor the flush at exit, fails: the
+    output is lost with its reader, while the records, which are the
+    authority, are written as usual and no item is failed for a write.
+    """
     try:
-        stream.write(text)
-    except UnicodeEncodeError:
-        encoding = getattr(stream, "encoding", None) or "ascii"
-        stream.write(text.encode(encoding, "backslashreplace").decode(encoding))
-    flush = getattr(stream, "flush", None)
-    if flush is not None:
-        flush()
+        try:
+            stream.write(text)
+        except UnicodeEncodeError:
+            encoding = getattr(stream, "encoding", None) or "ascii"
+            stream.write(text.encode(encoding, "backslashreplace").decode(encoding))
+        flush = getattr(stream, "flush", None)
+        if flush is not None:
+            flush()
+    except OSError as error:
+        if error.errno not in _GONE_ERRNOS:
+            raise
+        discard_output(stream)
+
+
+def discard_output(stream):
+    """Point the file descriptor behind `stream` at /dev/null; a stream without one is left as it is.
+
+    os.dup2 replaces the descriptor in place, so every writer of it (both
+    sys.stdout and a wrapper around it) now writes to /dev/null, and the
+    bytes still in the stream's buffer go there at the next flush.
+    """
+    try:
+        target = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return
+    null = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(null, target)
+    finally:
+        os.close(null)
 
 
 def say(message, stream=None):

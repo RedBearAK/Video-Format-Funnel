@@ -27,7 +27,17 @@ lock. The contract above then applies, with one
 addition: run_pool() calls stop_workers(), which sets `interrupted` and
 sends SIGTERM to the children registered in vidfunnel.ffmpeg (which then
 end the way child_interrupted() expects); vidfunnel.cli.main calls it
-again after a SIGTERM, for the case without a pool.
+again after a SIGTERM, for the case without a pool. SIGHUP and SIGQUIT are
+handled the same way.
+
+SIGUSR1 drains: vidfunnel.cli's handler sets `draining` (a Flag, so the
+handler takes no lock). run_pool() then hands out no further task, and the
+sequential loops of plan and convert ask drain_before_next() before each
+next item; the tasks in progress run to their end, nothing signals their
+children and `interrupted` stays clear, so their results are applied as
+usual. The main thread counts, in `drain_tally`, the tasks that were still
+running when the drain began and the items never started, for the line
+vidfunnel.cli.main prints at the end.
 """
 
 VERSION = "20261108"
@@ -76,6 +86,49 @@ class Flag:
 # Set only on the main thread: by run_pool() while a pool runs, and by stop_workers(); see the module docstring.
 interrupted = Flag()
 
+# Set by the SIGUSR1 handler (vidfunnel.cli): start no further item; see the module docstring.
+draining = Flag()
+
+
+class DrainTally:
+    """What a drain did, counted on the main thread: `finished` items were in progress when it began
+    and ran to their end, `left` items were never started; `seen` once a loop has stopped for it."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.seen = False
+        self.finished = 0
+        self.left = 0
+
+
+drain_tally = DrainTally()
+
+
+def drain_before_next(left, folder=None):
+    """For sequential loops, before each next item: True (stop here) while draining, counting `left` items.
+
+    With `folder`, the stop files above it are checked first
+    (vidfunnel.stopfile.check_item): 'drain' sets the drain, 'now' raises
+    KeyboardInterrupt here, as Ctrl+C would on this (the main) thread.
+    """
+    if folder is not None:
+        from vidfunnel.stopfile import check_item
+        if check_item(folder) == "now":
+            raise KeyboardInterrupt()
+    if not draining.is_set():
+        return False
+    drain_tally.seen = True
+    drain_tally.left += left
+    return True
+
+
+def drain_after_item(count=1):
+    """For sequential loops, after each item: count it as finished in the drain when the drain has begun."""
+    if draining.is_set():
+        drain_tally.finished += count
+
 # A worker whose child died the way a Ctrl+C kills it waits this long for the main
 # thread to set `interrupted`, so the child's death and the main thread's
 # KeyboardInterrupt, which arrive in either order, are not taken for a failure.
@@ -117,7 +170,10 @@ def child_interrupted(returncode):
 
 
 def stop_workers():
-    """Set `interrupted` and send SIGTERM to the registered children; on the main thread, never in a signal handler.
+    """Set `interrupted` and send SIGTERM to the registered children; never in a signal handler.
+
+    Called on the main thread after Ctrl+C or a stop signal, and on any
+    thread that finds a 'now' stop file (vidfunnel.stopfile.check_item).
 
     A KeyboardInterrupt (a further Ctrl+C, or a SIGTERM after a Ctrl+C) raised while it runs
     is dropped and the steps run again, so both are done when it returns;
@@ -134,7 +190,7 @@ def stop_workers():
             continue
 
 
-def run_pool(jobs, tasks, on_done):
+def run_pool(jobs, tasks, on_done, sizes=None, folders=None):
     """Run each task (a callable without arguments) on `jobs` threads; on_done(index, value) on this thread.
 
     A fixed set of worker threads takes the tasks from one queue; on_done is
@@ -149,7 +205,21 @@ def run_pool(jobs, tasks, on_done):
     and KeyboardInterrupt is raised; a task that ended with Interrupted is
     never passed to on_done. Another exception from a task is raised here
     after the running tasks have ended.
+
+    Once `draining` is set a worker takes no further task, and this function
+    returns normally when the running ones have ended: each worker puts a
+    final None on the result queue as it exits, and results are collected
+    until every worker has done so. drain_tally then counts the tasks that
+    ended while draining as finished and the untaken ones as left, each
+    weighed by sizes[index] (the items in that task; 1 when sizes is None).
+
+    With `folders` (the folder of each task), a worker that has taken a task
+    first checks the stop files above its folder (vidfunnel.stopfile.check_item):
+    on 'drain' or 'now' it puts the task back untouched and takes no more;
+    'now' has also set `interrupted` and signalled the children, so this
+    function then raises KeyboardInterrupt as after Ctrl+C.
     """
+    weights = list(sizes) if sizes is not None else [1] * len(tasks)
     pending = queue.Queue()
     for index, task in enumerate(tasks):
         pending.put((index, task))
@@ -157,15 +227,24 @@ def run_pool(jobs, tasks, on_done):
     stop = threading.Event()
 
     def worker():
-        while not (stop.is_set() or interrupted.is_set()):
-            try:
-                index, task = pending.get_nowait()
-            except queue.Empty:
-                return
-            try:
-                finished.put((index, True, task()))
-            except BaseException as error:  # handed to the calling thread, which raises it
-                finished.put((index, False, error))
+        try:
+            while not (stop.is_set() or interrupted.is_set() or draining.is_set()):
+                try:
+                    index, task = pending.get_nowait()
+                except queue.Empty:
+                    return
+                if folders is not None:
+                    from vidfunnel.stopfile import check_item
+                    if check_item(folders[index]) is not None:
+                        pending.put((index, task))  # not started: counted as left, or dropped by the interrupt
+                        return
+                try:
+                    value = task()
+                    finished.put((index, True, value, draining.is_set()))
+                except BaseException as error:  # handed to the calling thread, which raises it
+                    finished.put((index, False, error, False))
+        finally:
+            finished.put(None)  # this worker takes no further task
 
     interrupted.clear()
     threads = []
@@ -175,11 +254,28 @@ def run_pool(jobs, tasks, on_done):
                 thread = threading.Thread(target=worker, name="vidfunnel-worker")
                 threads.append(thread)
                 thread.start()
-            for _number in range(len(tasks)):
-                index, ok, value = finished.get()
+            working = len(threads)
+            while working:
+                result = finished.get()
+                if result is None:
+                    working -= 1
+                    continue
+                index, ok, value, while_draining = result
                 if not ok:
                     raise value
+                if while_draining:
+                    drain_tally.finished += weights[index]
                 on_done(index, value)
+            if interrupted.is_set():  # a 'now' stop file, found by a worker before any task raised
+                raise KeyboardInterrupt()
+            if draining.is_set():
+                drain_tally.seen = True
+                while True:
+                    try:
+                        index, _task = pending.get_nowait()
+                    except queue.Empty:
+                        break
+                    drain_tally.left += weights[index]
         except (KeyboardInterrupt, Interrupted) as error:
             stop_workers()
             if isinstance(error, Interrupted):

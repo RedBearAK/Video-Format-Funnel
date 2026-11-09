@@ -68,9 +68,10 @@ from pathlib import Path
 
 from vidfunnel.ffmpeg import FfmpegError, ToolNotFound, current_identity, forget_child, register_child
 from vidfunnel.ffmpeg import run as run_tool
-from vidfunnel.interrupt import Interrupted, child_interrupted, run_pool
+from vidfunnel.interrupt import Interrupted, child_interrupted, drain_after_item, drain_before_next, run_pool
 from vidfunnel.interrupt import check as check_interrupted
 from vidfunnel.progress import Progress, StageSummary, ffmpeg_progress_callback, say
+from vidfunnel.stopfile import raise_if_stopped_now
 from vidfunnel.record import (
     RECORD_DIR,
     FolderLock,
@@ -80,6 +81,7 @@ from vidfunnel.record import (
     add_stage,
     cheap_fingerprint,
     fingerprint_matches,
+    held_lock_fds,
     iter_records,
     load_record,
     record_path,
@@ -304,7 +306,8 @@ def write_par2(output_path, redundancy, progress=None):
     """par2create -r N -n 1 -q next to the output; returns the PAR2 files written. Raises OSError on failure.
 
     Stale PAR2 files of the same name are removed first. An elapsed-time line
-    runs while par2 works, since it reports no measurable progress.
+    runs while par2 works, since it reports no measurable progress. par2
+    inherits the folder locks' descriptors, as vidfunnel.ffmpeg.run's children do.
     """
     stream, quiet, _verbose = _stream_of(progress)
     output_path = Path(output_path)
@@ -317,9 +320,11 @@ def write_par2(output_path, redundancy, progress=None):
     argv = [par2, "create", "-r{}".format(int(redundancy)), "-n1", "-q", "--", index_name, output_path.name]
     say("writing PAR2 ({} %) for '{}'".format(int(redundancy), output_path.name), stream)
     check_interrupted()
-    process = subprocess.Popen(argv, cwd=str(output_path.parent), stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
-                               encoding="utf-8", errors="replace")
+    raise_if_stopped_now("par2")
+    with held_lock_fds() as lock_fds:
+        process = subprocess.Popen(argv, cwd=str(output_path.parent), stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+                                   encoding="utf-8", errors="replace", pass_fds=lock_fds)
     register_child(process)
     collected = []
     reader = threading.Thread(target=lambda: collected.append(process.stdout.read()), daemon=True)
@@ -1088,7 +1093,10 @@ def refit_paths(tools, paths, options, progress=None):
         results = []
         if jobs == 1:
             for position, key in enumerate(runnable, 1):
+                if drain_before_next(len(runnable) - position + 1, Path(key).parent):
+                    break
                 results.append(work(position, key))
+                drain_after_item()
         else:
             results = [None] * len(runnable)
 
@@ -1096,8 +1104,9 @@ def refit_paths(tools, paths, options, progress=None):
                 results[index] = value
 
             run_pool(jobs, [lambda position=position, key=key: work(position, key)
-                            for position, key in enumerate(runnable, 1)], refit_done)
-        for outcome, reason in results:
+                            for position, key in enumerate(runnable, 1)], refit_done,
+                     folders=[Path(key).parent for key in runnable])
+        for outcome, reason in [result for result in results if result is not None]:  # None: not started (drain)
             if outcome == "skipped":
                 skipped(reason)
             else:
@@ -1137,6 +1146,10 @@ class _LineStream(object):
 
     def isatty(self):
         return False
+
+    def fileno(self):
+        """The target's descriptor, for vidfunnel.progress.discard_output."""
+        return self.target.fileno()
 
 
 def _collect(paths, stream, problems):
@@ -1327,12 +1340,15 @@ def convert_paths(tools, paths, options, progress=None):
             return "failed"
 
         if jobs == 1:
-            for position, (key, _folder) in enumerate(runnable, 1):
+            for position, (key, folder) in enumerate(runnable, 1):
+                if drain_before_next(len(runnable) - position + 1, folder):
+                    break
                 summary.add(work(position, key))
+                drain_after_item()
         else:
             run_pool(jobs, [lambda position=position, key=key: work(position, key)
                             for position, (key, _folder) in enumerate(runnable, 1)],
-                     lambda _index, outcome: summary.add(outcome))
+                     lambda _index, outcome: summary.add(outcome), folders=[folder for _key, folder in runnable])
     finally:
         for lock in locks:
             lock.release()

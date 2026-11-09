@@ -1,6 +1,6 @@
 """Tests for vidfunnel.record: paths, atomic saves, fingerprints, hashes, stages, lock."""
 
-VERSION = "20261107"
+VERSION = "20261108"
 
 import datetime
 import hashlib
@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from unittest import mock
@@ -333,7 +334,8 @@ class FolderLockTests(TempDirCase):
         with FolderLock(self.base):
             content = json.loads(self.lock_file().read_text(encoding="utf-8"))
             self.assertEqual(content["pid"], os.getpid())
-            self.assertEqual(sorted(content), ["container", "host", "machine", "pid", "started"])
+            self.assertEqual(sorted(content),
+                             ["boot", "container", "device", "flock", "host", "machine", "pid", "started"])
             with self.assertRaises(LockHeld) as caught:
                 with FolderLock(self.base):
                     pass
@@ -708,6 +710,266 @@ class FolderLockTests(TempDirCase):
                 raise RuntimeError("boom")
         self.assertFalse(self.lock_file().exists())
 
+
+
+# A lock holder in a process of its own. argv: folder, mode ("plain", "container", "old", "child"),
+# and for "child" the stand-in to run through vidfunnel.ffmpeg.run. It prints ACQUIRED once it holds the lock.
+HOLDER_SCRIPT = """
+import sys, time
+from unittest import mock
+import vidfunnel.ffmpeg
+import vidfunnel.record
+from vidfunnel.record import FolderLock
+folder, mode = sys.argv[1], sys.argv[2]
+patches = []
+if mode == "container":
+    patches.append(mock.patch("vidfunnel.record.in_container", return_value=True))
+if mode == "old":
+    patches.append(mock.patch("vidfunnel.record.now_iso", return_value="2000-01-01T00:00:00Z"))
+for patch in patches:
+    patch.start()
+with FolderLock(folder, warn=lambda line: print("WARN", line, flush=True)):
+    print("ACQUIRED", flush=True)
+    if mode == "child":
+        vidfunnel.ffmpeg.run([sys.argv[3]], check=False)
+    time.sleep(60)
+"""
+
+
+@unittest.skipIf(not hasattr(os, "fork") or not Path("/proc/sys/kernel/random/boot_id").exists(),
+                 "the flock rule needs a POSIX system with a kernel boot id (Linux)")
+class FlockHolderTests(TempDirCase):
+    """The holder keeps flock(LOCK_EX) on its lock file for the run; a judge on the same kernel tests it."""
+
+    def lock_file(self):
+        return self.base / RECORD_DIR / LOCK_NAME
+
+    def start_holder(self, mode, *extra):
+        script = self.base / "holder.py"
+        script.write_text(HOLDER_SCRIPT, encoding="utf-8")
+        environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent))
+        holder = subprocess.Popen([sys.executable, str(script), str(self.base), mode] + list(extra),
+                                  stdout=subprocess.PIPE, universal_newlines=True, env=environment)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait)
+        self.addCleanup(self.kill_quietly, holder.pid)
+        self.assertEqual(holder.stdout.readline(), "ACQUIRED\n")
+        return holder
+
+    @staticmethod
+    def kill_quietly(pid):
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            pass
+
+    def judge(self, warnings):
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with FolderLock(self.base, warn=warnings.append):
+                content = json.loads(self.lock_file().read_text(encoding="utf-8"))
+                self.assertEqual(content["pid"], os.getpid())
+
+    def test_the_lock_records_its_flock_boot_and_device(self):
+        holder = self.start_holder("plain")
+        content = json.loads(self.lock_file().read_text(encoding="utf-8"))
+        self.assertEqual(content["pid"], holder.pid)
+        self.assertIs(content["flock"], True)
+        self.assertEqual(content["boot"], Path("/proc/sys/kernel/random/boot_id").read_text().strip())
+        self.assertEqual(content["device"], os.stat(str(self.lock_file())).st_dev)
+
+    def test_a_held_flock_is_respected_even_past_24_hours(self):
+        """The holder's pid rule would take a 24 h old lock for a reused pid; a held flock is never taken."""
+        holder = self.start_holder("old")
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with self.assertRaises(LockHeld) as caught:
+                with FolderLock(self.base, warn=self.fail):
+                    pass
+        self.assertEqual(caught.exception.pid, holder.pid)
+        self.assertIn("still holds the lock file's flock", str(caught.exception))
+        self.assertIn("whatever its age", str(caught.exception))
+        self.assertGreater(caught.exception.age_seconds, 30 * 3600)
+
+    def test_a_killed_container_holder_is_taken_over_at_once(self):
+        """A fresh lock from a container run (pid not checkable here) is free as soon as its holder is dead."""
+        holder = self.start_holder("container")
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with self.assertRaises(LockHeld):
+                with FolderLock(self.base, warn=self.fail):
+                    pass
+        holder.kill()
+        holder.wait()
+        warnings = []
+        self.judge(warnings)
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("a container run on host", warnings[0])
+        self.assertIn("pid {}, has exited".format(holder.pid), warnings[0])
+        self.assertIn("nothing holds the lock file's flock", warnings[0])
+        self.assertFalse(self.lock_file().exists())
+
+    def write_flock_lock(self, pid, hours_ago, container, **fields):
+        started = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours_ago)
+        content = {"host": socket.gethostname(), "pid": pid, "started": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   "container": container, "machine": machine_id(), "flock": True,
+                   "boot": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
+        write_bytes(self.lock_file(), b"{}")
+        content["device"] = os.stat(str(self.lock_file())).st_dev
+        content.update(fields)
+        write_bytes(self.lock_file(), json.dumps(content).encode("utf-8"))
+        return content
+
+    def test_another_boot_or_device_falls_back_to_the_age_rule(self):
+        """Nothing holds this file's flock; a judge that tested it would take the lock over at once."""
+        for fields in ({"boot": "another-boot"}, {"boot": None}, {"device": 1}):
+            with self.subTest(fields=fields), mock.patch("vidfunnel.record.in_container", return_value=False):
+                held = self.write_flock_lock(1, 2, True, **fields)
+                with self.assertRaises(LockHeld) as caught:
+                    with FolderLock(self.base, warn=self.fail):
+                        pass
+                self.assertIn("held by a container run", str(caught.exception))
+                self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), held)
+                self.write_flock_lock(1, 25, True, **fields)
+                warnings = []
+                with FolderLock(self.base, warn=warnings.append):
+                    pass
+                self.assertEqual(len(warnings), 1, warnings)
+                self.assertIn("stale lock", warnings[0])
+
+    def test_flock_false_falls_back_to_the_pid_rule(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        self.write_flock_lock(child.pid, 0.5, False, flock=False)
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with self.assertRaises(LockHeld) as caught:
+                with FolderLock(self.base, warn=self.fail):
+                    pass
+        self.assertIn("its pid {} is running here".format(child.pid), str(caught.exception))
+        finished = subprocess.Popen([sys.executable, "-c", "pass"])
+        finished.wait()
+        self.write_flock_lock(finished.pid, 0.5, False, flock=False)
+        warnings = []
+        self.judge(warnings)
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("no longer runs", warnings[0])
+
+    def test_a_file_system_refusing_flock_writes_flock_false_and_still_locks(self):
+        import fcntl
+        real_flock = fcntl.flock
+
+        def refuse_exclusive(handle, operation):
+            if operation == fcntl.LOCK_EX | fcntl.LOCK_NB:
+                raise OSError(95, "Operation not supported")
+            return real_flock(handle, operation)
+
+        with mock.patch("vidfunnel.record.fcntl.flock", side_effect=refuse_exclusive):
+            lock = FolderLock(self.base).acquire()
+        try:
+            content = json.loads(self.lock_file().read_text(encoding="utf-8"))
+            self.assertIs(content["flock"], False)
+            script = ("import sys; from vidfunnel.record import FolderLock, LockHeld\n"
+                      "try:\n"
+                      "    FolderLock(sys.argv[1], warn=lambda line: print('WARN', line)).acquire()\n"
+                      "    print('ACQUIRED')\n"
+                      "except LockHeld as held:\n"
+                      "    print('HELD', held)\n")
+            result = subprocess.run([sys.executable, "-c", script, str(self.base)], capture_output=True,
+                                    universal_newlines=True, timeout=20,
+                                    env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent)))
+            self.assertIn("HELD", result.stdout, result.stderr)
+            self.assertIn("its pid {} is running here".format(os.getpid()), result.stdout)
+        finally:
+            lock.release()
+        self.assertFalse(self.lock_file().exists())
+
+    def test_release_unlinks_the_file_before_it_closes_the_descriptor(self):
+        lock = FolderLock(self.base).acquire()
+        handle = lock.handle
+        steps = []
+        real_unlink, real_close = os.unlink, os.close
+
+        def unlink(path, *rest, **options):
+            if str(path) == str(self.lock_file()):
+                steps.append("unlink")
+            return real_unlink(path, *rest, **options)
+
+        def close(descriptor):
+            if descriptor == handle:
+                steps.append("close")
+            return real_close(descriptor)
+
+        with mock.patch("vidfunnel.record.os.unlink", side_effect=unlink), \
+                mock.patch("vidfunnel.record.os.close", side_effect=close):
+            lock.release()
+        self.assertEqual(steps, ["unlink", "close"])
+        self.assertFalse(self.lock_file().exists())
+        with self.assertRaises(OSError):
+            os.fstat(handle)
+
+    def test_a_judge_in_the_holding_process_does_not_open_the_lock_file(self):
+        """On NFS, closing any descriptor of a file can drop the process's locks on it."""
+        with FolderLock(self.base):
+            opened = []
+            real_open, real_os_open = open, os.open
+
+            def recording_open(path, *rest, **options):
+                stream = real_open(path, *rest, **options)
+                opened.append(str(path))
+                return stream
+
+            def recording_os_open(path, *rest):
+                handle = real_os_open(path, *rest)
+                opened.append(str(path))
+                return handle
+
+            with mock.patch("builtins.open", side_effect=recording_open), \
+                    mock.patch("vidfunnel.record.os.open", side_effect=recording_os_open):
+                with self.assertRaises(LockHeld) as caught:
+                    FolderLock(self.base).acquire()
+            self.assertIn("this run itself", str(caught.exception))
+            self.assertNotIn(str(self.lock_file()), opened, "the lock file was opened (only its O_EXCL create may fail)")
+            self.assertTrue(self.lock_file().exists())
+
+    def test_children_inherit_every_held_lock_descriptor(self):
+        """plan --jobs holds several folder locks at once; every child gets all of them."""
+        from vidfunnel.ffmpeg import run
+        other = self.base / "other"
+        with FolderLock(self.base) as first, FolderLock(other) as second:
+            check = "import os, sys\nfor number in sys.argv[1:]:\n    os.fstat(int(number))\n"
+            completed = run([sys.executable, "-c", check, str(first.handle), str(second.handle)], check=False)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+        completed = run([sys.executable, "-c", check, str(first.handle)], check=False)
+        self.assertNotEqual(completed.returncode, 0, "a released lock's descriptor is passed no more")
+
+    def test_an_orphaned_child_keeps_the_lock_until_it_exits(self):
+        """The holder is killed while its 'ffmpeg' runs; the lock stays held until that child ends."""
+        marker = self.base / "child.pid"
+        stand_in = self.base / "ffmpeg-stand-in"
+        stand_in.write_text("#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n".format(marker), encoding="utf-8")
+        os.chmod(str(stand_in), 0o755)
+        holder = self.start_holder("child", str(stand_in))
+        deadline = datetime.datetime.now() + datetime.timedelta(seconds=10)
+        while not (marker.exists() and marker.read_text().strip()):
+            self.assertLess(datetime.datetime.now(), deadline, "the stand-in never started")
+            time.sleep(0.02)
+        child_pid = int(marker.read_text().strip())
+        self.addCleanup(self.kill_quietly, child_pid)
+        holder.kill()
+        holder.wait()
+        self.assertFalse(pid_alive(holder.pid))
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with self.assertRaises(LockHeld) as caught:
+                with FolderLock(self.base, warn=self.fail):
+                    pass
+        self.assertIn("still holds the lock file's flock", str(caught.exception))
+        os.kill(child_pid, 9)
+        deadline = datetime.datetime.now() + datetime.timedelta(seconds=10)
+        while pid_alive(child_pid):
+            self.assertLess(datetime.datetime.now(), deadline, "the stand-in did not end")
+            time.sleep(0.02)
+        warnings = []
+        self.judge(warnings)
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("pid {}, has exited".format(holder.pid), warnings[0])
 
 
 class BandTests(unittest.TestCase):

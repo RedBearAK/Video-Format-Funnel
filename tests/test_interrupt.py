@@ -8,7 +8,7 @@ check what is left on disk. Tests that need ffmpeg or the fixtures skip
 with a message when they are missing.
 """
 
-VERSION = "20261107"
+VERSION = "20261108"
 
 import _thread
 import glob
@@ -310,6 +310,64 @@ class PoolTests(unittest.TestCase):
         self.assertEqual(done, ["fast", "slow"])
 
 
+class DrainPoolTests(unittest.TestCase):
+    """SIGUSR1's drain: run_pool hands out no further task; the running ones end and their results are applied."""
+
+    def setUp(self):
+        interrupted.clear()
+        vidfunnel.interrupt.draining.clear()
+        vidfunnel.interrupt.drain_tally.reset()
+        self.addCleanup(interrupted.clear)
+        self.addCleanup(vidfunnel.interrupt.draining.clear)
+        self.addCleanup(vidfunnel.interrupt.drain_tally.reset)
+
+    def test_the_pool_starts_no_more_tasks_and_applies_the_running_ones(self):
+        both_running = threading.Barrier(3)
+        started = []
+        done = []
+
+        def task(name):
+            def body():
+                started.append(name)
+                if name in ("first", "second"):
+                    both_running.wait(10)
+                    both_running.wait(10)  # held until the drain has begun
+                return name
+            return body
+
+        def drain_when_both_run():
+            both_running.wait(10)
+            vidfunnel.interrupt.draining.set()
+            both_running.wait(10)
+
+        helper = threading.Thread(target=drain_when_both_run)
+        helper.start()
+        run_pool(2, [task(name) for name in ("first", "second", "third", "fourth", "fifth")],
+                 lambda index, value: done.append(value), sizes=[1, 1, 1, 2, 1])
+        helper.join(10)
+        self.assertEqual(sorted(started), ["first", "second"])
+        self.assertEqual(sorted(done), ["first", "second"])
+        self.assertFalse(interrupted.is_set(), "a drain does not set the interrupt event")
+        tally = vidfunnel.interrupt.drain_tally
+        self.assertEqual((tally.seen, tally.finished, tally.left), (True, 2, 4))
+
+    def test_without_a_drain_every_task_runs_and_nothing_is_counted(self):
+        done = []
+        run_pool(3, [lambda number=number: number for number in range(7)], lambda index, value: done.append(value))
+        self.assertEqual(sorted(done), list(range(7)))
+        tally = vidfunnel.interrupt.drain_tally
+        self.assertEqual((tally.seen, tally.finished, tally.left), (False, 0, 0))
+
+    def test_sequential_loops_stop_before_the_next_item(self):
+        drain = vidfunnel.interrupt
+        self.assertFalse(drain.drain_before_next(3))
+        drain.drain_after_item()
+        drain.draining.set()
+        drain.drain_after_item()
+        self.assertTrue(drain.drain_before_next(2))
+        self.assertEqual((drain.drain_tally.seen, drain.drain_tally.finished, drain.drain_tally.left), (True, 1, 2))
+
+
 def _needs(*names):
     missing = [name for name in names if not os.path.exists(os.path.join(FIXTURE_DIR, name))]
     return "fixtures missing ({}); run tests/make_fixtures.sh".format(", ".join(missing)) if missing else None
@@ -488,14 +546,15 @@ def _make_long_clip(path):
 
 
 def _interrupt_command(arguments, trigger, settle, signum=signal.SIGINT, group=True, groups=None,
-                       again_after=None, environment=None):
+                       again_after=None, environment=None, timeout=60, act=None):
     """Run vidfunnel with `arguments`, SIGINT its process group `settle` s after a stdout line holding `trigger`.
 
     With group=False, `signum` goes to the Python process alone, as 'kill'
     or 'podman stop' sends it, so no child receives it from outside. With
     again_after, the same signal is sent a second time that many seconds
     after the first. The process group id (the child's pid) is appended to
-    `groups` when given. `environment` adds variables to the child's.
+    `groups` when given. `environment` adds variables to the child's. `timeout`: seconds to wait for the exit.
+    With `act` (a callable), it is called instead of sending a signal.
     Returns (returncode, stdout, stderr, seconds from the first signal to exit).
     """
     environment = dict(os.environ, PYTHONPATH=REPO_ROOT, **(environment or {}))
@@ -517,6 +576,8 @@ def _interrupt_command(arguments, trigger, settle, signum=signal.SIGINT, group=T
         # The trigger line is printed just before the ffmpeg run it announces starts.
         time.sleep(settle)
         send = (lambda: os.killpg(process.pid, signum)) if group else (lambda: os.kill(process.pid, signum))
+        if act is not None:
+            send = act
         send()
         sent = time.monotonic()
         if again_after is not None:
@@ -525,12 +586,20 @@ def _interrupt_command(arguments, trigger, settle, signum=signal.SIGINT, group=T
                 send()
             except ProcessLookupError:
                 pass
-        rest, errors = process.communicate(timeout=60)
+        rest, errors = process.communicate(timeout=timeout)
         return process.returncode, "".join(lines) + rest, errors, time.monotonic() - sent
     finally:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
+
+
+def _group_alive(group_id):
+    try:
+        os.killpg(group_id, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 @unittest.skipIf(TOOLS is None or not hasattr(os, "killpg"),
@@ -595,7 +664,7 @@ class InterruptIntegrationTests(unittest.TestCase):
         self.extra_environment = {"XDG_CACHE_HOME": str(Path(self.temporary.name) / "cache")}
         return ["--ffmpeg", str(fake_bin / "ffmpeg")]
 
-    def terminate(self, arguments, trigger, settle, again_after=None):
+    def terminate(self, arguments, trigger, settle, again_after=None, signum=signal.SIGTERM):
         groups = []
 
         def kill_leftovers():
@@ -606,13 +675,13 @@ class InterruptIntegrationTests(unittest.TestCase):
                     pass
 
         self.addCleanup(kill_leftovers)
-        result = _interrupt_command(arguments, trigger, settle, signal.SIGTERM, group=False, groups=groups,
+        result = _interrupt_command(arguments, trigger, settle, signum, group=False, groups=groups,
                                     again_after=again_after, environment=getattr(self, "extra_environment", None))
         return result + (groups[0],)
 
-    def assert_terminated(self, code, output, errors, seconds, group_id):
+    def assert_terminated(self, code, output, errors, seconds, group_id, name="SIGTERM"):
         self.assertEqual(code, 1, "stdout:\n{}\nstderr:\n{}".format(output, errors))
-        self.assertIn("vidfunnel: terminated", errors)
+        self.assertIn("vidfunnel: terminated ({})".format(name), errors)
         self.assertNotIn("vidfunnel: interrupted", errors)
         self.assertLess(seconds, SECONDS_TO_EXIT, "exit came {:.1f} s after SIGTERM".format(seconds))
         self.assertEqual(self.leftover_parts(), [])
@@ -620,13 +689,15 @@ class InterruptIntegrationTests(unittest.TestCase):
         with self.assertRaises(ProcessLookupError, msg="a child of the terminated run is still running"):
             os.killpg(group_id, 0)
 
-    def plan_terminated(self, jobs, again_after=None):
+    def plan_terminated(self, jobs, again_after=None, signum=signal.SIGTERM):
+        name = signal.Signals(signum).name
         arguments = self.slow_window_ffmpeg() + ["plan"] + (["--jobs", str(jobs)] if jobs else []) + [str(self.root)]
         code, output, errors, seconds, group_id = self.terminate(arguments, "idet, cropdetect", 0.3,
-                                                                 again_after=again_after)
-        sys.stderr.write("\n  plan{}{}: exit {:.2f} s after SIGTERM ".format(
-            " --jobs {}".format(jobs) if jobs else "", ", SIGTERM twice" if again_after else "", seconds))
-        self.assert_terminated(code, output, errors, seconds, group_id)
+                                                                 again_after=again_after, signum=signum)
+        sys.stderr.write("\n  plan{}{}: exit {:.2f} s after {} ".format(
+            " --jobs {}".format(jobs) if jobs else "", ", {} twice".format(name) if again_after else "", seconds,
+            name))
+        self.assert_terminated(code, output, errors, seconds, group_id, name)
         records = self.records()
         self.assertLess(len(records), len(COPY_NAMES), "every item finished; nothing was terminated")
         for name, record in records.items():
@@ -639,6 +710,14 @@ class InterruptIntegrationTests(unittest.TestCase):
     def test_plan_with_jobs_terminated_by_two_sigterms(self):
         """The second SIGTERM, 50 ms after the first, does not cut the cleanup short (no 'failed' records)."""
         self.plan_terminated(2, again_after=0.05)
+
+    def test_plan_with_jobs_terminated_by_sigquit(self):
+        """SIGQUIT (Ctrl+Backslash, or 'podman kill --signal QUIT' to the container's PID 1) stops like SIGTERM."""
+        self.plan_terminated(2, signum=signal.SIGQUIT)
+
+    def test_plan_with_jobs_terminated_by_sighup(self):
+        """SIGHUP (the terminal was closed) stops like SIGTERM."""
+        self.plan_terminated(2, signum=signal.SIGHUP)
 
     def test_plan_without_jobs_terminated_by_sigterm(self):
         """The main thread's own ffmpeg child is killed and reaped before the run exits."""
@@ -667,6 +746,95 @@ class InterruptIntegrationTests(unittest.TestCase):
                 continue
             self.assertIn(record["status"], ("converted", "verified"), name)
         self.assertGreater(unchanged, 0, "every item finished; nothing was terminated")
+
+    def drain(self, jobs):
+        """SIGUSR1 once the first encode runs: the encodes in progress finish and are verified, no more start."""
+        vidfunnel.plan.plan_paths(TOOLS, [str(self.root)], vidfunnel.plan.make_options(jobs=4), progress=quiet())
+        planned = self.records()
+        self.assertEqual(sorted(record["status"] for record in planned.values()), ["planned"] * len(COPY_NAMES))
+        arguments = ["convert"] + (["--jobs", str(jobs)] if jobs > 1 else []) + [str(self.root)]
+        groups = []
+        self.addCleanup(lambda: [os.killpg(group, signal.SIGKILL) for group in groups if _group_alive(group)])
+        trigger = "[convert {}/".format(jobs)
+        code, output, errors, seconds = _interrupt_command(arguments, trigger, 1.0, signal.SIGUSR1, group=False,
+                                                           groups=groups, timeout=900)
+        sys.stderr.write("\n  convert{}: exit {:.2f} s after SIGUSR1 ".format(
+            " --jobs {}".format(jobs) if jobs > 1 else "", seconds))
+        self.assertEqual(code, 0, "stdout:\n{}\nstderr:\n{}".format(output, errors))
+        self.assertIn("vidfunnel: SIGUSR1: finishing the items in progress, starting no more", errors)
+        self.assertIn("vidfunnel: drained: finished {} in progress, started no more ({} left planned)".format(
+            jobs, len(COPY_NAMES) - jobs), errors)
+        self.assertNotIn("terminated", errors)
+        self.assertNotIn("interrupted", errors)
+        self.assertEqual(self.leftover_parts(), [])
+        self.assertEqual(self.lock_files(), [])
+        statuses = [record["status"] for record in self.records().values()]
+        self.assertEqual(statuses.count("planned"), len(COPY_NAMES) - jobs, statuses)
+        self.assertEqual(len([status for status in statuses if status in ("converted", "verified")]), jobs, statuses)
+        for name, record in self.records().items():
+            if record["status"] == "planned":
+                self.assertEqual(record, planned[name], name)
+            else:
+                output_path = self.root / record["output"]["name"]
+                self.assertTrue(fingerprint_matches(record["output"]["fingerprint"],
+                                                    cheap_fingerprint(output_path)), name)
+
+    def stop_all(self, *options):
+        """'vidfunnel stop-all' on the library from a process of its own, as from another host."""
+        result = subprocess.run([sys.executable, "-m", "vidfunnel", "stop-all"] + list(options) + [str(self.root)],
+                                cwd=REPO_ROOT, env=dict(os.environ, PYTHONPATH=REPO_ROOT), capture_output=True,
+                                universal_newlines=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_convert_with_jobs_drained_by_a_stop_file(self):
+        """A stop file written while two encodes run: they finish (and are verified), no further item starts."""
+        vidfunnel.plan.plan_paths(TOOLS, [str(self.root)], vidfunnel.plan.make_options(jobs=4), progress=quiet())
+        planned = self.records()
+        groups = []
+        self.addCleanup(lambda: [os.killpg(group, signal.SIGKILL) for group in groups if _group_alive(group)])
+        code, output, errors, seconds = _interrupt_command(["convert", "--jobs", "2", str(self.root)], "[convert 2/",
+                                                           1.0, group=False, groups=groups, timeout=900,
+                                                           act=self.stop_all)
+        sys.stderr.write("\n  convert --jobs 2: exit {:.2f} s after the stop file ".format(seconds))
+        self.assertEqual(code, 0, "stdout:\n{}\nstderr:\n{}".format(output, errors))
+        self.assertIn("vidfunnel: stop requested from host", errors)
+        self.assertIn("(drain): finishing the items in progress, starting no more", errors)
+        self.assertIn("started no more (2 left planned)", errors)
+        self.assertEqual(self.leftover_parts(), [])
+        self.assertEqual(self.lock_files(), [])
+        statuses = [record["status"] for record in self.records().values()]
+        self.assertEqual(statuses.count("planned"), 2, statuses)
+        self.assertEqual(len([status for status in statuses if status in ("converted", "verified")]), 2, statuses)
+        for name, record in self.records().items():
+            if record["status"] == "planned":
+                self.assertEqual(record, planned[name], name)
+        self.assertTrue(os.path.exists(str(self.root / RECORD_DIR / "stop")), "only 'resume' removes the file")
+
+    def test_plan_with_jobs_stopped_now_by_a_stop_file(self):
+        """'stop-all --now' acts as Ctrl+C at the next item or child start: no record is failed, nothing is left."""
+        groups = []
+        self.addCleanup(lambda: [os.killpg(group, signal.SIGKILL) for group in groups if _group_alive(group)])
+        code, output, errors, seconds = _interrupt_command(["plan", "--jobs", "2", str(self.root)], "[plan 2/", 0.3,
+                                                           group=False, groups=groups, act=lambda: self.stop_all("--now"))
+        sys.stderr.write("\n  plan --jobs 2: exit {:.2f} s after the stop file (now) ".format(seconds))
+        self.assertEqual(code, 1, "stdout:\n{}\nstderr:\n{}".format(output, errors))
+        self.assertIn("(now): stopping now", errors)
+        self.assertIn("vidfunnel: stopped (a stop file asked for it)", errors)
+        self.assertLess(seconds, SECONDS_TO_EXIT)
+        self.assertEqual(self.leftover_parts(), [])
+        self.assertEqual(self.lock_files(), [])
+        records = self.records()
+        self.assertLess(len(records), len(COPY_NAMES), "every item finished; nothing was stopped")
+        for name, record in records.items():
+            self.assertEqual(record["status"], "planned", name)
+        with self.assertRaises(ProcessLookupError, msg="a child of the stopped run is still running"):
+            os.killpg(groups[0], 0)
+
+    def test_convert_with_jobs_drained_by_sigusr1(self):
+        self.drain(2)
+
+    def test_convert_without_jobs_drained_by_sigusr1(self):
+        self.drain(1)
 
     def test_plan_with_jobs_interrupted_in_the_window_pass(self):
         code, output, errors, seconds = _interrupt_command(["plan", "--jobs", "2", str(self.root)],
