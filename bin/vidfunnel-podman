@@ -11,7 +11,7 @@
 # follows; 'attach' follows one again and 'stop' drains or stops one.
 # See HANDOFF.md section 8.
 
-VERSION="20261108"
+VERSION="20261109"
 
 set -eu
 set -f
@@ -93,7 +93,10 @@ What the wrapper does:
   writable: with podman on the crun runtime through --group-add keep-groups; with
   docker through --group-add for each of your group ids. podman on runc cannot
   keep them (runc ignores keep-groups, and numeric ids map to subordinate gids
-  under keep-id); the wrapper then prints a warning when you have such groups.
+  under keep-id); the wrapper then prints a warning naming each mounted folder
+  that you can write only through one of those groups (owned by someone else,
+  group-writable, not writable by others, its group one of your supplementary
+  groups), and no warning when no mounted folder depends on one.
 
 Installing the command:
   --install-command and --uninstall-command (or an abbreviation argparse
@@ -1074,15 +1077,56 @@ supplementary_gids() {
         [ "${gid}" = "${primary}" ] || printf '%s\n' "${gid}"
     done
 }
+# Owner uid, group gid and permission bits (octal) of a path, as 'UID GID MODE':
+# 'stat -c' on GNU and busybox, 'stat -f' with '%Lp' on macOS and the BSDs. Prints
+# nothing when stat fails or answers in another shape.
+owner_group_mode() {
+    fields=$(stat -c '%u %g %a' "$1" 2>/dev/null) || fields=$(stat -f '%u %g %Lp' "$1" 2>/dev/null) || fields=""
+    set -- ${fields}
+    [ "$#" -eq 3 ] || return 0
+    for field in "$@"; do
+        case "${field}" in ''|*[!0-9]*) return 0 ;; esac
+    done
+    printf '%s %s %s\n' "$1" "$2" "$3"
+}
+# The gid through which alone the invoking user can write the folder $1, or nothing:
+# the folder is owned by another uid, its mode gives the group write and others no
+# write, and its group is one of the user's supplementary groups (supplementary_gids
+# leaves out the primary group, which every runtime keeps). A folder stat cannot
+# read needs no warning.
+group_only_gid() {
+    set -- $(owner_group_mode "$1")
+    [ "$#" -eq 3 ] || return 0
+    [ "$1" != "$(id -u)" ] || return 0
+    case "$3" in *[2367]?) ;; *) return 0 ;; esac
+    case "$3" in *[2367]) return 0 ;; esac
+    for gid in $(supplementary_gids); do
+        if [ "${gid}" = "$2" ]; then
+            printf '%s\n' "$2"
+            return 0
+        fi
+    done
+}
+# One warning for each mounted folder that is writable only through a supplementary
+# group, for a runtime that cannot keep those groups.
+warn_group_only_mounts() {
+    oldifs="$IFS"
+    IFS='
+'
+    for m in ${MOUNTS}; do
+        IFS="$oldifs"
+        needed=$(group_only_gid "${m}")
+        if [ -n "${needed}" ]; then
+            say "vidfunnel-podman: warning: '${m}' is writable only through group ${needed}, and the OCI runtime '$1' cannot keep supplementary groups inside the container; writes there may fail (crun keeps them)" >&2
+        fi
+    done
+    IFS="$oldifs"
+}
 if [ "${ENGINE}" = "podman" ]; then
     runtime=$(podman info --format '{{.Host.OCIRuntime.Name}}' 2>/dev/null || true)
     case "${runtime}" in
         crun|*/crun) set -- --group-add keep-groups "$@" ;;
-        *)
-            if [ -n "$(supplementary_gids)" ]; then
-                say "vidfunnel-podman: the OCI runtime '${runtime:-unknown}' cannot keep your supplementary groups inside the container (only crun can, with --group-add keep-groups); a folder writable only through a group will be read-only there" >&2
-            fi
-            ;;
+        *) warn_group_only_mounts "${runtime:-unknown}" ;;
     esac
     set -- --userns=keep-id "$@"
 else

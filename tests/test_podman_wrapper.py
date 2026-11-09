@@ -5,7 +5,7 @@ and exits 0, so no container is started. HOME is a temporary folder in every
 test; nothing here reads or writes the real ~/.local or any rc file.
 """
 
-VERSION = "20261108"
+VERSION = "20261109"
 
 import hashlib
 import os
@@ -147,6 +147,43 @@ esac
 exit 0
 """
 
+# A fake 'stat' for the supplementary-group warning: for a path ending in FAKE_STAT_SUFFIX it
+# prints FAKE_STAT_OUTPUT when asked the way FAKE_STAT_ANSWER says ('gnu': only 'stat -c'
+# answers, as on Linux; 'bsd': 'stat -c' fails and 'stat -f' answers, as on macOS; 'fail':
+# both fail). Every other path goes to the real stat.
+FAKE_STAT = r"""#!/bin/sh
+for argument in "$@"; do last="$argument"; done
+case "$last" in
+    *"${FAKE_STAT_SUFFIX:-/no-such-suffix}")
+        case "${FAKE_STAT_ANSWER:-gnu}" in
+            fail) exit 1 ;;
+            bsd) if [ "$1" != -f ]; then echo "stat: illegal option -- c" >&2; exit 1; fi ;;
+            *) if [ "$1" != -c ]; then exit 1; fi ;;
+        esac
+        printf '%s\n' "$FAKE_STAT_OUTPUT"
+        exit 0
+        ;;
+esac
+for real in /usr/bin/stat /bin/stat; do
+    if [ -x "$real" ]; then exec "$real" "$@"; fi
+done
+exit 1
+"""
+
+# A fake 'id' that answers -u, -g and -G from FAKE_ID_UID, FAKE_ID_GID and FAKE_ID_GROUPS when
+# they are set, and passes everything else to the real id.
+FAKE_ID = r"""#!/bin/sh
+case "$1" in
+    -u) if [ -n "${FAKE_ID_UID:-}" ]; then printf '%s\n' "$FAKE_ID_UID"; exit 0; fi ;;
+    -g) if [ -n "${FAKE_ID_GID:-}" ]; then printf '%s\n' "$FAKE_ID_GID"; exit 0; fi ;;
+    -G) if [ -n "${FAKE_ID_GROUPS:-}" ]; then printf '%s\n' "$FAKE_ID_GROUPS"; exit 0; fi ;;
+esac
+for real in /usr/bin/id /bin/id; do
+    if [ -x "$real" ]; then exec "$real" "$@"; fi
+done
+exit 1
+"""
+
 FAKE_OLD_PYTHON = """#!/bin/sh
 exit 1
 """
@@ -237,17 +274,71 @@ class SupplementaryGroupTests(WrapperTestCase):
         self.assertEqual(code, 0, output)
         argv = self.engine_argv()
         self.assert_pair(argv, "--group-add", "keep-groups")
-        self.assertNotIn("cannot keep your supplementary groups", output)
+        self.assertNotIn("cannot keep supplementary groups", output)
 
-    def test_podman_on_runc_adds_no_groups_and_warns_when_the_user_has_some(self):
+    def test_podman_on_runc_adds_no_groups_and_no_warning_for_folders_of_our_own(self):
         code, output = self.run_with_runtime("runc", "check")
         self.assertEqual(code, 0, output)
         argv = self.engine_argv()
         self.assertNotIn("--group-add", argv)
-        if self.host_supplementary_gids():
-            self.assertIn("'runc' cannot keep your supplementary groups", output)
-        else:
-            self.assertNotIn("cannot keep your supplementary groups", output)
+        self.assertNotIn("cannot keep supplementary groups", output)
+
+    def run_with_share(self, runtime, stat_output, answer="gnu"):
+        """Run 'plan SHARE' attached, with SHARE's owner, group and mode from the fake stat.
+
+        The invoking user is uid 5000, primary group 5000, supplementary groups
+        100 and 200 (the fake id). SHARE lies outside the working directory, so
+        it is a mount of its own.
+        """
+        self.write_script("stat", FAKE_STAT)
+        self.write_script("id", FAKE_ID)
+        share = self.workdir.parent / "media share"
+        share.mkdir()
+        env = dict(self.environment(runtime=runtime), FAKE_STAT_SUFFIX="/media share", FAKE_STAT_OUTPUT=stat_output,
+                   FAKE_STAT_ANSWER=answer, FAKE_ID_UID="5000", FAKE_ID_GID="5000", FAKE_ID_GROUPS="5000 100 200",
+                   VIDFUNNEL_ATTACHED="1")
+        result = subprocess.run([SHELL_BINARY, str(WRAPPER), "plan", str(share)], cwd=str(self.workdir), env=env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                universal_newlines=True)
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("{0}:{0}".format(share), self.engine_argv())
+        return share, output
+
+    def test_runc_warns_for_a_folder_writable_only_through_a_supplementary_group(self):
+        share, output = self.run_with_share("runc", "0 100 775")
+        self.assertIn("vidfunnel-podman: warning: '{}' is writable only through group 100, and the OCI runtime "
+                      "'runc' cannot keep supplementary groups inside the container; writes there may fail "
+                      "(crun keeps them)".format(share), output)
+        self.assertEqual(output.count("cannot keep supplementary groups"), 1, output)
+
+    def test_runc_warns_with_the_bsd_stat_fallback(self):
+        share, output = self.run_with_share("runc", "0 200 2775", answer="bsd")
+        self.assertIn("'{}' is writable only through group 200".format(share), output)
+
+    def test_runc_no_warning_when_the_folder_is_ours(self):
+        _share, output = self.run_with_share("runc", "5000 100 775")
+        self.assertNotIn("cannot keep supplementary groups", output)
+
+    def test_runc_no_warning_when_the_group_is_our_primary_group(self):
+        _share, output = self.run_with_share("runc", "0 5000 775")
+        self.assertNotIn("cannot keep supplementary groups", output)
+
+    def test_runc_no_warning_when_stat_fails(self):
+        _share, output = self.run_with_share("runc", "0 100 775", answer="fail")
+        self.assertNotIn("cannot keep supplementary groups", output)
+
+    def test_runc_no_warning_for_a_group_we_are_not_in_or_without_group_write_or_writable_by_all(self):
+        for stat_output in ("0 300 775", "0 100 755", "0 100 777", "0 100 garbage", "0 100"):
+            with self.subTest(stat_output=stat_output):
+                share, output = self.run_with_share("runc", stat_output)
+                self.assertNotIn("cannot keep supplementary groups", output)
+                share.rmdir()
+
+    def test_crun_never_warns(self):
+        _share, output = self.run_with_share("crun", "0 100 775")
+        self.assertNotIn("cannot keep supplementary groups", output)
+        self.assert_pair(self.engine_argv(), "--group-add", "keep-groups")
 
     def test_docker_adds_each_supplementary_group_by_number(self):
         # The PATH must not reach the real podman once the fake one is gone, so it holds only the
