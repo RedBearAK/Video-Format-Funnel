@@ -247,12 +247,17 @@ def _logs(record):
 def rows_from_records(items, redactor=None, with_logs=False):
     """One row dict per (folder, record); with a redactor, rows come from redacted copies.
 
-    Every record is passed to redactor.record() before any row is built, so that
-    the final redactor.text() pass over each string field knows every real name.
+    Every record is passed to redactor.learn() before any is redacted, so the
+    redactor compiles its pattern once with every real name in it; learning
+    and redacting record by record recompiled an ever longer pattern for each
+    record and took minutes for a few thousand records.
     """
     prepared = []
     groups = []
     group_numbers = {}
+    if redactor is not None:
+        for _folder, record in items:
+            redactor.learn(record)
     for folder, record in items:
         # Rows are grouped by the real folder, which redaction may make look like
         # another one ('Christmas 1998' and 'Christmas 2001'); the row carries only
@@ -260,7 +265,7 @@ def rows_from_records(items, redactor=None, with_logs=False):
         real_folder = str((record.get("source") or {}).get("folder") or "")
         groups.append(group_numbers.setdefault(real_folder, len(group_numbers)))
         if redactor is not None:
-            prepared.append(redactor.record(record))
+            prepared.append(redactor.redacted(record))
         else:
             prepared.append(record)
 

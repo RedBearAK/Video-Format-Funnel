@@ -105,6 +105,42 @@ def redact_word(word):
     return first + "".join(_mask_char(char) for char in word[1:])
 
 
+def trie_pattern(words):
+    """A regex source matching any of `words`, shaped as a trie, longest match first.
+
+    A flat alternation 'a|b|c|...' makes the engine try every alternative at
+    every position: with ten thousand names a report took minutes. In the
+    trie shape ('cl(?:ip(?: 1|2)?|ock)') the engine follows one branch per
+    character. At a node that ends a word and also continues, the
+    continuation is tried first (a greedy optional group), so the longest
+    word wins, as the sorted flat alternation did. With no words the pattern
+    is '(?!)', which matches nothing (an empty source would match everywhere).
+    """
+    root = {}
+    for word in words:
+        node = root
+        for character in word:
+            node = node.setdefault(character, {})
+        node[""] = {}  # end of a word
+
+    def render(node):
+        ends = "" in node
+        branches = []
+        for character in sorted(key for key in node if key != ""):
+            child = node[character]
+            branches.append(re.escape(character) + render(child))
+        if not branches:
+            return ""
+        body = branches[0] if len(branches) == 1 else "(?:" + "|".join(branches) + ")"
+        if ends:
+            return "(?:" + body + ")?"
+        return body
+
+    if not root:
+        return "(?!)"
+    return render(root)
+
+
 def _redact_words(text):
     """Split text into words and separators, redact each word, keep separators."""
     pieces = []
@@ -310,9 +346,7 @@ class Redactor:
 
     def _compiled(self):
         if self._pattern is None and self._substitutions:
-            ordered = sorted(self._substitutions, key=lambda item: (-len(item), item))
-            alternatives = "|".join(re.escape(item) for item in ordered)
-            self._pattern = re.compile(r"(?<![^\W_])(?:" + alternatives + r")(?![^\W_])")
+            self._pattern = re.compile(r"(?<![^\W_])(?:" + trie_pattern(self._substitutions) + r")(?![^\W_])")
         return self._pattern
 
     def text(self, text):
@@ -388,6 +422,19 @@ class Redactor:
         if not isinstance(record, dict):
             raise TypeError("Redactor.record() takes a dict, got {}".format(type(record).__name__))
         self.learn(record)
+        return self._record(record)
+
+    def redacted(self, record):
+        """Return a redacted deep copy of a record already passed to learn(); learns nothing.
+
+        For many records, call learn() on all of them first and then redacted()
+        on each: every learn() invalidates the compiled pattern, so learning and
+        redacting record by record recompiles an ever longer alternation for
+        each record (minutes for a few thousand records); learning first
+        compiles it once.
+        """
+        if not isinstance(record, dict):
+            raise TypeError("Redactor.redacted() takes a dict, got {}".format(type(record).__name__))
         return self._record(record)
 
     def _record(self, record):

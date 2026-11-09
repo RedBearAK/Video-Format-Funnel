@@ -720,6 +720,42 @@ class ReportTree(unittest.TestCase):
         self.assertEqual({self.records[word]["id"] for word in ("beach", "mountain")},
                          {row["id"] for row in json.loads(again)["rows"]})
 
+    def test_redaction_compiles_its_pattern_once_for_all_records(self):
+        # Learning and redacting record by record recompiled the pattern per record (quadratic);
+        # a 5,000-record redacted report took about 2.5 minutes with nothing printed. The bound
+        # also needs the trie-shaped pattern: with a flat alternation of every name these 4,000
+        # records took 15 s here, with the trie under 3 s.
+        import re as regex_module
+        items = []
+        for number in range(4000):
+            folder = str(self.base / "tree{}".format(number % 40))
+            source = Path(folder) / "clip {}.avi".format(number)
+            source.parent.mkdir(exist_ok=True)
+            source.write_bytes(b"x")
+            record = new_record(source)
+            record["source"]["folder"] = folder
+            record["output"]["name"] = "clip {}.mp4".format(number)
+            # The argv goes through Redactor.text() while the record is redacted, which is
+            # where the per-record learn-then-redact compiled the pattern again.
+            record["stages"]["plan"] = {"argv": ["ffmpeg", "-i", str(source), "-c", "copy",
+                                                 str(Path(folder) / "clip {}.mp4".format(number))]}
+            items.append((Path(folder), record))
+        compiled = []
+        real_compile = regex_module.compile
+
+        def counting(pattern, *rest, **options):
+            if "(?<![^\\W_])" in pattern:
+                compiled.append(pattern)
+            return real_compile(pattern, *rest, **options)
+
+        started = time.monotonic()
+        with mock.patch("vidfunnel.redact.re.compile", side_effect=counting):
+            rows = rows_from_records(items, redactor=Redactor(roots=[str(self.base)]))
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(rows), 4000)
+        self.assertEqual(len(compiled), 1, "one compile with every name, not one per record")
+        self.assertLess(elapsed, 10, "4000 records redacted in {:.1f} s".format(elapsed))
+
     def test_no_path_reads_the_current_directory_and_says_so(self):
         previous = os.getcwd()
         os.chdir(str(self.base))

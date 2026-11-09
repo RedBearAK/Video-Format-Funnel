@@ -8,6 +8,7 @@ VERSION = "20261108"
 
 import copy
 import random
+import re
 import unittest
 
 from vidfunnel.redact import (
@@ -16,6 +17,7 @@ from vidfunnel.redact import (
     redact_name,
     redact_path,
     redact_word,
+    trie_pattern,
     truncate_to_year,
 )
 
@@ -298,6 +300,61 @@ class RedactorTests(unittest.TestCase):
         self.assertEqual(redacted["history"][0]["source"]["name"],
                          "C____t N__e - D________n ####-##-## p___#.avi")
         self.assertEqual(redacted["history"][0]["id"], record["id"])
+
+
+BOUNDED = r"(?<![^\W_])(?:{})(?![^\W_])"
+
+TRIE_WORDS = [
+    "clip", "clip 1", "clip 12", "clock", "a/b/clip 1.avi", "a/b", "a", "b",
+    "é", "été", "name with spaces", "name", "dot.ted.name", "x+y", "(paren)",
+    "tab\there",
+]
+
+TRIE_TEXTS = [
+    "clip clip 1 clip 12 clip 123 clock clocks clipboard",
+    "/home/a/b/clip 1.avi and a/b/clip 12.avi, a/b/c, a b ab ba",
+    "é été étés éé (é) été-été",
+    "name with spaces; name with; names with spaces; a name",
+    "dot.ted.name dot.ted.names dot.ted x+y x+yz (paren) ((paren)) paren",
+    "tab\there tab here tab\theres\ttab\there",
+    "",
+    "nothing to see",
+    "clip_1 _clip 1_ clip-1 clip 1.avi",
+]
+
+
+class TriePatternTests(unittest.TestCase):
+
+    def test_matches_equal_the_flat_alternation_longest_first(self):
+        ordered = sorted(TRIE_WORDS, key=lambda item: (-len(item), item))
+        flat = re.compile(BOUNDED.format("|".join(re.escape(item) for item in ordered)))
+        trie = re.compile(BOUNDED.format(trie_pattern(TRIE_WORDS)))
+        for text in TRIE_TEXTS:
+            with self.subTest(text=text):
+                expected = [(match.span(), match.group(0)) for match in flat.finditer(text)]
+                actual = [(match.span(), match.group(0)) for match in trie.finditer(text)]
+                self.assertEqual(actual, expected)
+        self.assertTrue(any(flat.search(text) for text in TRIE_TEXTS))
+
+    def test_nested_words_match_the_longest(self):
+        pattern = re.compile(trie_pattern(["ab", "abc", "abcd"]))
+        table = [("abcd", "abcd"), ("abcx", "abc"), ("abx", "ab")]
+        for text, expected in table:
+            with self.subTest(text=text):
+                self.assertEqual(pattern.match(text).group(0), expected)
+
+    def test_single_word_is_its_escaped_self(self):
+        for word in ("clip", "x+y", "(paren)", "dot.ted.name"):
+            with self.subTest(word=word):
+                self.assertEqual(trie_pattern([word]), re.escape(word))
+
+    def test_no_words_matches_nothing(self):
+        pattern = trie_pattern([])
+        self.assertEqual(pattern, "(?!)")
+        compiled = re.compile(pattern)
+        for text in ("", "a", "clip 1"):
+            with self.subTest(text=text):
+                self.assertIsNone(compiled.search(text))
 
 
 if __name__ == "__main__":
