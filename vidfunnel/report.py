@@ -24,14 +24,16 @@ below, and rows inside a group keep that order, so the worst row of the whole
 report is still the first row printed. It cannot be read back with --from.
 
 Text and Markdown show each record ID as its first 8 characters (longer only
-when two rows of the report would share them), which 'vidfunnel find' accepts
-as a prefix. '--from' resolves such prefixes against the records it finds; a
+when two of the records collected, before any filter, would share them), which
+'vidfunnel find' accepts as a prefix. '--from' resolves such prefixes against the records it finds; a
 prefix that matches more than one record is an error naming both. JSON and CSV
 keep the full IDs.
 
 A redacted report records its paths as '<root>', which is what keeps the
 directory structure out of it. '--from' on such a report therefore needs the
 PATH arguments again, or the central index (rows are then found by record ID).
+A revealed Markdown report made from the index is re-run from the whole index
+when it is usable; its Folders section is read only when it is not.
 """
 
 VERSION = "20261108"
@@ -60,6 +62,12 @@ HINT_REDACTED = (
     "Names in this report are redacted. To see them, re-run the same command with --reveal, "
     "or vidfunnel report --from <this file> --reveal. To locate one row: vidfunnel find <ID>."
 )
+# Text and CSV reports cannot be read back with --from, so their hint does not offer it.
+HINT_REDACTED_NO_FROM = (
+    "Names in this report are redacted. To see them, re-run the same command with --reveal; "
+    "for a report that --from can read back, use --format md. To locate one row: vidfunnel find <ID>."
+)
+FORMATS_WITHOUT_FROM = ("text", "csv")
 HINT_REVEALED = (
     "Names in this report are shown (--reveal); do not share it as it is. "
     "To locate one row: vidfunnel find <ID>."
@@ -78,6 +86,8 @@ MD_COLUMNS = ("ID", "score", "band", "status", "action", "flags", "source", "siz
 # The table of reports written before 20261108; --from still reads it.
 OLD_MD_COLUMNS = ("ID", "score", "band", "status", "action", "flags", "source -> output", "path")
 SHORT_ID_LENGTH = 8
+# A row's real folder as a number (rows_from_records); not part of the JSON or CSV output.
+FOLDER_GROUP_KEY = "_folder_group"
 FOLDERS_HEADING = "## Folders"
 TEXT_TITLE = "vidfunnel report"
 
@@ -241,7 +251,14 @@ def rows_from_records(items, redactor=None, with_logs=False):
     the final redactor.text() pass over each string field knows every real name.
     """
     prepared = []
+    groups = []
+    group_numbers = {}
     for folder, record in items:
+        # Rows are grouped by the real folder, which redaction may make look like
+        # another one ('Christmas 1998' and 'Christmas 2001'); the row carries only
+        # a number for it, so no real path reaches a redacted report.
+        real_folder = str((record.get("source") or {}).get("folder") or "")
+        groups.append(group_numbers.setdefault(real_folder, len(group_numbers)))
         if redactor is not None:
             prepared.append(redactor.record(record))
         else:
@@ -253,7 +270,7 @@ def rows_from_records(items, redactor=None, with_logs=False):
         return value
 
     rows = []
-    for record in prepared:
+    for record, group in zip(prepared, groups):
         source = record.get("source") or {}
         output = record.get("output") or {}
         folder = source.get("folder") or ""
@@ -267,9 +284,12 @@ def rows_from_records(items, redactor=None, with_logs=False):
         ratio = None
         if isinstance(source_size, int) and isinstance(output_size, int) and source_size > 0:
             ratio = round(float(output_size) / source_size, 3)
-        # Until retire renames it, an interim-named output ('<stem>.vidfunnel.mp4') is the file on disk.
+        # The name the output has or will have: the interim name ('<stem>.vidfunnel.mp4') until
+        # retire renames it, and after a retire whose rename failed (renamed_output false).
         output_name = output.get("name")
-        if output.get("interim_name") and record.get("status") != "retired":
+        retire_stage = (record.get("stages") or {}).get("retire")
+        renamed = isinstance(retire_stage, dict) and retire_stage.get("renamed_output") is True
+        if output.get("interim_name") and not renamed:
             output_name = output.get("interim_name")
         elif not output_name:
             output_name = output.get("interim_name")
@@ -288,6 +308,7 @@ def rows_from_records(items, redactor=None, with_logs=False):
             "path": clean(path),
             "output_name": clean(output_name),
             "changed_since": None,
+            FOLDER_GROUP_KEY: group,
         }
         if with_logs:
             row["logs"] = [dict(entry, text=clean(entry["text"])) for entry in _logs(record)]
@@ -372,6 +393,10 @@ def invocation_from_args(args, redactor=None):
 def build_header(args, records_count, redactor=None, from_report=None, unreadable=0):
     """The report header: ID, time, tool version, invocation, redaction state, hint."""
     redacted = not getattr(args, "reveal", False)
+    form = getattr(args, "format", None) or DEFAULT_FORMAT
+    hint = HINT_REVEALED
+    if redacted:
+        hint = HINT_REDACTED_NO_FROM if form in FORMATS_WITHOUT_FROM else HINT_REDACTED
     if redacted and redactor is None:
         redactor = Redactor(roots=roots_for(getattr(args, "paths", None) or ()))
     invocation = invocation_from_args(args, redactor if redacted else None)
@@ -383,13 +408,13 @@ def build_header(args, records_count, redactor=None, from_report=None, unreadabl
         "report_version": VERSION,
         "invocation": invocation,
         "command": " ".join(shlex.quote(part) for part in invocation),
-        "format": getattr(args, "format", None) or DEFAULT_FORMAT,
+        "format": form,
         "redacted": redacted,
         "redact_dates": bool(getattr(args, "redact_dates", False)),
         "with_logs": bool(getattr(args, "with_logs", False)),
         "records": records_count,
         "unreadable_records": unreadable,
-        "hint": HINT_REDACTED if redacted else HINT_REVEALED,
+        "hint": hint,
     }
     if from_report is not None:
         header["from_report"] = from_report
@@ -413,16 +438,32 @@ def _fence(text):
     return "`" * max(3, longest + 1)
 
 
+def _common_prefix_length(first, second):
+    length = 0
+    for left, right in zip(first, second):
+        if left != right:
+            break
+        length += 1
+    return length
+
+
 def short_ids(rows):
-    """{full ID: shown ID}: the first 8 characters, more where two rows of the report share them."""
-    ids = [str(row.get("id") or "") for row in rows]
+    """{full ID: shown ID}: the first 8 characters, more where two of the IDs share them.
+
+    Each ID gets the shortest prefix (at least 8 characters, at most the whole ID)
+    that no other ID starts with. In sorted order the longest prefix an ID shares
+    with any other is the one it shares with a neighbour, so one sort and one pass
+    over neighbours suffice.
+    """
+    ids = sorted({str(row.get("id") or "") for row in rows})
     shown = {}
-    for record_id in ids:
-        length = SHORT_ID_LENGTH
-        while length < len(record_id) and any(
-                other != record_id and other[:length] == record_id[:length] for other in ids):
-            length += 1
-        shown[record_id] = record_id[:length]
+    for position, record_id in enumerate(ids):
+        shared = 0
+        if position > 0:
+            shared = _common_prefix_length(ids[position - 1], record_id)
+        if position + 1 < len(ids):
+            shared = max(shared, _common_prefix_length(ids[position + 1], record_id))
+        shown[record_id] = record_id[:min(len(record_id), max(SHORT_ID_LENGTH, shared + 1))]
     return shown
 
 
@@ -451,12 +492,23 @@ def _output_differs(source_name, output_name):
 
 
 def _group_by_folder(rows):
-    """[(folder, [rows])]: folders in the order of their first (worst) row, rows in report order."""
+    """[(folder, [rows])]: folders in the order of their first (worst) row, rows in report order.
+
+    Rows are grouped by their real folder (FOLDER_GROUP_KEY), so two real folders
+    whose redacted forms coincide stay two groups with the same printed folder.
+    Rows without the key are grouped by the folder of their path.
+    """
     groups = {}
     for row in rows:
         folder, _name = _split_path(row.get("path"))
-        groups.setdefault(folder, []).append(row)
-    return list(groups.items())
+        key = (row[FOLDER_GROUP_KEY],) if FOLDER_GROUP_KEY in row else folder
+        groups.setdefault(key, (folder, []))[1].append(row)
+    return list(groups.values())
+
+
+def _one_line(value):
+    """A text-report field on one line: carriage returns and newlines become spaces."""
+    return ("" if value is None else str(value)).replace("\r", " ").replace("\n", " ")
 
 
 def _header_lines(header):
@@ -474,37 +526,44 @@ def _header_lines(header):
     return lines
 
 
-def render_text(header, rows):
-    """Plain header lines, then one block per row grouped by folder, columns aligned over the report."""
-    lines = [TEXT_TITLE, "", header.get("hint", ""), ""]
-    lines.extend(_header_lines(header))
-    shown = short_ids(rows)
+def render_text(header, rows, shown=None):
+    """Plain header lines, then one block per row grouped by folder, columns aligned over the report.
+
+    shown: {full ID: shown ID} from short_ids(); computed over rows when not given.
+    Every field is kept on its line (carriage returns and newlines become spaces);
+    only log text keeps its own lines.
+    """
+    lines = [TEXT_TITLE, "", _one_line(header.get("hint", "")), ""]
+    lines.extend(_one_line(line) for line in _header_lines(header))
+    if shown is None:
+        shown = short_ids(rows)
     table = []
     for row in rows:
-        table.append((_score_text(row.get("score")), row.get("band") or "--", row.get("status") or "--",
-                      row.get("action") or "--", ", ".join(row.get("flags") or ()) or "--",
-                      shown.get(str(row.get("id") or ""), "")))
+        table.append(tuple(_one_line(cell) for cell in (
+            _score_text(row.get("score")), row.get("band") or "--", row.get("status") or "--",
+            row.get("action") or "--", ", ".join(row.get("flags") or ()) or "--",
+            shown.get(str(row.get("id") or ""), ""))))
     widths = [max([len(cells[column]) for cells in table] or [0]) for column in range(6)]
     cells_of = {id(row): cells for row, cells in zip(rows, table)}
     indent = " " * (2 + widths[0] + 2)
     if not rows:
         lines.extend(["", "No records."])
     for folder, members in _group_by_folder(rows):
-        lines.extend(["", folder or "./"])
+        lines.extend(["", _one_line(folder or "./")])
         for row in members:
             cells = cells_of[id(row)]
             first = "  " + cells[0].rjust(widths[0]) + "  " + "  ".join(
                 cells[column].ljust(widths[column]) for column in range(1, 5)) + "  " + cells[5]
             lines.append(first)
             _folder, name = _split_path(row.get("path"))
-            second = indent + name
+            second = indent + _one_line(name)
             if row.get("output_name"):
-                second += "  ->  " + row["output_name"]
+                second += "  ->  " + _one_line(row["output_name"])
             lines.append(second + "   (" + _sizes(row) + ")")
             if row.get("changed_since"):
-                lines.append(indent + "changed since: " + row["changed_since"])
+                lines.append(indent + "changed since: " + _one_line(row["changed_since"]))
             for entry in row.get("logs") or ():
-                lines.append(indent + "{} {}:".format(entry["stage"], entry["kind"]))
+                lines.append(indent + _one_line("{} {}:".format(entry["stage"], entry["kind"])))
                 for log_line in entry["text"].rstrip("\n").split("\n"):
                     lines.append(indent + "  " + log_line)
     if header.get("with_logs") and not any(row.get("logs") for row in rows):
@@ -512,8 +571,11 @@ def render_text(header, rows):
     return "\n".join(lines) + "\n"
 
 
-def render_markdown(header, rows):
-    """Hint line, header list, machine-readable header comment, table, then logs if any."""
+def render_markdown(header, rows, shown=None):
+    """Hint line, header list, machine-readable header comment, table, then logs if any.
+
+    shown: {full ID: shown ID} from short_ids(); computed over rows when not given.
+    """
     lines = ["# vidfunnel report", "", "> " + header.get("hint", ""), ""]
     for line in _header_lines(header):
         if line.startswith("invocation: "):
@@ -524,7 +586,8 @@ def render_markdown(header, rows):
     lines.extend(["", HEADER_COMMENT_START + machine + HEADER_COMMENT_END, ""])
     lines.append("| " + " | ".join(MD_COLUMNS) + " |")
     lines.append("|" + "|".join("---" for _column in MD_COLUMNS) + "|")
-    shown = short_ids(rows)
+    if shown is None:
+        shown = short_ids(rows)
     for row in rows:
         status = row.get("status") or "--"
         if row.get("changed_since"):
@@ -557,12 +620,13 @@ def render_markdown(header, rows):
     return "\n".join(lines) + "\n"
 
 
-def render_json(header, rows):
+def render_json(header, rows, shown=None):
+    rows = [{key: value for key, value in row.items() if key != FOLDER_GROUP_KEY} for row in rows]
     return json.dumps({"header": header, "rows": rows}, indent=2, sort_keys=True,
                       ensure_ascii=False) + "\n"
 
 
-def render_csv(header, rows):
+def render_csv(header, rows, shown=None):
     """RFC 4180: one column name row, then one row per record. Flags joined with ';'."""
     fields = list(ROW_FIELDS)
     if header.get("with_logs"):
@@ -675,8 +739,10 @@ def parse_report_header(text):
             rows[cells[0]] = {"status": None if status == "--" else status,
                               "score": _parse_score(cells[1])}
     if not isinstance(header, dict):
-        first = next((line.strip() for line in text.splitlines() if line.strip()), "")
-        if first == TEXT_TITLE:
+        # A text report saved with its stderr ('> file 2>&1') starts with progress lines,
+        # one per PATH and per unreadable record, so the title line is looked for on
+        # every line; no Markdown, JSON or CSV report has a line that is only the title.
+        if any(line.strip() == TEXT_TITLE for line in text.splitlines()):
             raise ReportUsageError("this is a text report, which is for reading and cannot be read "
                                    "back; give --from a Markdown or JSON report (--format md or json)")
         raise ReportError("no vidfunnel report header found (only Markdown and JSON reports "
@@ -760,13 +826,29 @@ def _stored_args(invocation):
             " ".join(shlex.quote(str(part)) for part in invocation)))
 
 
+def _index_usable(args):
+    """True when produce() may read the central index: no --no-index and the database file exists."""
+    if getattr(args, "no_index", False):
+        return False
+    location = getattr(args, "db", None)
+    if not location:
+        try:
+            from vidfunnel import index as index_module
+        except ImportError:
+            return False
+        location = index_module.default_db_path()
+    return os.path.isfile(str(location))
+
+
 def _merge(current, stored, folders=None):
     """The stored invocation with whatever the current command line adds or overrides.
 
     folders: the folders of a Markdown report's Folders section. When the stored
     report was revealed, its invocation names no PATH (it read the index) and the
-    current command line gives none, those folders become the PATHs and only the
-    stored rows are kept ('only_stored_rows').
+    current command line gives none, the index is read again when it is usable
+    (--no-index not given, the database file exists); otherwise those folders
+    become the PATHs and only the stored rows are kept ('only_stored_rows'). A
+    listed folder that no longer exists is skipped with a line on stderr.
     """
     merged = argparse.Namespace(**vars(stored))
     for attribute in ("format", "min_score", "max_score", "status", "db"):
@@ -789,8 +871,15 @@ def _merge(current, stored, folders=None):
     for folder in (folders or {}).values():
         if folder and not folder.startswith(ROOT_MARK) and folder not in real_folders:
             real_folders.append(folder)
-    if not merged.paths and not redacted_paths and stored.reveal and real_folders:
-        merged.paths = real_folders
+    if (not merged.paths and not redacted_paths and stored.reveal and real_folders
+            and not _index_usable(merged)):
+        merged.paths = []
+        for folder in real_folders:
+            if os.path.isdir(folder):
+                merged.paths.append(folder)
+            else:
+                _stderr("report: skipping folder '{}' of the earlier report: it no longer exists".format(
+                    folder))
         merged.only_stored_rows = True
     merged.from_report = None
     for attribute in ("quiet", "verbose"):
@@ -816,6 +905,9 @@ def produce(args, stored=None, from_report_id=None):
     for path in paths:
         _stderr("report: reading records under '{}'".format(path), args)
     items = collect(paths, use_index=use_index, db_path=getattr(args, "db", None), errors=errors)
+    # Shown IDs are made unique over everything collected, before any filter, which is
+    # also what --from matches them against (resolve_stored_rows).
+    shown = short_ids([{"id": record.get("id")} for _folder, record in items])
     stored_rows = {}
     if stored is not None:
         stored_rows, unmatched = resolve_stored_rows(stored["rows"], items)
@@ -841,7 +933,7 @@ def produce(args, stored=None, from_report_id=None):
     header = build_header(args, len(rows), redactor=redactor, from_report=from_report_id,
                           unreadable=len(errors))
     form = getattr(args, "format", None) or DEFAULT_FORMAT
-    text = RENDERERS[form](header, rows)
+    text = RENDERERS[form](header, rows, shown=shown)
     if redactor is not None:
         text = redactor.text(text)
     return text, header

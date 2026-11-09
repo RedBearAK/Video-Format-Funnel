@@ -8,8 +8,12 @@ import csv
 import io
 import json
 import os
+import random
+import shutil
 import tempfile
+import time
 import unittest
+import uuid
 from unittest import mock
 from pathlib import Path
 
@@ -18,6 +22,7 @@ from vidfunnel.report import (
     HEADER_COMMENT_END,
     HEADER_COMMENT_START,
     HINT_REDACTED,
+    HINT_REDACTED_NO_FROM,
     MD_COLUMNS,
     OLD_MD_COLUMNS,
     ReportError,
@@ -36,6 +41,7 @@ from vidfunnel.report import (
     short_ids,
     sort_rows,
 )
+from vidfunnel.index import index_tree, open_index, rebuild
 from vidfunnel.redact import Redactor
 
 
@@ -56,8 +62,21 @@ FIXED_HEADER = {
     "redacted": True,
     "redact_dates": False,
     "records": 4,
-    "hint": HINT_REDACTED,
+    "hint": HINT_REDACTED_NO_FROM,
 }
+
+
+def quadratic_short_ids(rows):
+    """The definition of short_ids at 1f0ac04, kept as the reference its result must equal."""
+    ids = [str(row.get("id") or "") for row in rows]
+    shown = {}
+    for record_id in ids:
+        length = 8
+        while length < len(record_id) and any(
+                other != record_id and other[:length] == record_id[:length] for other in ids):
+            length += 1
+        shown[record_id] = record_id[:length]
+    return shown
 
 
 class ReportTree(unittest.TestCase):
@@ -166,7 +185,7 @@ class ReportTree(unittest.TestCase):
         expected = "\n".join([
             "vidfunnel report",
             "",
-            HINT_REDACTED,
+            HINT_REDACTED_NO_FROM,
             "",
             "report ID: report-identity",
             "generated at: 2026-11-08T12:00:00Z",
@@ -206,6 +225,19 @@ class ReportTree(unittest.TestCase):
         self.assertEqual(sorted(positions), positions)
         self.assertLess(positions[1], summer, "meeting belongs to the office group")
 
+    def test_folders_follow_their_worst_row_not_the_alphabet(self):
+        attic = self.base / "aardvark_attic"
+        attic.mkdir()
+        self.make("attic", attic / "attic_boxes.avi", "verified", 99, "remux")
+        self.save_all()
+        # Worst rows: office 0, summer 70, attic 99; alphabetically attic comes first.
+        expected = ["<root>/o____e_w__k/", "<root>/s____r_h______s/", "<root>/a______k_a___c/"]
+        _code, text, _errors = self.run_report([str(self.base)])
+        self.assertEqual(expected, [line for line in text.splitlines() if line.startswith("<root>/")])
+        _code, text, _errors = self.run_report(["--format", "md", str(self.base)])
+        folders = text.split("\n## Folders\n\n", 1)[1].splitlines()
+        self.assertEqual(expected, [line[2:].rsplit(": ", 1)[0] for line in folders])
+
     def test_default_format_is_text_and_md_is_still_md(self):
         code, text, _errors = self.run_report([str(self.base)])
         self.assertEqual(0, code)
@@ -224,7 +256,51 @@ class ReportTree(unittest.TestCase):
         for word in self.records:
             self.assertIn(self.short(word), text)
             self.assertNotIn(self.records[word]["id"], text)
-        self.assertIn(HINT_REDACTED, text)
+        self.assertIn(HINT_REDACTED_NO_FROM, text)
+
+    def test_text_hint_does_not_offer_from_but_markdown_does(self):
+        _code, text, _errors = self.run_report([str(self.base)])
+        self.assertNotIn("--from <this file>", text, "--from refuses a text report")
+        self.assertIn("--format md", text.splitlines()[2])
+        _code, text, _errors = self.run_report(["--format", "md", str(self.base)])
+        self.assertIn("> " + HINT_REDACTED + "\n", text)
+        self.assertIn("--from <this file> --reveal", HINT_REDACTED)
+
+    def test_text_keeps_a_name_with_a_newline_on_its_line(self):
+        self.records["beach"]["source"]["name"] = "beach\nholiday\r.avi"
+        self.records["beach"]["output"]["name"] = "beach\nholiday.mp4"
+        self.save_all()
+        _code, text, _errors = self.run_report(["--reveal", str(self.base)])
+        self.assertIn("      beach holiday .avi  ->  beach holiday.mp4   (27 B -> 10 B)\n", text)
+        self.assertNotIn("\nholiday", text)
+        self.assertNotIn("\r", text)
+
+    def make_christmas_folders(self):
+        """Two real folders whose redacted forms are the same: 'C_______s ####'."""
+        early = self.base / "Christmas 1998"
+        late = self.base / "Christmas 2001"
+        early.mkdir()
+        late.mkdir()
+        self.make("sledding", early / "sledding_hill.avi", "verified", 80, "remux")
+        self.make("presents", late / "presents_opening.avi", "verified", 85, "remux")
+        self.save_all()
+
+    def test_two_real_folders_with_one_redacted_form_stay_two_groups(self):
+        self.make_christmas_folders()
+        _code, text, _errors = self.run_report([str(self.base)])
+        lines = text.splitlines()
+        heading = "<root>/C_______s ####/"
+        self.assertEqual(2, lines.count(heading), text)
+        first = lines.index(heading)
+        second = lines.index(heading, first + 1)
+        self.assertTrue(lines[first + 1].endswith(self.short("sledding")))
+        self.assertTrue(lines[second + 1].endswith(self.short("presents")))
+        _code, text, _errors = self.run_report(["--format", "md", str(self.base)])
+        folders = text.split("\n## Folders\n\n", 1)[1].splitlines()
+        self.assertIn("- {}: {}".format(heading, self.short("sledding")), folders)
+        self.assertIn("- {}: {}".format(heading, self.short("presents")), folders)
+        _code, text, _errors = self.run_report(["--format", "json", str(self.base)])
+        self.assertNotIn("_folder_group", text)
 
     def test_reveal_shows_names(self):
         code, text, _errors = self.run_report(["--reveal", str(self.base)])
@@ -285,9 +361,23 @@ class ReportTree(unittest.TestCase):
         self.assertIn("| m______n_h__e.mpg | 30 B -> 10 B |", text)
         self.assertNotIn("m______n_h__e.mp4", text)
         beach["status"] = "retired"
+        beach["stages"]["retire"] = {"renamed_output": True}
         self.save_all()
         _code, text, _errors = self.run_report(["--format", "md", str(self.base)])
         self.assertIn("| b___h_h_____y.avi | 27 B -> 10 B |", text, "after retire the final name is on disk")
+
+    def test_retired_record_whose_rename_failed_shows_the_interim_name(self):
+        beach = self.records["beach"]
+        beach["output"]["interim_name"] = "beach_holiday.vidfunnel.mp4"
+        beach["status"] = "retired"
+        beach["stages"]["retire"] = {"renamed_output": False, "rename_error":
+                                     "renaming 'beach_holiday.vidfunnel.mp4' to 'beach_holiday.mp4' failed"}
+        self.save_all()
+        _code, text, _errors = self.run_report(["--reveal", str(self.base)])
+        self.assertIn("beach_holiday.avi  ->  beach_holiday.vidfunnel.mp4   (27 B -> 10 B)", text)
+        _code, text, _errors = self.run_report(["--format", "json", "--reveal", str(self.base)])
+        row = next(row for row in json.loads(text)["rows"] if row["id"] == beach["id"])
+        self.assertEqual("beach_holiday.vidfunnel.mp4", row["output_name"])
 
     def test_markdown_revealed_folders_show_real_paths(self):
         _code, text, _errors = self.run_report(["--format", "md", "--reveal", str(self.base)])
@@ -301,6 +391,28 @@ class ReportTree(unittest.TestCase):
         self.assertEqual({"abcd1234-0000-4000-8000-000000000001": "abcd1234-0000-4000-8000-000000000001",
                           "abcd1234-0000-4000-8000-000000000002": "abcd1234-0000-4000-8000-000000000002",
                           "ffee9988-0000-4000-8000-000000000003": "ffee9988"}, short_ids(rows))
+
+    def test_short_ids_equal_the_old_definition_on_shared_prefixes(self):
+        rows = [{"id": value} for value in (
+            "abcd1234-0000-4000-8000-000000000001", "abcd1234-0000-4000-8000-000000000002",
+            "abcd1234-0000-4000-9000-000000000003", "abcd1235-0000-4000-8000-000000000004",
+            "abcdef", "abcdefgh", "abcdefghij", "abcdefghijk", "ffee9988-0000", "ffee9988-0000",
+            "", "0123456789abcdef", "0123456789abcdeg", "zzzzzzzz-1111")]
+        self.assertEqual(quadratic_short_ids(rows), short_ids(rows))
+
+    def test_short_ids_of_ten_thousand_uuids_take_under_three_seconds(self):
+        generator = random.Random(20261108)
+        rows = [{"id": str(uuid.UUID(int=generator.getrandbits(128), version=4))} for _count in range(10000)]
+        started = time.monotonic()
+        shown = short_ids(rows)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 3.0)
+        self.assertEqual(10000, len(set(shown.values())))
+        longer = [row for row in rows if shown[row["id"]] != row["id"][:8]]
+        everything = [row["id"] for row in rows]
+        for row in rows[:200] + longer[:50]:
+            prefix = shown[row["id"]]
+            self.assertEqual([row["id"]], [other for other in everything if other.startswith(prefix)])
 
     def test_markdown_round_trips_through_parse(self):
         _code, text, _errors = self.run_report(["--format", "md", "--min-score", "50", str(self.base)])
@@ -412,6 +524,64 @@ class ReportTree(unittest.TestCase):
         self.assertIsNone(changed[self.records["beach"]["id"]])
         self.assertEqual("earlier-report", data["header"]["from_report"])
 
+    def test_from_text_report_saved_with_its_stderr_is_usage_error(self):
+        _code, text, _errors = self.run_report([str(self.base)])
+        report_file = Path(self.scratch.name) / "terminal_with_stderr.txt"
+        report_file.write_text("vidfunnel report: no PATH given; reading the current directory '/x'\n"
+                               "report: reading records under '/x'\n" + text + "report: 4 rows, redacted\n",
+                               encoding="utf-8")
+        with self.assertRaises(ReportUsageError):
+            parse_report_header(report_file.read_text(encoding="utf-8"))
+        code, _output, errors = self.run_report(["--from", str(report_file), str(self.base)])
+        self.assertEqual(2, code)
+        self.assertIn("text report", errors)
+
+    def test_parse_stops_at_the_logs_section(self):
+        beach = self.records["beach"]
+        beach["stages"]["convert"]["stderr"] = ("## Folders\n\n- /elsewhere/: deadbeef\n\n"
+                                                "| " + " | ".join(MD_COLUMNS) + " |\n|---|---|---|---|---|---|---|---|\n"
+                                                "| deadbeef | 1 | hold | failed | -- | -- | x.avi | -- |\n")
+        self.save_all()
+        _code, text, _errors = self.run_report(["--format", "md", "--with-logs", str(self.base)])
+        self.assertIn("| deadbeef |", text)
+        stored = parse_report_header(text)
+        self.assertEqual({self.short(word) for word in self.records}, set(stored["rows"]))
+        self.assertNotIn("deadbeef", stored["folders"])
+        self.assertEqual(4, len(stored["folders"]))
+
+    def test_parse_rejects_a_table_with_unknown_columns(self):
+        _code, text, _errors = self.run_report(["--format", "md", str(self.base)])
+        changed = text.replace("| ID | score | band |", "| ID | rating | band |")
+        self.assertNotEqual(text, changed)
+        with self.assertRaises(ReportError) as caught:
+            parse_report_header(changed)
+        self.assertIn("unknown columns", str(caught.exception))
+
+    def test_from_says_which_earlier_row_is_not_found(self):
+        report_file, text = self.write_report(["--format", "md", str(self.base)], "shared_report.md")
+        report_file.write_text(text.replace("| {} |".format(self.short("beach")), "| deadbeef |"),
+                               encoding="utf-8")
+        args = parse(["--from", str(report_file), "--format", "json", str(self.base)])
+        args.quiet = False
+        output = io.StringIO()
+        errors = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            code = run(args)
+        self.assertEqual(0, code, errors.getvalue())
+        self.assertIn("report: record deadbeef from the earlier report was not found now", errors.getvalue())
+
+    def test_from_resolves_an_upper_case_prefix(self):
+        self.records["beach"]["id"] = "beadfeed-0000-4000-8000-000000000001"
+        self.save_all()
+        report_file, text = self.write_report(["--format", "md", str(self.base)], "shared_report.md")
+        upper = self.short("beach").upper()
+        report_file.write_text(text.replace("| {} |".format(self.short("beach")), "| {} |".format(upper)),
+                               encoding="utf-8")
+        code, again, errors = self.run_report(["--from", str(report_file), "--format", "json", str(self.base)])
+        self.assertEqual(0, code, errors)
+        changed = {row["id"]: row["changed_since"] for row in json.loads(again)["rows"]}
+        self.assertIsNone(changed[self.records["beach"]["id"]])
+
     def test_from_text_report_is_usage_error(self):
         report_file, _text = self.write_report([str(self.base)], "terminal_report.txt")
         code, output, errors = self.run_report(["--from", str(report_file), str(self.base)])
@@ -437,12 +607,99 @@ class ReportTree(unittest.TestCase):
         self.assertIn("'abcd1234-0000-4000-8000-000000000001'", errors)
         self.assertIn("'abcd1234-0000-4000-8000-000000000002'", errors)
 
+    def test_shown_id_is_unique_among_filtered_out_records_too(self):
+        self.records["beach"]["id"] = "abcd1234-0000-4000-8000-000000000001"
+        self.records["mountain"]["id"] = "abcd1234-0000-4000-9000-000000000002"
+        self.save_all()
+        report_file, text = self.write_report(["--format", "md", "--min-score", "80", str(self.base)],
+                                              "filtered_report.md")
+        self.assertIn("| abcd1234-0000-4000-8 | 95 |", text, "mountain is filtered out but shares 8 characters")
+        code, again, errors = self.run_report(["--from", str(report_file), "--format", "json", str(self.base)])
+        self.assertEqual(0, code, errors)
+        rows = json.loads(again)["rows"]
+        self.assertEqual([("abcd1234-0000-4000-8000-000000000001", None)],
+                         [(row["id"], row["changed_since"]) for row in rows])
+
     def test_from_revealed_report_reuses_stored_paths(self):
         report_file, _text = self.write_report(["--reveal", "--format", "json", str(self.base)],
                                                "local_report.json")
         code, again, _errors = self.run_report(["--from", str(report_file)])
         self.assertEqual(0, code)
         self.assertEqual(4, len(json.loads(again)["rows"]))
+
+    def index_report_file(self, argv, file_name):
+        """A revealed Markdown report as a run over the index writes it: no PATH in the invocation."""
+        _code, text, _errors = self.run_report(argv)
+        lines = text.splitlines()
+        for number, line in enumerate(lines):
+            if line.startswith(HEADER_COMMENT_START):
+                header = json.loads(line[len(HEADER_COMMENT_START):-len(HEADER_COMMENT_END)])
+                header["invocation"] = header["invocation"][:header["invocation"].index("--")]
+                lines[number] = HEADER_COMMENT_START + json.dumps(header) + HEADER_COMMENT_END
+        report_file = Path(self.scratch.name) / file_name
+        report_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return report_file
+
+    def test_from_index_report_reads_the_index_when_a_folder_is_gone(self):
+        db_path = Path(self.scratch.name) / "state" / "index.sqlite"
+        db_path.parent.mkdir()
+        connection = open_index(db_path)
+        index_tree(connection, self.base, progress_say=lambda message: None)
+        connection.close()
+        report_file = self.index_report_file(["--format", "md", "--reveal", str(self.base)], "index_report.md")
+        shutil.rmtree(str(self.work))
+        code, again, errors = self.run_report(["--from", str(report_file), "--db", str(db_path),
+                                               "--format", "json"])
+        self.assertEqual(0, code, errors)
+        self.assertEqual({record["id"] for record in self.records.values()},
+                         {row["id"] for row in json.loads(again)["rows"]})
+        self.assertNotIn("skipping folder", errors)
+
+    def index_into(self, db_path, root, fresh=False):
+        db_path.parent.mkdir(exist_ok=True)
+        connection = open_index(db_path)
+        if fresh:
+            rebuild(connection)
+        index_tree(connection, root, progress_say=lambda message: None)
+        connection.close()
+
+    def test_from_index_report_after_a_folder_moved_reads_the_whole_index(self):
+        db_path = Path(self.scratch.name) / "state" / "index.sqlite"
+        self.index_into(db_path, self.base)
+        report_file, _text = self.write_report(["--db", str(db_path), "--reveal", "--format", "md"],
+                                               "index_report.md")
+        self.assertNotIn(" -- ", " ".join(parse_report_header(report_file.read_text())["invocation"]))
+        self.holidays.rename(self.base / "moved_holidays")
+        self.index_into(db_path, self.base, fresh=True)
+        code, again, errors = self.run_report(["--from", str(report_file), "--format", "json"])
+        self.assertEqual(0, code, errors)
+        self.assertEqual({record["id"] for record in self.records.values()},
+                         {row["id"] for row in json.loads(again)["rows"]})
+
+    def test_from_index_report_after_the_tree_was_copied_reads_the_whole_index(self):
+        db_path = Path(self.scratch.name) / "state" / "index.sqlite"
+        self.index_into(db_path, self.base)
+        report_file, _text = self.write_report(["--db", str(db_path), "--reveal", "--format", "md"],
+                                               "index_report.md")
+        copy = Path(self.scratch.name) / "copied_archive"
+        shutil.copytree(str(self.base), str(copy))
+        self.index_into(db_path, copy, fresh=True)
+        code, again, errors = self.run_report(["--from", str(report_file), "--format", "json"])
+        self.assertEqual(0, code, errors)
+        self.assertEqual({record["id"] for record in self.records.values()},
+                         {row["id"] for row in json.loads(again)["rows"]})
+
+    def test_from_index_report_without_index_skips_a_folder_that_is_gone(self):
+        report_file = self.index_report_file(["--format", "md", "--reveal", str(self.base)], "index_report.md")
+        shutil.rmtree(str(self.work))
+        missing_db = Path(self.scratch.name) / "no_state" / "index.sqlite"
+        code, again, errors = self.run_report(["--from", str(report_file), "--db", str(missing_db),
+                                               "--format", "json"])
+        self.assertEqual(0, code, errors)
+        self.assertEqual({self.records[word]["id"] for word in ("beach", "mountain")},
+                         {row["id"] for row in json.loads(again)["rows"]})
+        self.assertEqual(1, errors.count("skipping folder"), errors)
+        self.assertIn("skipping folder '{}/' of the earlier report: it no longer exists".format(self.work), errors)
 
     def test_from_revealed_markdown_without_paths_reads_its_folders(self):
         _code, text, _errors = self.run_report(["--format", "md", "--reveal", "--min-score", "50",
@@ -506,7 +763,8 @@ class ReportTree(unittest.TestCase):
         header = build_header(args, 3)
         self.assertEqual(["vidfunnel", "report", "--format", "csv", "--status", "verified", "--", "<root>"],
                          header["invocation"])
-        self.assertEqual(HINT_REDACTED, header["hint"])
+        self.assertEqual(HINT_REDACTED_NO_FROM, header["hint"], "CSV cannot be read back either")
+        self.assertEqual(HINT_REDACTED, build_header(parse(["--format", "json", str(self.base)]), 3)["hint"])
         self.assertTrue(header["redacted"])
         self.assertEqual(3, header["records"])
         self.assertEqual(36, len(header["report_id"]))
