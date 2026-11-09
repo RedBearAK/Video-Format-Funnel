@@ -1,6 +1,6 @@
 """Tests for vidfunnel.retire: every guard, quarantine, interim rename, destroy confirmation, run."""
 
-VERSION = "20261102"
+VERSION = "20261109"
 
 import argparse
 import io
@@ -265,7 +265,7 @@ class GuardTests(RetireCase):
         self.assertEqual(result, {"output_path": self.meeting_interim,
                                   "final_output_path": self.meeting_source,
                                   "band": "ok", "sha256_verified": True,
-                                  "members": [self.meeting_source], "larger": False})
+                                  "members": [self.meeting_source], "larger": False, "sidecars": []})
 
     def test_large_output_hash_shows_progress(self):
         large = b"\0" * (33 * 1024 * 1024)
@@ -562,6 +562,81 @@ class VobGroupTests(RetireCase):
         self.assertEqual(listed, [str(self.first_member), str(self.second_member)])
         self.assertTrue(self.first_member.is_file())
         self.assertTrue(self.second_member.is_file())
+
+
+class MarkedOutputTests(RetireCase):
+    """plan --mark-outputs: the output and its sidecars carry interim names until retire renames them all."""
+
+    def setUp(self):
+        RetireCase.setUp(self)
+        self.party_source = self.holidays / "garden_party.avi"
+        self.party_interim = self.holidays / "garden_party.vidfunnel.mp4"
+        self.party_record = make_verified(self.party_source, self.party_interim, "garden_party.mp4",
+                                          interim_name="garden_party.vidfunnel.mp4")
+        self.party_record["output"]["sidecars"] = ["garden_party.srt", "garden_party.sup"]
+        self.party_record["output"]["interim_sidecars"] = ["garden_party.vidfunnel.srt", "garden_party.vidfunnel.sup"]
+        save_record(self.party_source, self.party_record)
+        write_bytes(self.holidays / "garden_party.vidfunnel.srt", b"1\n00:00:01,000 --> 00:00:02,000\nhello\n")
+        write_bytes(self.holidays / "garden_party.vidfunnel.sup", b"PG fake bitmap subtitles")
+
+    def test_output_and_sidecars_get_their_final_names(self):
+        stage = retire_one(self.party_source, self.party_record, self.root)
+        self.assertTrue(stage["renamed_output"])
+        self.assertEqual(stage["renamed_sidecars"], ["garden_party.srt", "garden_party.sup"])
+        self.assertNotIn("sidecar_rename_errors", stage)
+        self.assertEqual((self.holidays / "garden_party.mp4").read_bytes(), OUTPUT_BYTES)
+        self.assertIn(b"hello", (self.holidays / "garden_party.srt").read_bytes())
+        self.assertEqual((self.holidays / "garden_party.sup").read_bytes(), b"PG fake bitmap subtitles")
+        for name in ("garden_party.vidfunnel.mp4", "garden_party.vidfunnel.srt", "garden_party.vidfunnel.sup",
+                     "garden_party.avi"):
+            self.assertFalse((self.holidays / name).exists(), name)
+        saved = load_record(self.party_source)
+        self.assertEqual(saved["status"], "retired")
+        self.assertEqual(saved["output"]["name"], "garden_party.mp4")
+        self.assertEqual(saved["output"]["sidecars"], ["garden_party.srt", "garden_party.sup"])
+        self.assertEqual(saved["stages"]["retire"]["renamed_sidecars"], ["garden_party.srt", "garden_party.sup"])
+
+    def test_a_record_without_interim_sidecars_renames_none(self):
+        stage = retire_one(self.meeting_source, self.meeting_record, self.root)
+        self.assertTrue(stage["renamed_output"])
+        self.assertNotIn("renamed_sidecars", stage)
+
+    def test_a_foreign_file_at_a_final_sidecar_name_blocks_before_anything_moves(self):
+        write_bytes(self.holidays / "garden_party.srt", b"the user's own subtitles")
+        refusal = self.assert_refused("interim-rename-blocked", self.party_source, self.party_record)
+        self.assertIn("'garden_party.vidfunnel.srt'", refusal.detail)
+        self.assertIn("'garden_party.srt'", refusal.detail)
+
+    def test_a_sidecar_that_was_never_written_is_passed_over(self):
+        os.unlink(str(self.holidays / "garden_party.vidfunnel.sup"))
+        stage = retire_one(self.party_source, self.party_record, self.root)
+        self.assertEqual(stage["renamed_sidecars"], ["garden_party.srt"])
+        self.assertFalse((self.holidays / "garden_party.sup").exists())
+
+    def test_unusable_sidecar_lists_are_refused_as_no_record(self):
+        for interim in (["garden_party.vidfunnel.srt"], "garden_party.vidfunnel.srt",
+                        ["../garden_party.vidfunnel.srt", "garden_party.vidfunnel.sup"]):
+            with self.subTest(interim=interim):
+                record = dict(self.party_record, output=dict(self.party_record["output"], interim_sidecars=interim))
+                self.assert_refused("no-record", self.party_source, record)
+
+    def test_sidecars_keep_their_interim_names_when_the_output_rename_fails(self):
+        real_replace = os.replace
+
+        def failing_replace(source, destination):
+            if str(destination).endswith("garden_party.mp4"):
+                raise OSError("simulated rename failure")
+            return real_replace(source, destination)
+
+        with mock.patch("vidfunnel.retire.os.replace", side_effect=failing_replace):
+            with self.assertRaises(OSError):
+                retire_one(self.party_source, self.party_record, self.root)
+        self.assertTrue((self.holidays / "garden_party.vidfunnel.mp4").exists())
+        self.assertTrue((self.holidays / "garden_party.vidfunnel.srt").exists())
+        self.assertFalse((self.holidays / "garden_party.srt").exists())
+        stage = load_record(self.party_source)["stages"]["retire"]
+        self.assertFalse(stage["renamed_output"])
+        self.assertEqual(stage["renamed_sidecars"], [])
 
 
 class ConfirmDestroyTests(unittest.TestCase):

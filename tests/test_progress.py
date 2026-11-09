@@ -1,6 +1,6 @@
 """Tests for vidfunnel.progress: formatting, TTY and non-TTY rendering, ffmpeg adapter, summaries."""
 
-VERSION = "20261102"
+VERSION = "20261109"
 
 import io
 import unittest
@@ -14,7 +14,9 @@ from vidfunnel.progress import (
     format_duration,
     format_rate,
     is_tty,
+    item_tag,
     say,
+    tagged,
 )
 
 
@@ -286,6 +288,111 @@ class StageSummaryTests(unittest.TestCase):
     def test_format_empty(self):
         summary = StageSummary("retire", clock=FakeClock())
         self.assertEqual(summary.format(), "retire: no files in 00:00:00")
+
+
+class AsciiStream(io.StringIO):
+    """A StringIO whose write refuses characters outside ASCII, as a terminal in the C locale does."""
+
+    encoding = "ascii"
+
+    def write(self, text):
+        text.encode("ascii")
+        return io.StringIO.write(self, text)
+
+
+class ItemTagTests(unittest.TestCase):
+    """Every line of one item starts with its counter tag, so --jobs output says which item a line is from."""
+
+    def test_item_tag_text(self):
+        self.assertEqual(item_tag("convert", 3, 1054), "[convert 3/1054]")
+        self.assertEqual(item_tag("refit", 1, 1), "[refit 1/1]")
+        self.assertEqual(item_tag("verify"), "[verify]")
+        self.assertEqual(item_tag("plan", 2, 0), "[plan]")
+
+    def test_one_shot_lines_carry_the_tag(self):
+        captured = io.StringIO()
+        stream = tagged(captured, item_tag("convert", 3, 1054))
+        say("re-encode 'movie.avi' -> 'movie.mp4'", stream)
+        say("  converted 'movie.mp4'", stream)
+        self.assertEqual(captured.getvalue(),
+                         "[convert 3/1054] re-encode 'movie.avi' -> 'movie.mp4'\n"
+                         "[convert 3/1054]   converted 'movie.mp4'\n")
+
+    def test_plain_progress_lines_carry_the_tag(self):
+        clock = FakeClock()
+        captured = io.StringIO()
+        stream = tagged(captured, item_tag("convert", 3, 1054))
+        progress = Progress("re-encode", total=5828, unit="s", stream=stream, clock=clock)
+        clock.advance(30)
+        progress.update(4646)
+        progress.finish()
+        lines = captured.getvalue().splitlines()
+        self.assertEqual(lines, ["[convert 3/1054] [re-encode] 01:17:26 / 01:37:08  79.7 %"])
+
+    def test_terminal_redraws_keep_the_tag_after_each_carriage_return(self):
+        clock = FakeClock()
+        terminal = TerminalStream()
+        stream = tagged(terminal, item_tag("refit", 2, 7))
+        self.assertTrue(is_tty(stream))
+        progress = Progress("refit", total=5828, unit="s", stream=stream, clock=clock)
+        progress.update(4646)
+        clock.advance(0.5)
+        progress.update(4700)
+        progress.finish("done")
+        output = terminal.getvalue()
+        self.assertEqual(output.count("\r"), 2)
+        self.assertEqual(output.count("\r[refit 2/7] [refit] "), 2)
+        self.assertTrue(output.startswith("\r[refit 2/7] [refit] 01:17:26 / 01:37:08  79.7 %"))
+        self.assertTrue(output.endswith("\n[refit 2/7] done\n"), repr(output))
+
+    def test_verify_progress_line_carries_the_tag(self):
+        clock = FakeClock()
+        captured = io.StringIO()
+        progress = Progress("verify decode", total=600, unit="s", stream=tagged(captured, "[verify 4/9]"),
+                            clock=clock)
+        progress.update(300)
+        progress.finish()
+        self.assertEqual(captured.getvalue(), "[verify 4/9] [verify decode] 00:05:00 / 00:10:00  50.0 %\n")
+
+    def test_two_items_on_one_line_stream_stay_apart(self):
+        from vidfunnel.encode import _LineStream
+        shared = io.StringIO()
+        line_stream = _LineStream(shared)
+        first = tagged(line_stream, item_tag("convert", 1, 2))
+        second = tagged(line_stream, item_tag("convert", 2, 2))
+        clock = FakeClock()
+        one = Progress("re-encode", total=100, unit="s", stream=first, clock=clock)
+        other = Progress("remux", total=100, unit="s", stream=second, clock=clock)
+        for step in range(1, 4):
+            clock.advance(30)
+            one.update(10 * step)
+            other.update(20 * step)
+        one.finish()
+        other.finish()
+        lines = shared.getvalue().splitlines()
+        self.assertEqual(len(lines), 6)
+        for line in lines:
+            if "[re-encode]" in line:
+                self.assertTrue(line.startswith("[convert 1/2] [re-encode] "), line)
+            else:
+                self.assertTrue(line.startswith("[convert 2/2] [remux] "), line)
+
+    def test_a_text_retried_after_an_encoding_error_keeps_its_tag(self):
+        from vidfunnel.progress import _write
+        captured = AsciiStream()
+        stream = tagged(captured, "[plan 5/6]")
+        # A write that does not end its line, as a progress line's text before its newline.
+        _write(stream, "probing 'caf\u00e9.avi'")
+        _write(stream, "\n")
+        say("next", stream)
+        self.assertEqual(captured.getvalue(), "[plan 5/6] probing 'caf\\xe9.avi'\n[plan 5/6] next\n")
+
+    def test_empty_lines_and_split_writes(self):
+        captured = io.StringIO()
+        stream = tagged(captured, "[plan 1/1]")
+        stream.write("first ")
+        stream.write("half\n\nsecond\n")
+        self.assertEqual(captured.getvalue(), "[plan 1/1] first half\n\n[plan 1/1] second\n")
 
 
 if __name__ == "__main__":

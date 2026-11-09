@@ -123,7 +123,7 @@ bin/vidfunnel-podman --build
 bin/vidfunnel-podman plan /srv/media/Home\ Videos
 ```
 
-Every argument that is an existing folder on the host is bind-mounted read-write at the same path inside the container, and the current directory is mounted too and used as the working directory. A file argument mounts its folder, because the records, the output and the sidecars are written beside the source. Each folder is also mounted at its physical path (symlinks resolved) when that differs, and for an argument that is a symlink, every link on the way and the folder it ends in are mounted too, so a folder argument that is a symlink to another disk, or a symlink inside the current directory, still points somewhere inside the container. The wrapper never mounts `/` and stops instead. `--quarantine DIR` and `--db PATH` (also written `--quarantine=DIR` and `--db=PATH`) are created on the host first (the folder holding `PATH`, for `--db`) and mounted, and `report --from=REPORT` and `find --root=PATH` are mounted like separate arguments. After the subcommand that has the option, the abbreviations argparse accepts are handled like the full name: `--q` and longer for `--quarantine` after `retire`, `--d` for `--db` after `index`, `find` and `report`, `--fr` for `--from` after `report`, and `--r` for `--root` after `find`. `report --from REPORT` re-runs the invocation stored in the report, but only the folder holding the report file is mounted, not the paths the report names, so give those paths again as arguments (as for a redacted report). `--ffmpeg` is refused before the container starts, because the image's own ffmpeg is the only one that works inside it; `VIDFUNNEL_FFMPEG` from the host is not passed in either. The container runs with `--userns=keep-id` under podman (`--user uid:gid` under docker) so that records and outputs are owned by you, and with `--security-opt label=disable` for SELinux hosts. Your supplementary groups are kept inside the container where the engine allows it, so a share writable only through a group you belong to (a NAS mount owned `root:media` with mode 775) stays writable: podman on the crun runtime gets `--group-add keep-groups`, docker gets `--group-add` for each of your group ids. podman on runc cannot keep them (runc ignores `keep-groups`, and numeric ids map to subordinate gids under `keep-id`); the wrapper prints a warning there when you have such groups. The container gets a terminal only when both stdin and stdout are terminals; piped (`| less`, `| tee`, `> file`) it gets no terminal and no stdin, so the pipe's reader owns the terminal and nothing is left in raw mode afterwards (vidfunnel's one prompt, retire's `--destroy-originals-now`, refuses without a terminal unless `--yes`). `VIDFUNNEL_NICE` runs the command under `nice -n VALUE` and `VIDFUNNEL_IONICE_CLASS` under `ionice -c VALUE`, which is worth setting on a server that does other work. `--image` or `VIDFUNNEL_IMAGE` choose another image; setting `VIDFUNNEL_IMAGE_DIGEST` near the top of the script pins the image by digest so it changes only when that line is edited.
+Every argument that is an existing folder on the host is bind-mounted read-write at the same path inside the container, and the current directory is mounted too and used as the working directory. A file argument mounts its folder, because the records, the output and the sidecars are written beside the source. Each folder is also mounted at its physical path (symlinks resolved) when that differs, and for an argument that is a symlink, every link on the way and the folder it ends in are mounted too, so a folder argument that is a symlink to another disk, or a symlink inside the current directory, still points somewhere inside the container. The wrapper never mounts `/` and stops instead. `--quarantine DIR` and `--db PATH` (also written `--quarantine=DIR` and `--db=PATH`) are created on the host first (the folder holding `PATH`, for `--db`) and mounted, and `report --from=REPORT` and `find --root=PATH` are mounted like separate arguments. After the subcommand that has the option, the abbreviations argparse accepts are handled like the full name: `--q` and longer for `--quarantine` after `retire`, `--d` for `--db` after `index`, `find` and `report`, `--fr` for `--from` after `report`, and `--r` for `--root` after `find`. `report --from REPORT` re-runs the invocation stored in the report, but only the folder holding the report file is mounted, not the paths the report names, so give those paths again as arguments (as for a redacted report). `--ffmpeg` is refused before the container starts, because the image's own ffmpeg is the only one that works inside it; `VIDFUNNEL_FFMPEG` from the host is not passed in either. The container runs with `--userns=keep-id` under podman (`--user uid:gid` under docker) so that records and outputs are owned by you, and with `--security-opt label=disable` for SELinux hosts. Your supplementary groups are kept inside the container where the engine allows it, so a share writable only through a group you belong to (a NAS mount owned `root:media` with mode 775) stays writable: podman on the crun runtime gets `--group-add keep-groups`, docker gets `--group-add` for each of your group ids. podman on runc cannot keep them (runc ignores `keep-groups`, and numeric ids map to subordinate gids under `keep-id`); on runc the wrapper prints a warning naming each mounted folder that you can write only through one of those groups (owned by someone else, writable by its group but not by everyone, its group one of your supplementary groups and not your primary group), and stays quiet when no mounted folder depends on one, as on a CIFS mount that presents every file as your own. The container gets a terminal only when both stdin and stdout are terminals; piped (`| less`, `| tee`, `> file`) it gets no terminal and no stdin, so the pipe's reader owns the terminal and nothing is left in raw mode afterwards (vidfunnel's one prompt, retire's `--destroy-originals-now`, refuses without a terminal unless `--yes`). `VIDFUNNEL_NICE` runs the command under `nice -n VALUE` and `VIDFUNNEL_IONICE_CLASS` under `ionice -c VALUE`, which is worth setting on a server that does other work. `--image` or `VIDFUNNEL_IMAGE` choose another image; setting `VIDFUNNEL_IMAGE_DIGEST` near the top of the script pins the image by digest so it changes only when that line is edited.
 
 The container gets your `HOME` (`-e HOME=$HOME`): with `--userns=keep-id` podman adds a passwd entry for your uid, but its home is not usable (`/` on one host, root-owned and read-only; the working directory on another), so without this every `~` would resolve to the wrong place. The wrapper creates `~/.local/state/vidfunnel` (where the index database lives by default) and `~/.cache/vidfunnel` (the ffmpeg capability cache) on the host and mounts both at the same path (and at their physical path when `~/.cache` or `~/.local/state` is a symlink), so they persist from one run to the next and are owned by you. Inside the container `HOME`'s own directory is root-owned and not writable; only those two folders are, and vidfunnel writes nothing else under `HOME`. If `HOME` is unset or empty, the wrapper stops instead of guessing.
 
@@ -170,13 +170,13 @@ vidfunnel plan "Home Videos"
 
 ```
 [plan 6/6] probing 'movie.mkv'
-decode check of 'movie.mkv'
-[decode] 00:00:05 / 00:00:05  100.0 %  0 fps  136.0x  eta 00:00:00
-idet, blockdetect over 1 window(s) of 'movie.mkv'
-[window pass] 1/1  100.0 %
-reading packet timing of 2 stream(s) of 'movie.mkv'
-measuring keyframe spacing of 'movie.mkv'
-[keyframes] elapsed 00:00:00  1 keyframes in 125 packets
+[plan 6/6] decode check of 'movie.mkv'
+[plan 6/6] [decode] 00:00:05 / 00:00:05  100.0 %  0 fps  136.0x  eta 00:00:00
+[plan 6/6] idet, blockdetect over 1 window(s) of 'movie.mkv'
+[plan 6/6] [window pass] 1/1  100.0 %
+[plan 6/6] reading packet timing of 2 stream(s) of 'movie.mkv'
+[plan 6/6] measuring keyframe spacing of 'movie.mkv'
+[plan 6/6] [keyframes] elapsed 00:00:00  1 keyframes in 125 packets
   action                             score       size  source  flags
   remux                                100    100 KiB  Beach day.mkv  -
   reencode                             100    217 KiB  Birthday party 2004-06-12.avi  -
@@ -200,6 +200,7 @@ The main options:
 - `--max-level 4.1` deinterlaces HD at frame rate to stay at level 4.1 (the default allows 4.2 for field-rate HD).
 - `--plain-mp4` plans a conventional `+faststart` MP4 instead of a fragmented one.
 - `--par2 N` records that `convert` should write PAR2 with N % redundancy.
+- `--mark-outputs` names every output `<stem>.vidfunnel.mp4` and its subtitle sidecars `<stem>.vidfunnel.srt` (`.sup`, `.subs.mkv`) until `retire` has moved the original away and renamed them to `<stem>.mp4` and `<stem>.srt`. While the originals are still there, a converted file is then recognisable at a glance in a file manager or in Jellyfin; after `retire` the names are clean. Without it, only an MP4 source, whose output would otherwise take its own name, goes through the interim name. The choice is stored in the record, so `convert`, `verify`, `report` and `convert --refit` find the output under whichever name it has; `--replan` with or without the flag changes it for files not yet converted. A file already at the final name that is not ours stops the plan with `output-collision`, as without the flag, since `retire` would have to rename over it. DVD titles keep their final names, since `retire` does not retire a DVD folder.
 
 ### convert
 
@@ -207,7 +208,7 @@ The main options:
 vidfunnel convert "Home Videos"
 ```
 
-`convert` runs the planned command for every record with status `planned`. ffmpeg writes to a hidden `.NAME.mp4.part` file in the same folder, which is renamed into place on success; the output gets the source's modification time, subtitle sidecars are written the same way, PAR2 is written when asked, and `verify` runs on the result straight away. A failed run leaves the record at `failed` with ffmpeg's error output, and removes the part file. A record that is already converted and whose output still matches is skipped.
+`convert` runs the planned command for every record with status `planned`, under the output name the plan chose (the interim `<stem>.vidfunnel.mp4` for an MP4 source and for every source planned with `--mark-outputs`). ffmpeg writes to a hidden `.NAME.mp4.part` file in the same folder, which is renamed into place on success; the output gets the source's modification time, subtitle sidecars are written the same way, PAR2 is written when asked, and `verify` runs on the result straight away. A failed run leaves the record at `failed` with ffmpeg's error output, and removes the part file. A record that is already converted and whose output still matches is skipped.
 
 Before it runs a planned command, `convert` asks the ffmpeg named in that command for its version and build configuration and compares them with what `plan` recorded. A plan made in the container names the image's `/usr/bin/ffmpeg`; a host can have a `/usr/bin/ffmpeg` of its own, of another version and perhaps without `libx264` or `dvdvideo`. When they differ, the record is skipped and left as it is, and the reason names both versions and the path and says to plan again with `--replan` on this machine. `--refit` and `--dry-run` make the same check. Records planned before this field existed do not have it and are converted as before. The question is asked once per ffmpeg build in a run, not once per record.
 
@@ -217,26 +218,28 @@ Ctrl+C stops a run without leaving false records: the files in progress keep the
 
 ```
 [convert 2/4] re-encode 'Birthday party 2004-06-12.avi' -> 'Birthday party 2004-06-12.mp4'
-[re-encode] 00:00:04 / 00:00:05  98.4 %  0 fps  10.2x  eta 00:00:00
-  converted 'Birthday party 2004-06-12.mp4' (149212 bytes, 67 % of the source) in 0.7 s
-verifying 'Birthday party 2004-06-12.mp4' (146 KiB)
-[verify decode] 00:00:05 / 00:00:05  99.2 %  0 fps  147.0x  eta 00:00:00
-  verified 'Birthday party 2004-06-12.mp4': score 100 (ok); frames 125 of 125 expected, duration delta 0.04 s
+[convert 2/4] [re-encode] 00:00:04 / 00:00:05  98.4 %  0 fps  10.2x  eta 00:00:00
+[convert 2/4]   converted 'Birthday party 2004-06-12.mp4' (149212 bytes, 67 % of the source) in 0.7 s
+[convert 2/4] verifying 'Birthday party 2004-06-12.mp4' (146 KiB)
+[convert 2/4] [verify decode] 00:00:05 / 00:00:05  99.2 %  0 fps  147.0x  eta 00:00:00
+[convert 2/4]   verified 'Birthday party 2004-06-12.mp4': score 100 (ok); frames 125 of 125 expected, duration delta 0.04 s
 [convert 3/4] remux 'Phone clip 3.mp4' -> 'Phone clip 3.vidfunnel.mp4'
-[remux] 00:00:04 / 00:00:05  98.4 %  0 fps  573.0x  eta 00:00:00
-  converted 'Phone clip 3.vidfunnel.mp4' (103872 bytes, 100 % of the source) in 0.2 s
-verifying 'Phone clip 3.vidfunnel.mp4' (101 KiB)
-[verify decode] 00:00:05 / 00:00:05  100.0 %  0 fps  156.0x  eta 00:00:00
-  verified 'Phone clip 3.vidfunnel.mp4': score 100 (ok); frames 125 of 125 expected, duration delta 0.0 s
+[convert 3/4] [remux] 00:00:04 / 00:00:05  98.4 %  0 fps  573.0x  eta 00:00:00
+[convert 3/4]   converted 'Phone clip 3.vidfunnel.mp4' (103872 bytes, 100 % of the source) in 0.2 s
+[convert 3/4] verifying 'Phone clip 3.vidfunnel.mp4' (101 KiB)
+[convert 3/4] [verify decode] 00:00:05 / 00:00:05  100.0 %  0 fps  156.0x  eta 00:00:00
+[convert 3/4]   verified 'Phone clip 3.vidfunnel.mp4': score 100 (ok); frames 125 of 125 expected, duration delta 0.0 s
 [convert 4/4] remux 'Wedding DVD rip.mkv' -> 'Wedding DVD rip.mp4'
-[remux] 00:00:04 / 00:00:05  98.8 %  0 fps  1300.0x  eta 00:00:00
-  remuxed output is larger than the source (114714 > 112684 bytes); container overhead, kept
-  converted 'Wedding DVD rip.mp4' (114714 bytes, 102 % of the source) in 0.2 s
-verifying 'Wedding DVD rip.mp4' (112 KiB)
-[verify decode] 00:00:05 / 00:00:05  99.8 %  0 fps  60.0x  eta 00:00:00
-  verified 'Wedding DVD rip.mp4': score 85 (review); frames 150 of 150 expected, duration delta 0.0 s
+[convert 4/4] [remux] 00:00:04 / 00:00:05  98.8 %  0 fps  1300.0x  eta 00:00:00
+[convert 4/4]   remuxed output is larger than the source (114714 > 112684 bytes); container overhead, kept
+[convert 4/4]   converted 'Wedding DVD rip.mp4' (114714 bytes, 102 % of the source) in 0.2 s
+[convert 4/4] verifying 'Wedding DVD rip.mp4' (112 KiB)
+[convert 4/4] [verify decode] 00:00:05 / 00:00:05  99.8 %  0 fps  60.0x  eta 00:00:00
+[convert 4/4]   verified 'Wedding DVD rip.mp4': score 85 (review); frames 150 of 150 expected, duration delta 0.0 s
 convert: 0 converted, 4 verified, 0 skipped, 0 failed in 00:00:04; records in '.vidfunnel/' under each folder
 ```
+
+Every line about one file starts with that file's counter, `[convert 3/4]`, the live progress lines too, so the lines of `--jobs 2`, where two files are converted at once and their lines alternate, still say which file each belongs to. On a terminal a run without `--jobs` updates its progress line in place; with `--jobs` above 1 the progress lines are written as new lines every 30 seconds instead, since two lines cannot both be updated in place. `plan` (`[plan 6/6]`), `convert --refit` (`[refit 1/1]`) and `verify` (`[verify 2/5]`) tag their lines the same way.
 
 The re-encode came out at two thirds of the source's size. The MP4 source was written under the interim name because the output name is its own, and the letterboxed file keeps its 15-point aspect penalty from `plan`, which puts it in the `review` band.
 
@@ -256,12 +259,12 @@ vidfunnel convert --refit "Home Videos"
 
 ```
 [refit 1/1] 'Web clip 2006.avi': CRF 18 -> 19, hqdn3d, ratio 1.08
-  size class 'heavy' and blockiness 173.8731 at or above 3.5: hqdn3d=2:1:2:3
-[refit] 00:00:05 / 00:00:05  97.7 %  0 fps  13.8x  eta 00:00:00
-  refit 'Web clip 2006.avi': CRF 18 -> 19, hqdn3d, ratio 1.08 -> 1.05; replaced 'Web clip 2006.mp4' (123535 bytes, was 126343); still larger than the source, 'output-larger' kept
-verifying 'Web clip 2006.mp4' (121 KiB)
-[verify decode] 00:00:05 / 00:00:05  97.8 %  0 fps  162.0x  eta 00:00:00
-  verified 'Web clip 2006.mp4': score 100 (ok); frames 124 of 125 expected, duration delta 0.12 s
+[refit 1/1]   size class 'heavy' and blockiness 173.8731 at or above 3.5: hqdn3d=2:1:2:3
+[refit 1/1] [refit] 00:00:05 / 00:00:05  97.7 %  0 fps  13.8x  eta 00:00:00
+[refit 1/1]   refit 'Web clip 2006.avi': CRF 18 -> 19, hqdn3d, ratio 1.08 -> 1.05; replaced 'Web clip 2006.mp4' (123535 bytes, was 126343); still larger than the source, 'output-larger' kept
+[refit 1/1] verifying 'Web clip 2006.mp4' (121 KiB)
+[refit 1/1] [verify decode] 00:00:05 / 00:00:05  97.8 %  0 fps  162.0x  eta 00:00:00
+[refit 1/1]   verified 'Web clip 2006.mp4': score 100 (ok); frames 124 of 125 expected, duration delta 0.12 s
 skipped: 1 not larger
 convert --refit: 1 refitted, 0 kept, 1 skipped, 0 failed in 00:00:01; records in '.vidfunnel/' under each folder
 ```
@@ -386,10 +389,10 @@ vidfunnel retire "Home Videos"
 4. the score is not in the `hold` band, and not in the `review` band unless `--allow-review` is given;
 5. a re-encode's output is not larger than the source and the record is not flagged `output-larger`, unless `--allow-larger` is given (the record is then flagged `allowed-larger`, so the report shows the choice);
 6. the output's full SHA-256 matches the record (the one expensive check, so it runs last);
-7. an output under the interim `<stem>.vidfunnel.mp4` name can be renamed to its final name;
+7. an output under the interim `<stem>.vidfunnel.mp4` name, and its interim-named subtitle sidecars (`--mark-outputs`), can be renamed to their final names;
 8. the quarantine destination does not exist yet.
 
-Only then is the original moved into the quarantine directory, by default `.vidfunnel-retired/` under each PATH given, keeping its relative path; `--quarantine DIR` chooses another. An interim-named output is then renamed to its final name. The record stays as the audit trail with status `retired`. Outputs are never removed. In the example folder, retire moved the three originals that scored 100 into `.vidfunnel-retired/` (renaming `Phone clip 3.vidfunnel.mp4` to `Phone clip 3.mp4` on the way), skipped the two quarantined sources, and refused the letterboxed one:
+Only then is the original moved into the quarantine directory, by default `.vidfunnel-retired/` under each PATH given, keeping its relative path; `--quarantine DIR` chooses another. An interim-named output is then renamed to its final name, and its interim-named sidecars with it. The record stays as the audit trail with status `retired`. Outputs are never removed. In the example folder, retire moved the three originals that scored 100 into `.vidfunnel-retired/` (renaming `Phone clip 3.vidfunnel.mp4` to `Phone clip 3.mp4` on the way), skipped the two quarantined sources, and refused the letterboxed one:
 
 ```
 [retire 4/4] 'Clips/Wedding DVD rip.mkv' -> quarantine
@@ -486,7 +489,7 @@ Each folder that `plan` processes gets a hidden `.vidfunnel/` directory with one
 
 Keeping the records in one hidden directory per folder, rather than a sidecar per video, keeps folders readable in file managers and media servers, and the state stays with the data when the tool is run from different machines over the same share.
 
-Every MP4 the tool writes carries a `vidfunnel` metadata tag naming its record ID, the tool version, the first 16 hex digits of the source's SHA-256 and the output profile. The tag travels with the file through copies and renames, and `verify` checks it. An MP4 that already sits at the output name without this tag, or with a tag for another source, is not ours: `plan` quarantines the source as `output-collision` and writes nothing. The same happens when two sources in one folder share a stem (`movie.avi` and `movie.mkv`), since picking one of two versions of the same content is a human's job. When the source is itself an MP4, the output is written as `<stem>.vidfunnel.mp4` next to it, and `retire` renames it to `<stem>.mp4` once the original has been moved away.
+Every MP4 the tool writes carries a `vidfunnel` metadata tag naming its record ID, the tool version, the first 16 hex digits of the source's SHA-256 and the output profile. The tag travels with the file through copies and renames, and `verify` checks it. An MP4 that already sits at the output name without this tag, or with a tag for another source, is not ours: `plan` quarantines the source as `output-collision` and writes nothing. The same happens when two sources in one folder share a stem (`movie.avi` and `movie.mkv`), since picking one of two versions of the same content is a human's job. When the source is itself an MP4, the output is written as `<stem>.vidfunnel.mp4` next to it, and `retire` renames it to `<stem>.mp4` once the original has been moved away; `plan --mark-outputs` does the same for every source, sidecars included. The record holds both names.
 
 ## Redaction
 

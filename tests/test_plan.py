@@ -7,7 +7,7 @@ fixture folder itself is never planned) and skip with a message when
 ffmpeg or the fixtures are missing.
 """
 
-VERSION = "20261107"
+VERSION = "20261109"
 
 import contextlib
 import copy
@@ -429,6 +429,14 @@ class JobsOptionTest(unittest.TestCase):
         self.assertEqual(options.jobs, 3)
         self.assertNotIn("jobs", _options_dict(options))
         self.assertEqual(cli.build_parser().parse_args(["plan"]).jobs, 1)
+
+    def test_parser_accepts_mark_outputs_and_records_it(self):
+        from vidfunnel import cli
+        from vidfunnel.plan import _options_dict, options_from_args
+        options = options_from_args(cli.build_parser().parse_args(["plan", "--mark-outputs", "somewhere"]))
+        self.assertTrue(options.mark_outputs)
+        self.assertTrue(_options_dict(options)["mark_outputs"])
+        self.assertFalse(options_from_args(cli.build_parser().parse_args(["plan", "somewhere"])).mark_outputs)
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 cli.build_parser().parse_args(["plan", "--jobs", "0"])
@@ -486,6 +494,43 @@ class NamesTest(unittest.TestCase):
         clip = touch(self.root / "clip.avi")
         touch(self.root / "clip.mp4", b"not ours")
         self.assertEqual(output_names(clip, [clip])["collision"], "foreign-output")
+
+    def test_marked_source_gets_the_interim_name_whatever_its_extension(self):
+        clip = touch(self.root / "clip.avi")
+        self.assertEqual(output_names(clip, [clip], mark=True),
+                         {"name": "clip.mp4", "interim_name": "clip.vidfunnel.mp4", "collision": None})
+        movie = touch(self.root / "movie.mp4")
+        self.assertEqual(output_names(movie, [movie], mark=True),
+                         {"name": "movie.mp4", "interim_name": "movie.vidfunnel.mp4", "collision": None})
+        first = touch(self.root / "VTS_01_1.VOB")
+        self.assertEqual(output_names(first, [first], mark=True)["interim_name"], "VTS_01.vidfunnel.mp4")
+
+    def test_marked_source_meets_a_foreign_file_at_either_name(self):
+        clip = touch(self.root / "clip.avi")
+        touch(self.root / "clip.mp4", b"not ours")
+        names = output_names(clip, [clip], mark=True)
+        self.assertEqual((names["collision"], names["collision_name"]), ("foreign-output", "clip.mp4"))
+        other = touch(self.root / "other.avi")
+        touch(self.root / "other.vidfunnel.mp4", b"not ours either")
+        names = output_names(other, [other], mark=True)
+        self.assertEqual(names["collision"], "foreign-output")
+        self.assertNotIn("collision_name", names)
+
+    def test_interim_sidecars_follow_the_interim_output(self):
+        from vidfunnel.plan import interim_sidecars
+        sidecars = build_sidecar_argvs(FAKE_TOOLS, ["/films/Party.avi"], "/films/Party.mp4",
+                                       {"subtitles": {"result": [{"action": "mov_text", "sidecar": ".srt"},
+                                                                 {"action": "mov_text", "sidecar": ".srt"},
+                                                                 {"sidecar": ".sup"}]}})
+        renamed = interim_sidecars(sidecars, "/films/Party.mp4", "/films/Party.vidfunnel.mp4")
+        self.assertEqual([entry["path"] for entry in renamed],
+                         ["/films/Party.vidfunnel.0.srt", "/films/Party.vidfunnel.1.srt", "/films/Party.vidfunnel.sup"])
+        for entry, original in zip(renamed, sidecars):
+            self.assertEqual(entry["argv"][-1], entry["path"])
+            self.assertEqual(entry["argv"][:-1], original["argv"][:-1])
+            self.assertEqual(entry["kind"], original["kind"])
+        with self.assertRaises(PlanError):
+            interim_sidecars(sidecars, "/films/Other.mp4", "/films/Other.vidfunnel.mp4")
 
     def test_vob_group_named_after_title_set(self):
         first = touch(self.root / "VTS_01_1.VOB")
@@ -564,6 +609,87 @@ class PlanRunTest(unittest.TestCase):
 
     def plan(self, **values):
         return plan_paths(TOOLS, [str(self.root)], make_options(**values), progress=quiet())
+
+    def test_every_line_of_an_item_carries_its_counter_tag(self):
+        self.copy_fixture("xvid_avi_mp3.avi")
+        self.copy_fixture("h264_high_mkv_aac.mkv")
+        for jobs in (1, 2):
+            progress = types.SimpleNamespace(stream=io.StringIO(), quiet=False)
+            plan_paths(TOOLS, [str(self.root)], make_options(jobs=jobs, replan=True), progress=progress)
+            text = progress.stream.getvalue()
+            tags = set()
+            for line in text.splitlines():
+                if line.startswith("[plan "):
+                    tags.add(line.split("]", 1)[0] + "]")
+                else:
+                    # The scan line, the summary table and the stage summary belong to no item.
+                    self.assertTrue(line.startswith(("scanning ", "  ", "plan: ")), text)
+            self.assertEqual(tags, {"[plan 1/2]", "[plan 2/2]"}, text)
+            self.assertIn("[plan 1/2] probing '", text)
+            self.assertRegex(text, r"\[plan [12]/2\] \[window pass\] ")
+
+    def test_mark_outputs_is_recorded_and_replan_rewrites_it(self):
+        source = self.copy_fixture("h264_mkv_srt_subtitles.mkv", "Movie night.mkv")
+        self.plan(mark_outputs=True)
+        record = load_record(source)
+        self.assertEqual(record["status"], "planned")
+        self.assertIs(record["stages"]["plan"]["mark_outputs"], True)
+        self.assertEqual(record["output"]["name"], "Movie night.mp4")
+        self.assertEqual(record["output"]["interim_name"], "Movie night.vidfunnel.mp4")
+        self.assertEqual(record["output"]["sidecars"], ["Movie night.srt"])
+        self.assertEqual(record["output"]["interim_sidecars"], ["Movie night.vidfunnel.srt"])
+        self.assertEqual(record["stages"]["plan"]["argv"][-1], str(self.root / "Movie night.vidfunnel.mp4"))
+        self.assertEqual([entry["path"] for entry in record["stages"]["plan"]["sidecars"]],
+                         [str(self.root / "Movie night.vidfunnel.srt")])
+        self.assertEqual(record["stages"]["plan"]["sidecars"][0]["argv"][-1],
+                         str(self.root / "Movie night.vidfunnel.srt"))
+
+        self.plan(replan=True)
+        record = load_record(source)
+        self.assertIs(record["stages"]["plan"]["mark_outputs"], False)
+        self.assertIsNone(record["output"]["interim_name"])
+        self.assertNotIn("interim_sidecars", record["output"])
+        self.assertEqual(record["stages"]["plan"]["argv"][-1], str(self.root / "Movie night.mp4"))
+
+        self.plan(replan=True, mark_outputs=True)
+        record = load_record(source)
+        self.assertIs(record["stages"]["plan"]["mark_outputs"], True)
+        self.assertEqual(record["output"]["interim_name"], "Movie night.vidfunnel.mp4")
+
+    def test_marked_replan_after_convert_does_not_collide_with_its_own_interim_srt(self):
+        from vidfunnel.encode import convert_paths
+        source = self.copy_fixture("h264_mkv_srt_subtitles.mkv", "Movie night.mkv")
+        self.plan(mark_outputs=True)
+        options = types.SimpleNamespace(par2=None, verbose=False, jobs=1, dry_run=False)
+        progress = types.SimpleNamespace(stream=io.StringIO(), quiet=True, verbose=False)
+        convert_paths(TOOLS, [str(self.root)], options, progress)
+        self.assertTrue((self.root / "Movie night.vidfunnel.srt").exists())
+        summary = self.plan(replan=True, mark_outputs=True)
+        self.assertEqual(summary.counts["quarantine"], 0, summary.counts)
+        record = load_record(source)
+        self.assertEqual(record["status"], "planned")
+        self.assertEqual(record["output"]["interim_sidecars"], ["Movie night.vidfunnel.srt"])
+        self.assertNotIn("sidecar-exists", record["flags"])
+
+    def test_marked_plan_leaves_the_users_own_srt_alone(self):
+        source = self.copy_fixture("h264_mkv_srt_subtitles.mkv", "Movie night.mkv")
+        (self.root / "Movie night.srt").write_text("1\n00:00:01,000 --> 00:00:02,000\nthe user's own\n")
+        self.plan(mark_outputs=True)
+        record = load_record(source)
+        self.assertEqual(record["status"], "planned")
+        self.assertIn("sidecar-exists", record["flags"])
+        self.assertEqual(record["output"]["sidecars"], [])
+        self.assertEqual(record["output"]["interim_sidecars"], [])
+        self.assertEqual(record["stages"]["plan"]["sidecars"], [])
+
+    def test_marked_plan_quarantines_a_foreign_file_at_the_final_name(self):
+        source = self.copy_fixture("h264_high_mkv_aac.mkv")
+        (self.root / "h264_high_mkv_aac.mp4").write_bytes(b"someone else's file")
+        # Planned by its own path: a folder run would plan the foreign .mp4 as a source of the same stem.
+        plan_paths(TOOLS, [str(source)], make_options(mark_outputs=True), progress=quiet())
+        record = load_record(source)
+        self.assertEqual((record["status"], record["quarantine_reason"]), ("quarantined", "output-collision"))
+        self.assertIn("'h264_high_mkv_aac.mp4' already exists", record["stages"]["plan"]["reason"])
 
     def test_users_own_srt_beside_the_source_is_left_alone(self):
         source = self.copy_fixture("h264_mkv_srt_subtitles.mkv", "Movie night.mkv")

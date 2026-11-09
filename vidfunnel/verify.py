@@ -48,12 +48,13 @@ missing, cannot be probed, does not decode at all (non-zero exit and no
 decoded frame), or changed while it was verified.
 """
 
-VERSION = "20261107"
+VERSION = "20261109"
 
 import json
 import os
 import re
 import sys
+import types
 from fractions import Fraction
 from pathlib import Path
 
@@ -62,7 +63,7 @@ from vidfunnel.ffmpeg import FfmpegError, null_decode
 from vidfunnel.ffmpeg import run as run_tool
 from vidfunnel.plan import HASH_PROGRESS_BYTES, IDENTITY_KEY, video_filters
 from vidfunnel.probe import count_frames, probe_file
-from vidfunnel.progress import Progress, StageSummary, ffmpeg_progress_callback, format_bytes, say
+from vidfunnel.progress import Progress, StageSummary, ffmpeg_progress_callback, format_bytes, item_tag, say, tagged
 from vidfunnel.record import (
     RECORD_DIR,
     FolderLock,
@@ -755,6 +756,9 @@ def run(args):
                 by_folder[str(folder)] = []
                 order.append(str(folder))
             by_folder[str(folder)].append(record)
+    total = sum(1 for folder in order for record in by_folder[folder]
+                if record.get("status") in VERIFIABLE_STATUSES)
+    position = 0
     for folder in order:
         records = by_folder[folder]
         wanted = [record for record in records if record.get("status") in VERIFIABLE_STATUSES]
@@ -762,29 +766,35 @@ def run(args):
             summary.add("skipped", len(records) - len(wanted))
         if not wanted:
             continue
+        first_position = position
         try:
             with FolderLock(folder, warn=lambda message: say(message, stream)):
                 for collected in wanted:
                     key = record_key(folder, collected)
+                    position += 1
+                    # Every line of this item starts with its counter, as convert's do.
+                    tag = item_tag("verify", position, total)
+                    item = types.SimpleNamespace(stream=tagged(stream, tag),
+                                                 quiet=bool(getattr(args, "quiet", False)))
                     # Read again under the lock: a retire or convert that finished since the
                     # collection above has changed the record on disk, and verifying the stale
                     # copy would overwrite that change.
                     try:
                         record = load_record(key)
                     except RecordError as error:
-                        say("failed: '{}': {}".format(key.name, error), stream)
+                        say("failed: '{}': {}".format(key.name, error), item.stream)
                         summary.add("failed")
                         continue
                     if record is None or record.get("status") not in VERIFIABLE_STATUSES:
                         say("skipping '{}': its record {} since it was listed".format(
                             key.name, "is gone" if record is None
-                            else "now has status '{}'".format(record.get("status"))), stream)
+                            else "now has status '{}'".format(record.get("status"))), item.stream)
                         summary.add("skipped")
                         continue
                     try:
-                        result = verify_record(tools, key, record, args, progress=args)
+                        result = verify_record(tools, key, record, args, progress=item)
                     except (OSError, RecordError, FfmpegError) as error:
-                        say("failed: '{}': {}".format(key.name, error), stream)
+                        say("failed: '{}': {}".format(key.name, error), item.stream)
                         summary.add("failed")
                         continue
                     if result.get("status") == "failed":
@@ -794,6 +804,7 @@ def run(args):
         except LockHeld as error:
             say("skipping folder '{}': {}".format(folder, error), stream)
             summary.add("skipped", len(wanted))
+            position = first_position + len(wanted)
     say(summary.format("'{}/' under each folder".format(RECORD_DIR)), stream)
     return EXIT_ERROR if summary.counts.get("failed") else EXIT_OK
 

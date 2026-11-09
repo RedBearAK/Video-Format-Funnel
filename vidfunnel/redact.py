@@ -18,7 +18,7 @@ stderr, rendered report rows). Records on disk are never redacted; this module
 only transforms copies for output.
 """
 
-VERSION = "20261108"
+VERSION = "20261109"
 
 import copy
 import datetime
@@ -450,7 +450,7 @@ class Redactor:
                         self.add_path(os.path.join(folder, name))
                     else:
                         self.add_path(name)
-        for sidecar in output.get("sidecars") or ():
+        for sidecar in list(output.get("sidecars") or ()) + list(output.get("interim_sidecars") or ()):
             sidecar_name = sidecar.get("name") if isinstance(sidecar, dict) else sidecar
             if isinstance(sidecar_name, str) and sidecar_name:
                 if isinstance(folder, str) and folder:

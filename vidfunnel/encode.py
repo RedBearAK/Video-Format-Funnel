@@ -5,7 +5,8 @@ HANDOFF.md sections 2.4, 2.5, 5 (the size rule), 6.3, 6.7 and 6.10.
 with its last element (the output path) replaced by a hidden
 '.NAME.<first 8 hex digits of the record id>.part' file in the same folder,
 so two records can never write the same part file. On success the part file is renamed into place
-(the interim '<stem>.vidfunnel.mp4' name when the source is itself an MP4),
+(the interim '<stem>.vidfunnel.mp4' name when the source is itself an MP4,
+or for any source planned with --mark-outputs, whose sidecars carry interim names too),
 the output gets the source's mtime, the subtitle sidecars are written the
 same way, the size rule is applied, PAR2 is written when asked, and verify
 runs on the result when vidfunnel.verify is present.
@@ -53,7 +54,7 @@ refused without being touched, except that a converted or verified record
 whose output still matches its fingerprint is reported as already converted.
 """
 
-VERSION = "20261108"
+VERSION = "20261109"
 
 import math
 import os
@@ -70,7 +71,7 @@ from vidfunnel.ffmpeg import FfmpegError, ToolNotFound, current_identity, forget
 from vidfunnel.ffmpeg import run as run_tool
 from vidfunnel.interrupt import Interrupted, child_interrupted, drain_after_item, drain_before_next, run_pool
 from vidfunnel.interrupt import check as check_interrupted
-from vidfunnel.progress import Progress, StageSummary, ffmpeg_progress_callback, say
+from vidfunnel.progress import Progress, StageSummary, ffmpeg_progress_callback, item_tag, say, tagged
 from vidfunnel.stopfile import raise_if_stopped_now
 from vidfunnel.record import (
     RECORD_DIR,
@@ -302,6 +303,12 @@ def _stream_of(progress):
             bool(getattr(progress, "verbose", False)))
 
 
+def _tagged_progress(progress, tag):
+    """A progress namespace like `progress` whose stream starts every line with `tag` ('[convert 3/1054]')."""
+    stream, quiet, verbose = _stream_of(progress)
+    return types.SimpleNamespace(stream=tagged(stream, tag), quiet=quiet, verbose=verbose)
+
+
 def write_par2(output_path, redundancy, progress=None):
     """par2create -r N -n 1 -q next to the output; returns the PAR2 files written. Raises OSError on failure.
 
@@ -432,8 +439,11 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
     group, or '<dvd folder>_titleNN' beside the DVD folder); its parent is
     the folder. `options` carries par2 (override or None) and
     verbose. `progress` is None or carries stream and quiet. The record is
-    changed in place and saved after each change of state.
+    changed in place and saved after each change of state. Every line it
+    prints, the live progress line included, starts with the item's tag,
+    '[convert <position>/<total>]' ('[convert]' without them).
     """
+    progress = _tagged_progress(progress, item_tag("convert", position, total))
     stream, quiet, verbose = _stream_of(progress)
     verbose = verbose or bool(getattr(options, "verbose", False))
     key = Path(os.path.abspath(os.fspath(source)))
@@ -473,8 +483,7 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
     temp = part_path(output_path, record.get("id"))
     argv = list(plan["argv"])
     argv[-1] = str(temp)
-    counter = "[convert {}/{}]".format(position, total) if position is not None and total else "[convert]"
-    say("{} {} '{}' -> '{}'".format(counter, action_word, label, output_path.name), stream)
+    say("{} '{}' -> '{}'".format(action_word, label, output_path.name), stream)
     if verbose:
         say(shlex.join(argv), stream)
 
@@ -841,7 +850,11 @@ def refit_one(tools, source, record, options, progress=None, position=None, tota
     'failed': ffmpeg failed; stage 'refit' with outcome 'failed' and the
     error, no 'fit-capped', so a later --refit run tries again (the failed
     stage then moves to stages.refit_history).
+
+    Every line it prints, the live progress line included, starts with the
+    item's tag, '[refit <position>/<total>]' ('[refit]' without them).
     """
+    progress = _tagged_progress(progress, item_tag("refit", position, total))
     stream, quiet, verbose = _stream_of(progress)
     verbose = verbose or bool(getattr(options, "verbose", False))
     key = Path(os.path.abspath(os.fspath(source)))
@@ -851,8 +864,7 @@ def refit_one(tools, source, record, options, progress=None, position=None, tota
     if plan is None:
         say("skipping '{}': {}".format(label, reason), stream)
         return "skipped", reason
-    counter = "[refit {}/{}]".format(position, total) if position is not None and total else "[refit]"
-    say("{} '{}': {}".format(counter, label, _refit_words(plan)), stream)
+    say("'{}': {}".format(label, _refit_words(plan)), stream)
     say("  {}".format(plan["denoise_reason"]), stream)
     if verbose:
         say(shlex.join(plan["argv"]), stream)
@@ -1080,13 +1092,14 @@ def refit_paths(tools, paths, options, progress=None):
         total = len(runnable)
 
         def work(position, key):
+            tag = item_tag("refit", position, total)
             try:
                 record = load_record(key)
             except RecordError as error:
-                say("failed: {}".format(error), out)
+                say("{} failed: {}".format(tag, error), out)
                 return "failed", None
             if record is None:
-                say("failed: the record of '{}' disappeared".format(key.name), out)
+                say("{} failed: the record of '{}' disappeared".format(tag, key.name), out)
                 return "failed", None
             return refit_one(tools, key, record, options, shared, position, total)
 
@@ -1321,13 +1334,14 @@ def convert_paths(tools, paths, options, progress=None):
         total = len(runnable)
 
         def work(position, key):
+            tag = item_tag("convert", position, total)
             try:
                 record = load_record(key)
             except RecordError as error:
-                say("failed: {}".format(error), out)
+                say("{} failed: {}".format(tag, error), out)
                 return "failed"
             if record is None:
-                say("failed: the record of '{}' disappeared".format(key.name), out)
+                say("{} failed: the record of '{}' disappeared".format(tag, key.name), out)
                 return "failed"
             stage = convert_one(tools, key, record, options, shared, position, total)
             outcome = stage.get("outcome")

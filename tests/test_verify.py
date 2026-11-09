@@ -10,7 +10,7 @@ streams, which is what verify checks. They skip with a message when ffmpeg
 or the fixtures are missing.
 """
 
-VERSION = "20261102"
+VERSION = "20261109"
 
 import argparse
 import contextlib
@@ -385,6 +385,23 @@ class VerifyRunTest(unittest.TestCase):
                                   stream=io.StringIO())
         self.assertEqual(run(args), EXIT_OK)
         self.assertIn("5 ok", args.stream.getvalue())
+
+    def test_run_tags_every_line_of_an_item(self):
+        from vidfunnel.cli import EXIT_OK
+        args = argparse.Namespace(paths=[str(self.root)], ffmpeg=None, quiet=False, verbose=False, log=None,
+                                  yes=False, ssim_check=False, ssim_threshold=0.97, samples=None,
+                                  stream=io.StringIO())
+        self.assertEqual(run(args), EXIT_OK)
+        text = args.stream.getvalue()
+        tags = set()
+        for line in text.splitlines():
+            if line.startswith("[verify "):
+                tags.add(line.split("]", 1)[0] + "]")
+            else:
+                self.assertTrue(line.startswith("verify: "), text)
+        self.assertEqual(tags, {"[verify {}/5]".format(number) for number in range(1, 6)}, text)
+        self.assertIn("] [verify decode] ", text)
+        self.assertIn("]   verified '", text)
 
 
 @unittest.skipIf(TOOLS is None, "ffmpeg not found on PATH; verify integration tests skipped")

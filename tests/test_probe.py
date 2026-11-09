@@ -10,14 +10,17 @@ Recapture after changing probe.py or the fixtures, from the repo root:
     python3 -m tests.test_probe --capture
 """
 
-VERSION = "20261102"
+VERSION = "20261109"
 
+import io
 import json
 import os
 import shutil
 import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 from vidfunnel.ffmpeg import FfmpegError, ToolNotFound, find_tools
 from vidfunnel.probe import (
@@ -573,6 +576,25 @@ def main(argv):
         return 0
     unittest.main(argv=[argv[0]] + [arg for arg in argv[1:]])
     return 0
+
+
+class AnnounceTests(unittest.TestCase):
+    """The start line of a whole-file pass goes to the stream of the item's progress, where it gets the item's tag."""
+
+    def test_announce_line_goes_to_the_progress_stream(self):
+        from vidfunnel import probe
+        from vidfunnel.progress import tagged
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "clip.avi")
+            with open(path, "wb") as handle:
+                handle.write(b"x" * 4096)
+            captured = io.StringIO()
+            item = types.SimpleNamespace(stream=tagged(captured, "[plan 2/3]"))
+            elsewhere = io.StringIO()
+            with mock.patch.object(probe, "ANNOUNCE_BYTES", 1024), mock.patch.object(sys, "stdout", elsewhere):
+                probe._announce(path, "scanning keyframes of stream 0", item)
+            self.assertEqual(captured.getvalue(), "[plan 2/3] scanning keyframes of stream 0 of 'clip.avi' (0 MiB)\n")
+            self.assertEqual(elsewhere.getvalue(), "")
 
 
 if __name__ == "__main__":

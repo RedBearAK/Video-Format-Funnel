@@ -13,7 +13,7 @@ frame count from duration times frame rate, no aspect guessed from the frame
 size). The rules that interpret the values live in analyze.
 """
 
-VERSION = "20261102"
+VERSION = "20261109"
 
 import os
 import re
@@ -301,14 +301,19 @@ def probe_file(tools, path, extra_args=()):
 # --- packet-level measurements -----------------------------------------------------
 
 
-def _announce(path, what):
-    """One start line before a whole-file pass over a large file."""
+def _announce(path, what, progress=None):
+    """One start line before a whole-file pass over a large file, on the stream of `progress` when it has one.
+
+    Through that stream the line goes through --jobs' line stream and carries
+    the item's tag, as the item's other lines do (stdout without one).
+    """
     try:
         size = os.path.getsize(path)
     except OSError:
         return
     if size >= ANNOUNCE_BYTES:
-        say("{} of '{}' ({:.0f} MiB)".format(what, os.path.basename(path), size / (1024.0 * 1024.0)))
+        say("{} of '{}' ({:.0f} MiB)".format(what, os.path.basename(path), size / (1024.0 * 1024.0)),
+            getattr(progress, "stream", None))
 
 
 def _packet_time(packet):
@@ -400,7 +405,7 @@ def keyframe_spacing(tools, path, stream_index, progress=None):
     scan (ffprobe reports no progress of its own while it reads packets).
     """
     absolute = os.path.abspath(os.fspath(path))
-    _announce(absolute, "scanning keyframes of stream {}".format(stream_index))
+    _announce(absolute, "scanning keyframes of stream {}".format(stream_index), progress)
     if progress is not None:
         progress.update(extra="keyframe scan, stream {}".format(stream_index))
     packets = ffprobe_packets(tools, absolute, stream_index, "pts_time,dts_time,duration_time,flags")
@@ -417,7 +422,7 @@ def count_frames(tools, path, stream_index, progress=None):
     packet too). Raises FfmpegError when ffprobe fails or reports no count.
     """
     absolute = os.path.abspath(os.fspath(path))
-    _announce(absolute, "counting packets of stream {}".format(stream_index))
+    _announce(absolute, "counting packets of stream {}".format(stream_index), progress)
     if progress is not None:
         progress.update(extra="counting packets, stream {}".format(stream_index))
     argv = [

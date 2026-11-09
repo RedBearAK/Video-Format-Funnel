@@ -27,7 +27,13 @@ What the record carries for the later stages:
   stages.plan.blockiness ({'score'}), an informational copy of the
   analysis values (convert --refit reads stages.analyze, not these);
 - output.name and output.interim_name ('<stem>.vidfunnel.mp4' when the
-  source is itself '<stem>.mp4'), output.sidecars (file names).
+  source is itself '<stem>.mp4', and for every file source planned with
+  --mark-outputs), output.sidecars (file names, final);
+- stages.plan.mark_outputs: True when planned with --mark-outputs. Then the
+  sidecars are written under interim names too ('<stem>.vidfunnel.srt'),
+  listed in output.interim_sidecars beside output.sidecars (same order),
+  and retire renames them with the output. DVD titles keep their final
+  names, since retire does not retire a DVD folder.
 
 Two sources whose outputs would share a name are both quarantined with
 'output-collision' (HANDOFF 2.4), whether they are planned in the same run
@@ -43,7 +49,7 @@ analyze_input(), which runs the same passes with an input-argument list and
 returns the same dict shape, built from analyze's own pure rules.
 """
 
-VERSION = "20261108"
+VERSION = "20261109"
 
 import hashlib
 import json
@@ -91,7 +97,7 @@ from vidfunnel.probe import (
     spacing_from_packets,
     vob_group,
 )
-from vidfunnel.progress import Progress, StageSummary, ffmpeg_progress_callback, format_bytes, say
+from vidfunnel.progress import Progress, StageSummary, ffmpeg_progress_callback, format_bytes, item_tag, say, tagged
 from vidfunnel.record import (
     FOLDER_FILE,
     RECORD_DIR,
@@ -154,7 +160,7 @@ H273_MATRIX = {"gbr": 0, "bt709": 1, "fcc": 4, "bt470bg": 5, "smpte170m": 6, "sm
                "ictcp": 14}
 
 PLAN_OPTION_NAMES = ("samples", "full_analysis", "assume_dar", "audio_offset", "audio_strict_aac", "reencode_video",
-                     "max_level", "plain_mp4", "par2", "replan")
+                     "max_level", "plain_mp4", "par2", "replan", "mark_outputs")
 
 _TITLE_SET_VOB = re.compile(r"^(VTS_\d\d)_[1-9]\.VOB$", re.IGNORECASE)
 
@@ -171,7 +177,8 @@ class PlanError(Exception):
 def make_options(**values):
     """The plan options as a namespace, defaults filled in (what run() builds from the CLI args)."""
     defaults = dict(samples=None, full_analysis=False, assume_dar=None, audio_offset=None, audio_strict_aac=False,
-                    reencode_video=False, max_level="4.2", plain_mp4=False, par2=None, replan=False, jobs=1)
+                    reencode_video=False, max_level="4.2", plain_mp4=False, par2=None, replan=False, jobs=1,
+                    mark_outputs=False)
     defaults.update(values)
     return types.SimpleNamespace(**defaults)
 
@@ -350,11 +357,14 @@ def _same_file(first, second):
         return os.path.abspath(str(first)) == os.path.abspath(str(second))
 
 
-def output_names(source, sibling_sources, tools=None, source_sha256=None, stem=None):
+def output_names(source, sibling_sources, tools=None, source_sha256=None, stem=None, mark=False):
     """{'name', 'interim_name', 'collision'} for a source (HANDOFF 2.4).
 
     name: '<stem>.mp4' beside the source. interim_name: '<stem>.vidfunnel.mp4'
-    when the name is the source's own (an .mp4 source), else None.
+    when the name is the source's own (an .mp4 source) or `mark` is true
+    (plan --mark-outputs), else None. With `mark` the final name is checked
+    for a foreign file as well as the interim one, since retire renames the
+    output to it.
     collision: 'same-stem' when another source in the folder would get the
     same output name (compared case-insensitively, as macOS and SMB shares
     do); 'foreign-output' when the file convert would write (the interim
@@ -369,7 +379,7 @@ def output_names(source, sibling_sources, tools=None, source_sha256=None, stem=N
     stem = stem if stem is not None else output_stem(source)
     name = stem + ".mp4"
     interim_name = None
-    if source.name.casefold() == name.casefold():
+    if mark or source.name.casefold() == name.casefold():
         interim_name = stem + INTERIM_INFIX + ".mp4"
     collision = None
     for sibling in sibling_sources or []:
@@ -379,14 +389,24 @@ def output_names(source, sibling_sources, tools=None, source_sha256=None, stem=N
         if output_stem(sibling).casefold() == stem.casefold():
             collision = "same-stem"
             break
-    if collision is None:
-        target = source.parent / (interim_name or name)
+    targets = [interim_name or name]
+    if mark and interim_name is not None:
+        targets.append(name)
+    collision_name = None
+    for target_name in targets:
+        if collision is not None:
+            break
+        target = source.parent / target_name
         if target.exists() and not _same_file(target, source):
             tag = read_identity(tools, target) if tools is not None else None
             ours = bool(tag and source_sha256 and tag.get("src") == source_sha256[:16])
             if not ours:
                 collision = "foreign-output"
-    return {"name": name, "interim_name": interim_name, "collision": collision}
+                collision_name = target_name
+    names = {"name": name, "interim_name": interim_name, "collision": collision}
+    if collision_name is not None and collision_name != (interim_name or name):
+        names["collision_name"] = collision_name
+    return names
 
 
 def _record_key_name(record):
@@ -1108,7 +1128,8 @@ def _plan_one_locked(tools, work, options, folder_sources, capabilities, progres
 
     plan = {"inputs": list(work.inputs), "profile": PLAIN_PROFILE if getattr(options, "plain_mp4", False) else PROFILE,
             "options": _options_dict(options), "par2": getattr(options, "par2", None),
-            "plain_mp4": bool(getattr(options, "plain_mp4", False)), "dvd_title": work.dvd_title, "argv": None,
+            "plain_mp4": bool(getattr(options, "plain_mp4", False)),
+            "mark_outputs": bool(getattr(options, "mark_outputs", False)), "dvd_title": work.dvd_title, "argv": None,
             "sidecars": [], "output": {"name": None, "interim_name": None}, "predicted_score": None,
             "keyframes": None, "size_class": None, "blockiness": None,
             "ffmpeg": plan_identity(tools.ffmpeg, capabilities)}
@@ -1163,7 +1184,8 @@ def _plan_one_locked(tools, work, options, folder_sources, capabilities, progres
         if work.dvd_title is not None:
             names = _dvd_title_names(work, tools, record["source"]["sha256"])
         else:
-            names = output_names(work.key, folder_sources, tools, record["source"]["sha256"])
+            names = output_names(work.key, folder_sources, tools, record["source"]["sha256"],
+                                 mark=plan["mark_outputs"])
         plan["output"] = {"name": names["name"], "interim_name": names["interim_name"]}
         record["output"]["name"] = names["name"]
         record["output"]["interim_name"] = names["interim_name"]
@@ -1177,14 +1199,20 @@ def _plan_one_locked(tools, work, options, folder_sources, capabilities, progres
                 "as mov_text)".format(work.label, name), stream)
         plan["sidecars_skipped"] = skipped_sidecars
         record["output"]["sidecars"] = [Path(entry["path"]).name for entry in sidecars]
+        final_sidecar_paths = [entry["path"] for entry in sidecars]
+        if plan["mark_outputs"] and names["interim_name"]:
+            # Written under interim names beside the interim output; retire renames them with it.
+            sidecars = interim_sidecars(sidecars, final_path, work.folder / names["interim_name"])
+            record["output"]["interim_sidecars"] = [Path(entry["path"]).name for entry in sidecars]
         collision = names["collision"]
         reason = None
         claims = recorded_claims(work.folder, names["name"], work.key.name, stream)
         if claims and collision != "same-stem":
             collision = "same-stem"
             reason = _claims_reason(claims, names["name"])
-        taken = [entry["path"] for entry in sidecars
-                 if os.path.exists(entry["path"]) and Path(entry["path"]).name not in ours]
+        written_paths = [entry["path"] for entry in sidecars]
+        taken = [path for path in dict.fromkeys(final_sidecar_paths + written_paths)
+                 if os.path.exists(path) and Path(path).name not in ours]
         if collision is None and taken:
             collision = "sidecar-exists"
         if collision is not None:
@@ -1236,12 +1264,36 @@ def _own_sidecar_names(existing):
 
     A file with one of these names beside the source is ours to overwrite,
     so a `plan --replan` after a convert does not trip over its own .srt.
+    The interim names of a record planned with --mark-outputs count too.
     """
     names = set()
     for record in [existing] + list((existing or {}).get("history") or []):
-        for name in ((record or {}).get("output") or {}).get("sidecars") or []:
+        output = (record or {}).get("output") or {}
+        for name in list(output.get("sidecars") or []) + list(output.get("interim_sidecars") or []):
             names.add(name)
     return names
+
+
+def interim_sidecars(sidecars, final_path, interim_path):
+    """The sidecar entries renamed for an interim output: 'NAME.srt' -> 'NAME.vidfunnel.srt'. Pure.
+
+    Each entry's path and the last element of its argv (the same path) get
+    the interim output's base in place of the final output's base; the
+    kind and the rest of the argv stay as they are.
+    """
+    final_base = _sidecar_base(final_path)
+    interim_base = _sidecar_base(interim_path)
+    renamed = []
+    for entry in sidecars:
+        path = entry["path"]
+        if not path.startswith(final_base):
+            raise PlanError("sidecar '{}' is not named after the output '{}'".format(path, final_path))
+        new_path = interim_base + path[len(final_base):]
+        argv = list(entry["argv"])
+        if argv and argv[-1] == path:
+            argv[-1] = new_path
+        renamed.append(dict(entry, path=new_path, argv=argv))
+    return renamed
 
 
 def _drop_foreign_text_sidecars(sidecars, ours):
@@ -1269,7 +1321,7 @@ def _collision_reason(collision, names, taken):
             names["name"])
     if collision == "foreign-output":
         return "'{}' already exists and is not ours (no vidfunnel tag with this source's src)".format(
-            names["interim_name"] or names["name"])
+            names.get("collision_name") or names["interim_name"] or names["name"])
     return "sidecar(s) already exist: {}".format(", ".join("'{}'".format(Path(path).name) for path in taken))
 
 
@@ -1412,8 +1464,15 @@ def _take_folder_lock(folder, entries, summary, stream):
 
 def _plan_entry(tools, work, found, options, folder_sources, capabilities, progress, stream, position, total,
                 record_lock=None):
-    """(outcome, record or None) for one work item, with its start line and its skip line."""
-    say("[plan {}/{}] probing '{}'".format(position, total, work.label), stream)
+    """(outcome, record or None) for one work item, with its start line and its skip line.
+
+    Every line of the item, the live progress lines of its passes included,
+    starts with its tag '[plan <position>/<total>]'.
+    """
+    _stream, quiet = _progress_options(progress)
+    stream = tagged(stream, item_tag("plan", position, total))
+    progress = types.SimpleNamespace(stream=stream, quiet=quiet)
+    say("probing '{}'".format(work.label), stream)
     try:
         outcome, record = _plan_one(tools, work, options, folder_sources, capabilities, progress, found,
                                     record_lock)
@@ -1581,6 +1640,9 @@ def add_arguments(parser):
     parser.add_argument("--par2", type=_positive_int, default=None, metavar="N",
                         help="record that convert should write PAR2 with N %% redundancy")
     parser.add_argument("--replan", action="store_true", help="plan again sources whose records still match")
+    parser.add_argument("--mark-outputs", action="store_true",
+                        help="write every output (and its subtitle sidecars) as '<stem>.vidfunnel.mp4' until retire "
+                        "renames it to '<stem>.mp4', so converted files are recognisable while the originals remain")
     parser.add_argument("--jobs", type=_positive_int, default=1, metavar="N",
                         help="files planned at once, also within one folder (default 1)")
     return parser

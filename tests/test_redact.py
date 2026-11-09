@@ -4,9 +4,10 @@ Each table is a list of (input, expected) pairs; reading the table is reading
 the behaviour.
 """
 
-VERSION = "20261108"
+VERSION = "20261109"
 
 import copy
+import json
 import random
 import re
 import unittest
@@ -317,6 +318,22 @@ class RedactorTests(unittest.TestCase):
         self.assertEqual(redacted["history"][0]["source"]["name"],
                          "C____t N__e - D________n ####-##-## p___#.avi")
         self.assertEqual(redacted["history"][0]["id"], record["id"])
+
+    def test_marked_record_interim_sidecars_are_redacted(self):
+        record = sample_record()
+        interim = "Client Name - Deposition 2019-03-14 part2.vidfunnel.srt"
+        record["output"]["interim_name"] = "Client Name - Deposition 2019-03-14 part2.vidfunnel.mp4"
+        record["output"]["interim_sidecars"] = [interim]
+        # Only in an argv and in stderr, where no path key names it: the record's output section must teach it.
+        record["stages"]["plan"]["sidecars"] = [
+            {"kind": "srt", "argv": ["/usr/bin/ffmpeg", "-i", SOURCE_PATH, "-f", "srt", SOURCE_FOLDER + "/" + interim]}]
+        record["stages"]["convert"]["stderr"] += "Output #0, srt, to '" + SOURCE_FOLDER + "/" + interim + "':\n"
+        redacted = Redactor(roots=["/srv/media/Family Videos"]).record(record)
+        self.assertEqual(redacted["output"]["interim_sidecars"], [redact_name(interim)])
+        self.assertEqual(redact_name(interim), "C____t N__e - D________n ####-##-## p___#.v_______l.srt")
+        text = json.dumps(redacted)
+        for word in ("Client", "Deposition", "part2"):
+            self.assertNotIn(word, text)
 
 
 BOUNDED = r"(?<![^\W_])(?:{})(?![^\W_])"

@@ -21,13 +21,17 @@ is checked against its own fingerprint and moved or unlinked, in order. An
 interim-named output is then renamed to its final name, and PAR2 files
 written for the interim name are replaced by PAR2 for the final name (PAR2
 stores the protected file's name); when that cannot be done the old ones are
-kept and the record is flagged 'par2-stale'. The record gains a
+kept and the record is flagged 'par2-stale'. Subtitle sidecars written under
+interim names (output.interim_sidecars, plan --mark-outputs) are renamed to
+their final names (output.sidecars, same order) with the output; a final
+sidecar name taken by another file is checked by the
+'interim-rename-blocked' guard before anything is moved. The record gains a
 'retire' stage and the status 'retired', and stays where it is as the audit
 trail. Output files are never removed, and records that are not 'verified'
 are never touched.
 """
 
-VERSION = "20261107"
+VERSION = "20261109"
 
 import contextlib
 import os
@@ -132,7 +136,8 @@ def check_eligible(source, record, allow_review=False, progress=None, quiet=Fals
     progress: None (a Progress line is shown for outputs over 32 MiB unless
     quiet) or a Progress-like object handed to sha256_file. Returns
     {'output_path', 'final_output_path', 'band', 'sha256_verified': True,
-    'members': [paths], 'larger': bool}; 'larger' is True when the output is
+    'members': [paths], 'larger': bool, 'sidecars': [(interim path, final
+    path)] of the interim-named sidecars on disk}; 'larger' is True when the output is
     larger than the source (or flagged 'output-larger') and allow_larger let
     it pass; 'members' is [source] for a single file and every
     member of source.members, in order, for a 'vob-group' record, each of
@@ -160,6 +165,10 @@ def check_eligible(source, record, allow_review=False, progress=None, quiet=Fals
     if interim_name is not None and not _plain_name(interim_name):
         raise RetireRefused("no-record", "the record of '{}' has an unusable interim name ({!r})".format(
             source.name, interim_name))
+    sidecar_names = _sidecar_pairs(output_section)
+    if sidecar_names is None:
+        raise RetireRefused("no-record", "the record of '{}' has unusable sidecar names ({!r} for {!r})".format(
+            source.name, output_section.get("interim_sidecars"), output_section.get("sidecars")))
     members = None
     if source_section.get("kind") == "vob-group":
         members = source_section.get("members")
@@ -272,6 +281,18 @@ def check_eligible(source, record, allow_review=False, progress=None, quiet=Fals
             raise RetireRefused("interim-rename-blocked",
                                 "'{}' cannot be renamed to '{}': a different file has that name".format(
                                     interim_name, output_name))
+    sidecars = []
+    if interim_name is not None and interim_name != output_name:
+        for interim_sidecar, final_sidecar in sidecar_names:
+            interim_path = folder / interim_sidecar
+            if not os.path.lexists(str(interim_path)):
+                continue    # never written (a failed sidecar), or already renamed
+            final_path = folder / final_sidecar
+            if os.path.lexists(str(final_path)) and not _same_file(final_path, interim_path):
+                raise RetireRefused("interim-rename-blocked",
+                                    "sidecar '{}' cannot be renamed to '{}': a different file has that name".format(
+                                        interim_sidecar, final_sidecar))
+            sidecars.append((interim_path, final_path))
 
     return {
         "output_path": output_path,
@@ -280,7 +301,26 @@ def check_eligible(source, record, allow_review=False, progress=None, quiet=Fals
         "sha256_verified": True,
         "members": member_paths,
         "larger": bool(larger or flagged),
+        "sidecars": sidecars,
     }
+
+
+def _sidecar_pairs(output_section):
+    """[(interim name, final name)] of the sidecars written under interim names; None when the lists are unusable.
+
+    A record without output.interim_sidecars (any record not planned with
+    --mark-outputs) has none. The two lists must be of plain names and of
+    the same length.
+    """
+    interim = output_section.get("interim_sidecars")
+    if interim is None:
+        return []
+    final = output_section.get("sidecars")
+    if not isinstance(interim, list) or not isinstance(final, list) or len(interim) != len(final):
+        return None
+    if not all(_plain_name(name) for name in interim + final):
+        return None
+    return [(first, second) for first, second in zip(interim, final) if first != second]
 
 
 def quarantine_destination(source, root, quarantine_dir=None):
@@ -448,7 +488,11 @@ def retire_one(source, record, root, quarantine_dir=None, destroy=False, allow_r
     the confirmation. A 'vob-group' record moves (or unlinks) every member,
     in order, each to its own quarantine_destination. After the source is
     gone an interim-named output is renamed to its final name and its PAR2
-    files redone (_redo_par2). The record gets a 'retire' stage {mode,
+    files redone (_redo_par2), and after a successful output rename its
+    interim-named sidecars are renamed to their final names
+    (renamed_sidecars, and sidecar_rename_errors for any that failed; a
+    failed sidecar rename is printed and recorded, not raised, since the
+    source is gone by then). The record gets a 'retire' stage {mode,
     destination (the first member's), destinations (one per member), method,
     renamed_output, score, band}, plus par2_recreated and par2_redundancy (and
     par2_stale, par2_error when the PAR2 could not be redone) when interim
@@ -518,6 +562,22 @@ def retire_one(source, record, root, quarantine_dir=None, destroy=False, allow_r
             rename_error = "renaming '{}' to '{}' failed: {}".format(
                 output_path.name, final_output_path.name, error)
 
+    renamed_sidecars = []
+    sidecar_errors = []
+    if renamed_output:
+        # Only with the output, so a sidecar never carries a name its video does not have.
+        for interim_path, final_path in eligibility["sidecars"]:
+            try:
+                if os.path.lexists(str(final_path)):
+                    raise OSError("'{}' exists".format(final_path))
+                os.replace(str(interim_path), str(final_path))
+                renamed_sidecars.append(final_path.name)
+            except OSError as error:
+                sidecar_errors.append("renaming '{}' to '{}' failed: {}".format(
+                    interim_path.name, final_path.name, error))
+                say("  sidecar '{}' keeps its interim name: renaming it to '{}' failed: {}".format(
+                    interim_path.name, final_path.name, error))
+
     par2_outcome = None
     if renamed_output:
         par2_outcome = _redo_par2(record, output_path, final_output_path, quiet)
@@ -533,6 +593,10 @@ def retire_one(source, record, root, quarantine_dir=None, destroy=False, allow_r
     }
     if rename_error is not None:
         stage["rename_error"] = rename_error
+    if eligibility["sidecars"]:
+        stage["renamed_sidecars"] = renamed_sidecars
+    if sidecar_errors:
+        stage["sidecar_rename_errors"] = sidecar_errors
     if par2_outcome is not None:
         stage.update(par2_outcome)
     add_stage(record, "retire", stage)

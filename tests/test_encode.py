@@ -8,7 +8,7 @@ ends at 'converted' or 'verified' depends on whether vidfunnel.verify is
 present, so both are accepted.
 """
 
-VERSION = "20261107"
+VERSION = "20261109"
 
 import argparse
 import contextlib
@@ -246,6 +246,7 @@ TOOLS = _tools_or_none()
 REMUX_SOURCE = "h264_high_mkv_aac.mkv"
 REENCODE_SOURCE = "xvid_avi_mp3.avi"
 MP4_SOURCE = "h264_mp4_aac.mp4"
+SUBTITLE_SOURCE = "h264_mkv_srt_subtitles.mkv"
 INTEGRATION_FIXTURES = (REMUX_SOURCE, REENCODE_SOURCE, MP4_SOURCE)
 
 
@@ -524,6 +525,75 @@ class ConvertRunTest(unittest.TestCase):
         self.assertEqual(listing(self.root), before)
         self.assertEqual(record_path(self.root / REMUX_SOURCE).read_bytes(), record_bytes)
 
+    def test_every_line_of_an_item_carries_its_counter_tag(self):
+        record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
+        progress = types.SimpleNamespace(stream=io.StringIO(), quiet=False, verbose=False)
+        stage = convert_one(TOOLS, self.root / REMUX_SOURCE, record, convert_options(), progress, 3, 1054)
+        self.assertEqual(stage["outcome"], "ok", stage)
+        lines = progress.stream.getvalue().splitlines()
+        for line in lines:
+            self.assertTrue(line.startswith("[convert 3/1054] "), lines)
+        self.assertIn("[convert 3/1054] remux '{}' -> 'h264_high_mkv_aac.mp4'".format(REMUX_SOURCE), lines)
+        # The live lines of the remux and of the verify that follows it, and verify's one-shot lines.
+        self.assertTrue(any(line.startswith("[convert 3/1054] [remux] ") for line in lines), lines)
+        self.assertTrue(any(line.startswith("[convert 3/1054] [verify decode] ") for line in lines), lines)
+        self.assertTrue(any(line.startswith("[convert 3/1054] verifying 'h264_high_mkv_aac.mp4'")
+                            for line in lines), lines)
+        self.assertTrue(any(line.startswith("[convert 3/1054]   converted '") for line in lines), lines)
+
+    def test_marked_outputs_go_through_interim_names_until_retire(self):
+        # Without --mark-outputs the names are unchanged: test_remux_writes_output_with_source_mtime_and_skips_on_
+        # second_run (clean name), test_mp4_source_writes_interim_name_and_leaves_source_alone (the MP4 case).
+        from vidfunnel.report import collect, rows_from_records
+        from vidfunnel.retire import retire_one
+        if not os.path.exists(os.path.join(FIXTURE_DIR, SUBTITLE_SOURCE)):
+            self.skipTest("fixture '{}' missing; run tests/make_fixtures.sh".format(SUBTITLE_SOURCE))
+        shutil.copy2(os.path.join(FIXTURE_DIR, SUBTITLE_SOURCE), str(self.root / "Movie night.mkv"))
+        shutil.copy2(os.path.join(FIXTURE_DIR, REMUX_SOURCE), str(self.root / REMUX_SOURCE))
+        plan_paths(TOOLS, [str(self.root)], make_options(mark_outputs=True), progress=quiet())
+        code, text = self.run_command()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(sorted(name for name in os.listdir(str(self.root)) if not name.startswith(".")),
+                         ["Movie night.mkv", "Movie night.vidfunnel.mp4", "Movie night.vidfunnel.srt",
+                          REMUX_SOURCE, "h264_high_mkv_aac.vidfunnel.mp4"])
+        record = load_record(self.root / "Movie night.mkv")
+        self.assertEqual(record["status"], "verified", text)
+        self.assertEqual((record["output"]["name"], record["output"]["interim_name"]),
+                         ("Movie night.mp4", "Movie night.vidfunnel.mp4"))
+        self.assertEqual((record["output"]["sidecars"], record["output"]["interim_sidecars"]),
+                         (["Movie night.srt"], ["Movie night.vidfunnel.srt"]))
+        self.assertEqual(record["stages"]["convert"]["output_path"], "Movie night.vidfunnel.mp4")
+        self.assertEqual(record["stages"]["convert"]["sidecars_written"], ["Movie night.vidfunnel.srt"])
+        self.assertEqual(record["stages"]["verify"]["output_name"], "Movie night.vidfunnel.mp4")
+        rows = {row["path"].rsplit("/", 1)[-1]: row for row in rows_from_records(collect([str(self.root)]))}
+        self.assertEqual(rows["Movie night.mkv"]["output_name"], "Movie night.vidfunnel.mp4")
+
+        stage = retire_one(self.root / "Movie night.mkv", record, self.root, quiet=True)
+        self.assertTrue(stage["renamed_output"])
+        self.assertEqual(stage["renamed_sidecars"], ["Movie night.srt"])
+        self.assertEqual(sorted(name for name in os.listdir(str(self.root)) if not name.startswith(".")),
+                         ["Movie night.mp4", "Movie night.srt", REMUX_SOURCE, "h264_high_mkv_aac.vidfunnel.mp4"])
+        self.assertIn("-->", (self.root / "Movie night.srt").read_text(errors="replace"))
+        retired = load_record(self.root / "Movie night.mkv")
+        self.assertEqual(retired["status"], "retired")
+        rows = {row["path"].rsplit("/", 1)[-1]: row for row in rows_from_records(collect([str(self.root)]))}
+        self.assertEqual(rows["Movie night.mkv"]["output_name"], "Movie night.mp4")
+        self.assertEqual(rows[REMUX_SOURCE]["output_name"], "h264_high_mkv_aac.vidfunnel.mp4")
+
+    def test_two_jobs_tag_every_item_line(self):
+        self.plan(REMUX_SOURCE, MP4_SOURCE)
+        code, text = self.run_command(jobs=2, quiet=False)
+        self.assertEqual(code, 0, text)
+        tags = set()
+        for line in text.splitlines():
+            if line.startswith("[convert "):
+                tags.add(line.split("]", 1)[0] + "]")
+            else:
+                self.assertTrue(line.startswith(("scanning ", "convert: ")), text)
+        self.assertEqual(tags, {"[convert 1/2]", "[convert 2/2]"}, text)
+        for tag in tags:
+            self.assertIn(tag + " [remux] ", text)
+
     def test_two_jobs_convert_both_planned_records(self):
         self.plan(REMUX_SOURCE, MP4_SOURCE)
         code, text = self.run_command(jobs=2)
@@ -800,6 +870,37 @@ class RefitRunTest(unittest.TestCase):
         with unittest.mock.patch("vidfunnel.encode._verify", side_effect=lambda tools, key, record, *rest: record):
             summary, text = self.refit()
         self.assertEqual(summary.counts["refitted"], 1, "a record without stages.plan.ffmpeg refits as before\n" + text)
+
+    def test_refit_of_a_marked_output_replaces_the_interim_file(self):
+        records = self.plan_and_convert(REFIT_SOURCE, reencode_video=True, mark_outputs=True)
+        record = records[REFIT_SOURCE]
+        interim = self.root / "h264_avi_mp3.vidfunnel.mp4"
+        self.assertEqual(record["output"]["interim_name"], interim.name)
+        self.assertIn("output-larger", record["flags"])
+        before = interim.stat().st_size
+        summary, text = self.refit()
+        self.assertEqual(summary.counts["refitted"], 1, text)
+        self.assertLess(interim.stat().st_size, before)
+        self.assertFalse((self.root / REFIT_OUTPUT).exists())
+        self.assertEqual(self.leftover_parts(), [])
+        saved = load_record(self.root / REFIT_SOURCE)
+        self.assertEqual(saved["status"], "verified", text)
+        self.assertEqual(saved["stages"]["verify"]["output_name"], interim.name)
+        self.assertEqual(saved["output"]["size"], interim.stat().st_size)
+
+    def test_every_line_of_a_refit_carries_its_counter_tag(self):
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
+        key = self.root / REFIT_SOURCE
+        progress = types.SimpleNamespace(stream=io.StringIO(), quiet=False, verbose=False)
+        outcome, reason = refit_one(TOOLS, key, load_record(key), convert_options(refit=True), progress, 2, 7)
+        lines = progress.stream.getvalue().splitlines()
+        self.assertEqual(outcome, "refitted", lines)
+        for line in lines:
+            self.assertTrue(line.startswith("[refit 2/7] "), lines)
+        self.assertTrue(any(line.startswith("[refit 2/7] '{}': CRF 18 -> ".format(REFIT_SOURCE)) for line in lines),
+                        lines)
+        self.assertTrue(any(line.startswith("[refit 2/7] [refit] ") for line in lines), lines)
+        self.assertTrue(any(line.startswith("[refit 2/7] [verify decode] ") for line in lines), lines)
 
     def test_reset_record_goes_through_a_separate_verify_run(self):
         self.plan_and_convert(REFIT_SOURCE, reencode_video=True)

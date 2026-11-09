@@ -12,7 +12,7 @@ The clock and the output stream are injectable so that tests can drive the
 throttling deterministically.
 """
 
-VERSION = "20261108"
+VERSION = "20261109"
 
 import errno
 import os
@@ -90,6 +90,74 @@ def discard_output(stream):
         os.dup2(null, target)
     finally:
         os.close(null)
+
+
+class TaggedStream(object):
+    """A stream that starts every line written through it with a tag: "[convert 3/1054] [re-encode] ...".
+
+    TaggedStream(target, tag). With --jobs the lines of several items
+    interleave; the tag is the item's counter, the same one its start line
+    carries, so every line (start lines, sub-lines, live progress) says which
+    item it belongs to, also in a sequential run. A line starts after a
+    newline or a carriage return, so the in-place progress line of a
+    terminal ('\\r' + text) keeps its tag on every redraw. Each write() is
+    one write to the target, so a _LineStream underneath still keeps lines
+    whole. isatty, fileno and encoding are the target's.
+    """
+
+    def __init__(self, target, tag):
+        self.target = _resolve_stream(target)
+        self.tag = tag
+        self.encoding = getattr(self.target, "encoding", None)
+        self._at_line_start = True
+
+    def write(self, text):
+        pieces = []
+        at_line_start = self._at_line_start
+        start = 0
+        for index, character in enumerate(text):
+            if character in "\r\n":
+                if index > start:
+                    if at_line_start:
+                        pieces.append(self.tag + " ")
+                    pieces.append(text[start:index])
+                pieces.append(character)
+                at_line_start = True
+                start = index + 1
+        if start < len(text):
+            if at_line_start:
+                pieces.append(self.tag + " ")
+            pieces.append(text[start:])
+            at_line_start = False
+        # The state changes only once the write went through, so a retry of the same text
+        # (_write's UnicodeEncodeError path) is tagged the same way.
+        result = self.target.write("".join(pieces))
+        self._at_line_start = at_line_start
+        return result
+
+    def flush(self):
+        flush = getattr(self.target, "flush", None)
+        if flush is not None:
+            flush()
+
+    def isatty(self):
+        return is_tty(self.target)
+
+    def fileno(self):
+        """The target's descriptor, for discard_output."""
+        return self.target.fileno()
+
+
+def tagged(stream, tag):
+    """`stream` (None: sys.stdout looked up now) with every line starting with `tag`; see TaggedStream."""
+    return TaggedStream(stream, tag)
+
+
+def item_tag(stage, position=None, total=None):
+    """'[convert 3/1054]', or '[convert]' when the position or the total is not known. Pure."""
+    if position is not None and total:
+        return "[{} {}/{}]".format(stage, position, total)
+    return "[{}]".format(stage)
 
 
 def say(message, stream=None):
