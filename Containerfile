@@ -25,6 +25,6 @@ COPY bin/ /opt/vidfunnel/bin/
 COPY LICENSE README.md /opt/vidfunnel/
 
 ENTRYPOINT ["/opt/vidfunnel/bin/vidfunnel"]
-CMD ["--version"]
+CMD []
 
 # End of File #
