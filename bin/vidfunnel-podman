@@ -97,6 +97,13 @@ What the wrapper does:
   that you can write only through one of those groups (owned by someone else,
   group-writable, not writable by others, its group one of your supplementary
   groups), and no warning when no mounted folder depends on one.
+  The host's /etc/machine-id, when it exists and is not empty, is mounted
+  read-only at the same path, so the folder locks a container run writes carry
+  this machine's id: a lock written before the machine's last reboot is then
+  taken over at once, by a run in a container or on the host. Without it (a
+  Mac, where podman and docker run in a VM, has no such file) the image has no
+  machine id, vidfunnel records the boot id instead, and such a lock is judged
+  by the other lock rules.
 
 Installing the command:
   --install-command and --uninstall-command (or an abbreviation argparse
@@ -1060,6 +1067,12 @@ for m in ${MOUNTS}; do
     set -- -v "${m}:${m}" "$@"
 done
 IFS="$oldifs"
+
+# The host's machine id, read-only, so the folder locks a container run writes name
+# this machine (the image has none, and vidfunnel would fall back to the boot id).
+if [ -f /etc/machine-id ] && [ -s /etc/machine-id ]; then
+    set -- -v /etc/machine-id:/etc/machine-id:ro "$@"
+fi
 
 set -- --workdir "${CWD}" "$@"
 set -- -e "HOME=${HOME}" "$@"

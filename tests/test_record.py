@@ -1,6 +1,6 @@
 """Tests for vidfunnel.record: paths, atomic saves, fingerprints, hashes, stages, lock."""
 
-VERSION = "20261108"
+VERSION = "20261109"
 
 import datetime
 import hashlib
@@ -19,6 +19,7 @@ from pathlib import Path
 
 from vidfunnel.record import (
     machine_id,
+    machine_identity,
     FOLDER_FILE,
     LOCK_NAME,
     RECORD_DIR,
@@ -335,7 +336,9 @@ class FolderLockTests(TempDirCase):
             content = json.loads(self.lock_file().read_text(encoding="utf-8"))
             self.assertEqual(content["pid"], os.getpid())
             self.assertEqual(sorted(content),
-                             ["boot", "container", "device", "flock", "host", "machine", "pid", "started"])
+                             ["boot", "container", "device", "flock", "host", "machine", "machine_source", "pid",
+                              "started"])
+            self.assertEqual((content["machine"], content["machine_source"]), machine_identity())
             with self.assertRaises(LockHeld) as caught:
                 with FolderLock(self.base):
                     pass
@@ -394,6 +397,25 @@ class FolderLockTests(TempDirCase):
                 mock.patch("vidfunnel.record.uuid.getnode", return_value=0x011122334455):
             self.assertIsNone(machine_id(), "the multicast bit marks getnode's random fallback")
         self.assertIsNotNone(machine_id(), "this machine has an identity")
+
+    def test_machine_identity_names_its_source(self):
+        machine_file = self.base / "machine-id"
+        boot_file = self.base / "boot-id"
+        files = (str(machine_file), str(boot_file))
+        boot_file.write_text("boot-value\n")
+        with mock.patch("vidfunnel.record.MACHINE_ID_FILES", files):
+            self.assertEqual(machine_identity(), ("boot-value", "boot-id"))
+            machine_file.write_text("\n")
+            self.assertEqual(machine_identity(), ("boot-value", "boot-id"), "an empty machine-id is skipped")
+            machine_file.write_text("machine-value\n")
+            self.assertEqual(machine_identity(), ("machine-value", "machine-id"))
+        absent = (str(self.base / "no-machine-id"), str(self.base / "no-boot-id"))
+        with mock.patch("vidfunnel.record.MACHINE_ID_FILES", absent), \
+                mock.patch("vidfunnel.record.uuid.getnode", return_value=0x001122334455):
+            self.assertEqual(machine_identity(), ("node-001122334455", "hardware"))
+        with mock.patch("vidfunnel.record.MACHINE_ID_FILES", absent), \
+                mock.patch("vidfunnel.record.uuid.getnode", return_value=0x011122334455):
+            self.assertEqual(machine_identity(), (None, None))
 
     def test_null_lock_file_is_judged_by_age_and_never_loops(self):
         # A lock file holding JSON null once sent acquire() into an endless loop (the base crashed on it).
@@ -819,13 +841,17 @@ class FlockHolderTests(TempDirCase):
 
     def test_another_boot_or_device_falls_back_to_the_age_rule(self):
         """Nothing holds this file's flock; a judge that tested it would take the lock over at once."""
-        for fields in ({"boot": "another-boot"}, {"boot": None}, {"device": 1}):
+        # Another boot id on this machine would be the reboot rule (RebootRuleTests); here the lock names
+        # another machine.
+        cases = (({"boot": "another-boot", "machine": "another-machine"}, "another machine with this host name"),
+                 ({"boot": None}, "held by a container run"), ({"device": 1}, "held by a container run"))
+        for fields, reason in cases:
             with self.subTest(fields=fields), mock.patch("vidfunnel.record.in_container", return_value=False):
                 held = self.write_flock_lock(1, 2, True, **fields)
                 with self.assertRaises(LockHeld) as caught:
                     with FolderLock(self.base, warn=self.fail):
                         pass
-                self.assertIn("held by a container run", str(caught.exception))
+                self.assertIn(reason, str(caught.exception))
                 self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), held)
                 self.write_flock_lock(1, 25, True, **fields)
                 warnings = []
@@ -970,6 +996,114 @@ class FlockHolderTests(TempDirCase):
         self.judge(warnings)
         self.assertEqual(len(warnings), 1, warnings)
         self.assertIn("pid {}, has exited".format(holder.pid), warnings[0])
+
+
+@unittest.skipIf(machine_identity()[1] != "machine-id" or not Path("/proc/sys/kernel/random/boot_id").exists(),
+                 "the reboot rule needs /etc/machine-id and a kernel boot id")
+class RebootRuleTests(TempDirCase):
+    """A lock written on this machine under an earlier boot id is taken over at once."""
+
+    OTHER_BOOT = "0d6e2f4a-1b3c-4d5e-8f70-123456789abc"
+
+    def lock_file(self):
+        return self.base / RECORD_DIR / LOCK_NAME
+
+    def live_pid(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        return child.pid
+
+    def write_lock(self, pid, seconds_ago, **fields):
+        started = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=seconds_ago)
+        content = {"host": socket.gethostname(), "pid": pid, "started": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   "container": False, "machine": machine_id(), "machine_source": "machine-id",
+                   "boot": self.OTHER_BOOT, "flock": False, "device": 1}
+        content.update(fields)
+        content = {key: value for key, value in content.items() if value is not None}
+        write_bytes(self.lock_file(), json.dumps(content).encode("utf-8"))
+        return content
+
+    def test_a_lock_from_before_the_last_reboot_is_taken_over_at_once(self):
+        live = self.live_pid()
+        for flock in (False, True):
+            with self.subTest(flock=flock):
+                self.write_lock(live, 10, flock=flock)
+                warnings = []
+                with mock.patch("vidfunnel.record.in_container", return_value=False):
+                    with FolderLock(self.base, warn=warnings.append):
+                        content = json.loads(self.lock_file().read_text(encoding="utf-8"))
+                        self.assertEqual(content["pid"], os.getpid())
+                self.assertEqual(len(warnings), 1, warnings)
+                self.assertIn("taking over lock '{}'".format(self.lock_file()), warnings[0])
+                self.assertIn("host '{}' pid {}".format(socket.gethostname(), live), warnings[0])
+                self.assertIn("ran before this machine's last reboot", warnings[0])
+                self.assertRegex(warnings[0], r"lock written 1[0-9] s ago")
+                self.assertFalse(self.lock_file().exists())
+
+    def test_a_container_lock_from_before_the_last_reboot_is_taken_over_too(self):
+        self.write_lock(1, 10, host="0123abcdef45", container=True)
+        warnings = []
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with FolderLock(self.base, warn=warnings.append):
+                pass
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("a container run on host '0123abcdef45' pid 1", warnings[0])
+        self.assertIn("ran before this machine's last reboot", warnings[0])
+
+    def assert_not_the_reboot_rule(self, **fields):
+        """A fresh lock with a live pid stays held; at 25 h it is a stale lock, never the reboot message."""
+        live = self.live_pid()
+        held = self.write_lock(live, 10, **fields)
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with self.assertRaises(LockHeld) as caught:
+                with FolderLock(self.base, warn=self.fail):
+                    pass
+        self.assertNotIn("reboot", str(caught.exception))
+        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), held)
+        self.write_lock(live, 25 * 3600, **fields)
+        warnings = []
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with FolderLock(self.base, warn=warnings.append):
+                pass
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("stale lock", warnings[0])
+        self.assertNotIn("reboot", warnings[0])
+
+    def test_a_machine_from_the_boot_id_fallback_proves_nothing(self):
+        self.assert_not_the_reboot_rule(machine_source="boot-id", boot=machine_id())
+
+    def test_a_lock_without_machine_source_whose_machine_is_its_boot_proves_nothing(self):
+        self.assert_not_the_reboot_rule(machine_source=None, boot=machine_id())
+
+    def test_machine_source_decides_when_present(self):
+        """machine_source 'boot-id' wins over a machine that differs from the boot id."""
+        self.assert_not_the_reboot_rule(machine_source="boot-id")
+
+    def test_a_lock_without_machine_source_whose_machine_differs_from_its_boot_is_judged(self):
+        self.write_lock(self.live_pid(), 10, machine_source=None)
+        warnings = []
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with FolderLock(self.base, warn=warnings.append):
+                pass
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("ran before this machine's last reboot", warnings[0])
+
+    def test_another_machine_with_another_boot_id_waits_for_the_age_rule(self):
+        self.assert_not_the_reboot_rule(machine="another-machine")
+
+    def test_our_boot_id_is_not_a_reboot(self):
+        """Same machine, same boot, flock false, live pid: the pid rule, as before."""
+        live = self.live_pid()
+        self.write_lock(live, 10, boot=Path("/proc/sys/kernel/random/boot_id").read_text().strip())
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with self.assertRaises(LockHeld) as caught:
+                with FolderLock(self.base, warn=self.fail):
+                    pass
+        self.assertIn("its pid {} is running here".format(live), str(caught.exception))
+
+    def test_a_lock_without_a_boot_id_is_not_a_reboot(self):
+        self.assert_not_the_reboot_rule(boot=None)
 
 
 class BandTests(unittest.TestCase):

@@ -6,7 +6,7 @@ per source file, named after the full source file name including its extension
 Records are the authority; every write is atomic (temp file, then os.replace).
 """
 
-VERSION = "20261108"
+VERSION = "20261109"
 
 import contextlib
 import datetime
@@ -356,30 +356,38 @@ def in_container():
 
 
 MACHINE_ID_FILES = ("/etc/machine-id", "/proc/sys/kernel/random/boot_id")
+MACHINE_ID_SOURCES = ("machine-id", "boot-id")  # the lock's machine_source for each of MACHINE_ID_FILES
 
 
-def machine_id():
-    """An identity of this machine for the lock file, or None when none can be found.
+def machine_identity():
+    """(identity of this machine, its source) for the lock file; (None, None) when none can be found.
 
-    /etc/machine-id, else the kernel boot id (Linux), else the hardware
-    address uuid.getnode() reports (macOS has neither file), unless that is
-    the random value getnode falls back to (multicast bit set). Two machines
-    on one share may carry the same host name (fresh installs, images); a
-    pid is judged alive or dead only when the lock was written on this very
-    machine, which the host name alone cannot tell.
+    /etc/machine-id (source 'machine-id'), else the kernel boot id (Linux;
+    'boot-id'), else the hardware address uuid.getnode() reports (macOS has
+    neither file; 'hardware'), unless that is the random value getnode falls
+    back to (multicast bit set). Two machines on one share may carry the
+    same host name (fresh installs, images); a pid is judged alive or dead
+    only when the lock was written on this very machine, which the host
+    name alone cannot tell. Only a 'machine-id' identity outlives a reboot
+    while the boot id changes, which the reboot rule of FolderLock needs.
     """
-    for path in MACHINE_ID_FILES:
+    for path, source in zip(MACHINE_ID_FILES, MACHINE_ID_SOURCES):
         try:
             with open(path, encoding="ascii", errors="replace") as handle:
                 value = handle.read().strip()
         except OSError:
             continue
         if value:
-            return value
+            return value, source
     node = uuid.getnode()
     if (node >> 40) & 1:  # a random 48-bit value, not a hardware address
-        return None
-    return "node-{:012x}".format(node)
+        return None, None
+    return "node-{:012x}".format(node), "hardware"
+
+
+def machine_id():
+    """An identity of this machine for the lock file, or None when none can be found (see machine_identity)."""
+    return machine_identity()[0]
 
 
 BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"
@@ -502,11 +510,33 @@ def _unjudged_reason(host, holder_in_container, ours, pid):
     return "its pid cannot be checked; taken over once 24 h old"
 
 
+def _written_before_reboot(holder, content):
+    """True when the lock was written on this machine during an earlier boot, so its holder cannot run.
+
+    The lock's machine must equal ours and come from /etc/machine-id, which
+    stays the same across reboots: its machine_source says 'machine-id',
+    or, in a lock without machine_source, its machine differs from its boot
+    (machine_id() falls back to the boot id itself, and then a differing boot
+    id says nothing about the machine). Its boot id must be present and
+    differ from ours: a boot id is new on every boot.
+    """
+    machine = holder.get("machine")
+    boot = holder.get("boot")
+    if content["machine"] is None or machine != content["machine"]:
+        return False
+    if content["boot"] is None or not isinstance(boot, str) or not boot or boot == content["boot"]:
+        return False
+    if "machine_source" in holder:
+        return holder["machine_source"] == "machine-id"
+    return machine != boot
+
+
 class FolderLock:
     """Context manager holding '.vidfunnel/lock' for one folder.
 
     The lock file holds host (socket.gethostname()), machine (machine_id()),
-    pid, started (ISO time), container (True when this run is inside a
+    machine_source ('machine-id', 'boot-id' or 'hardware', see
+    machine_identity), pid, started (ISO time), container (True when this run is inside a
     container: '/run/.containerenv' or '/.dockerenv' exists), boot (boot_id()),
     device (the lock file's st_dev as the holder sees it) and flock (True
     when the holder holds flock(LOCK_EX) on the lock file).
@@ -530,7 +560,18 @@ class FolderLock:
     false (fcntl missing, or a file system that refuses flock) is judged by
     the rules below.
 
-    Every such lock is taken over, with a warning, once it is 24 h old
+    A lock written on this machine (its machine, from /etc/machine-id, is
+    ours) under another boot id was written before this machine's last
+    reboot: no process of that boot runs any more, so it is taken over at
+    once with a message saying so, before the pid rule (a pid reused since
+    the reboot must not count as alive) and before the age rule. A machine
+    that came from the boot id fallback (machine_source 'boot-id', or, in a
+    lock without machine_source, machine equal to boot) says nothing about
+    the machine, so such a lock is left to the rules below. A container run
+    sees the host's /etc/machine-id only when it is mounted in (the
+    vidfunnel-podman wrapper does).
+
+    Every other lock is taken over, with a warning, once it is 24 h old
     (stale_seconds); younger ones raise LockHeld. The pid can only shorten
     that wait, never lengthen it: when the lock was written on this host
     name and on the same side of the container boundary, a holder that no
@@ -681,8 +722,10 @@ class FolderLock:
 
     def acquire(self):
         record_dir(self.folder).mkdir(parents=True, exist_ok=True)
+        machine, machine_source = machine_identity()
         content = {"host": socket.gethostname(), "pid": os.getpid(), "started": now_iso(),
-                   "container": in_container(), "machine": machine_id(), "boot": boot_id()}
+                   "container": in_container(), "machine": machine, "machine_source": machine_source,
+                   "boot": boot_id()}
         try:
             self._create(content)
         except FileExistsError:
@@ -716,13 +759,18 @@ class FolderLock:
                 raise self._held(holder, age, "its holder, or a process it started, still holds the lock file's "
                                  "flock on this machine; not taken over while it does, whatever its age")
             liveness = None
+            rebooted = judgement is None and _written_before_reboot(holder, content)
             same_machine = content["machine"] is not None and holder.get("machine") == content["machine"]
-            if (judgement is None and host == content["host"] and same_machine
+            if (judgement is None and not rebooted and host == content["host"] and same_machine
                     and holder_in_container == content["container"] and pid != content["pid"]):
                 liveness = pid_alive(pid)
             if judgement == "free":
                 warning = ("warning: taking over lock '{}': its holder, {} '{}' pid {}, has exited (nothing "
                            "holds the lock file's flock; lock written {} s ago)".format(
+                               self.path, holder_words, host, pid, _whole_seconds(age)))
+            elif rebooted:
+                warning = ("warning: taking over lock '{}': its holder, {} '{}' pid {}, ran before this "
+                           "machine's last reboot (lock written {} s ago)".format(
                                self.path, holder_words, host, pid, _whole_seconds(age)))
             elif liveness is False:
                 warning = ("warning: taking over lock '{}': its holder, host '{}' pid {}, no longer runs "

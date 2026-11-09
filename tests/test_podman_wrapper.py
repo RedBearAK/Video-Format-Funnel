@@ -23,6 +23,11 @@ WRAPPER = REPO_ROOT / "bin" / "vidfunnel-podman"
 PLAIN_LAUNCHER = REPO_ROOT / "bin" / "vidfunnel"
 SHELL_BINARY = shutil.which("sh")
 
+# The wrapper mounts the host's machine id read-only when the file exists and is not
+# empty; the folder-mount tests leave that mount out of what they compare.
+MACHINE_ID_MOUNT = "/etc/machine-id:/etc/machine-id:ro"
+HOST_HAS_MACHINE_ID = os.path.isfile("/etc/machine-id") and os.path.getsize("/etc/machine-id") > 0
+
 # The fake engine writes the arguments of 'run' and 'build' one per line to
 # FAKE_ENGINE_LOG and appends every invocation, one line each, to FAKE_CALL_LOG.
 # Containers are folders under FAKE_STATE_DIR: 'run -d' makes one (status, exit
@@ -417,7 +422,7 @@ class HomeTests(WrapperTestCase):
         code, output = self.run_wrapper("check")
         self.assertEqual(code, 0, output)
         argv = self.engine_argv()
-        self.assertEqual(argv.count("-v"), 1, argv)
+        self.assertEqual(argv.count("-v"), 2 if HOST_HAS_MACHINE_ID else 1, argv)
         self.assert_pair(argv, "-v", "{0}:{0}".format(self.workdir))
         self.assertTrue(self.state_dir.is_dir())
 
@@ -447,6 +452,33 @@ class HomeTests(WrapperTestCase):
         code, output = self.run_wrapper("check")
         self.assertNotEqual(code, 0)
         self.assertIn("'{}'".format(self.state_dir), output)
+        self.assertFalse(self.engine_log.exists())
+
+
+class MachineIdTests(WrapperTestCase):
+    """The host's /etc/machine-id is mounted read-only, so container locks name this machine."""
+
+    @unittest.skipUnless(HOST_HAS_MACHINE_ID, "this host has no non-empty /etc/machine-id")
+    def test_attached_and_detached_runs_mount_the_machine_id_read_only(self):
+        for arguments in (("check",), ("plan", ".")):
+            with self.subTest(arguments=arguments):
+                code, output = self.run_wrapper(*arguments)
+                self.assertEqual(code, 0, output)
+                argv = self.engine_argv()
+                self.assert_pair(argv, "-v", MACHINE_ID_MOUNT)
+                self.assertEqual(argv.count(MACHINE_ID_MOUNT), 1, argv)
+                self.assertLess(argv.index(MACHINE_ID_MOUNT), argv.index("localhost/vidfunnel:latest"),
+                                "the mount is an engine option, before the image and vidfunnel's arguments")
+
+    @unittest.skipIf(HOST_HAS_MACHINE_ID, "this host has a non-empty /etc/machine-id")
+    def test_no_machine_id_mount_without_the_file(self):
+        code, output = self.run_wrapper("check")
+        self.assertEqual(code, 0, output)
+        self.assertNotIn(MACHINE_ID_MOUNT, self.engine_argv())
+
+    def test_ffmpeg_is_still_refused_before_the_engine(self):
+        code, output = self.run_wrapper("--ffmpeg", "/usr/bin/ffmpeg", "check")
+        self.assertEqual(code, 1, output)
         self.assertFalse(self.engine_log.exists())
 
 
@@ -707,7 +739,7 @@ class PhysicalPathTests(WrapperTestCase):
 
     def mounts(self):
         argv = self.engine_argv()
-        return [second for first, second in zip(argv, argv[1:]) if first == "-v"]
+        return [second for first, second in zip(argv, argv[1:]) if first == "-v" and second != MACHINE_ID_MOUNT]
 
     def assert_mounted(self, path):
         self.assertIn("{0}:{0}".format(path), self.mounts())
@@ -833,7 +865,7 @@ class PathOptionTests(WrapperTestCase):
 
     def mounts(self):
         argv = self.engine_argv()
-        return [second for first, second in zip(argv, argv[1:]) if first == "-v"]
+        return [second for first, second in zip(argv, argv[1:]) if first == "-v" and second != MACHINE_ID_MOUNT]
 
     def assert_db_prepared(self, *arguments):
         db_folder = self.elsewhere / "index-folder"
