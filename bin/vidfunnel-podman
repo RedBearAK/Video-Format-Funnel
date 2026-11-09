@@ -175,9 +175,10 @@ Wrapper commands (handled by the wrapper, not passed to vidfunnel):
   Following in attach and stop handles Ctrl+C, SIGHUP and SIGTERM as above.
   'stop' is for this host only: a path argument (an existing file or folder, or
   anything with a '/') is refused. vidfunnel's own 'stop-all PATH...' stops
-  every run under PATH on every host, through the share, and 'resume PATH...'
-  lifts that (deleting PATH/.vidfunnel/stop does the same); both run in the
-  container, attached, like 'check'.
+  every plan, convert, verify and retire run under PATH on every host,
+  through the share, and 'resume PATH...' lifts that (deleting
+  PATH/.vidfunnel/stop does the same); both run in the container, attached,
+  like 'check'.
   Installed as 'vidfunnel', these are 'vidfunnel attach' and 'vidfunnel stop'.
 
 Environment:

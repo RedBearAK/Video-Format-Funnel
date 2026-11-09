@@ -1,6 +1,6 @@
 """Tests for vidfunnel.stopfile: 'stop-all' and 'resume', the walk up to the root, and what a stop file does."""
 
-VERSION = "20261108"
+VERSION = "20261109"
 
 import contextlib
 import io
@@ -83,6 +83,34 @@ class WalkTests(StopFileCase):
         _path, data = find_stop(self.nested)
         self.assertEqual(data["mode"], "drain")
         self.assertTrue(data["unreadable"])
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "os.mkfifo is not available here")
+    def test_a_fifo_at_the_stop_path_is_a_drain_and_is_never_opened(self):
+        """Opening a FIFO waits for a writer; the check must return at once and name the path."""
+        (self.library / RECORD_DIR).mkdir()
+        fifo = stop_path(str(self.library))
+        os.mkfifo(fifo)
+        outcome = []
+        errors = io.StringIO()
+
+        def check():
+            outcome.append(check_item(self.nested))
+
+        with contextlib.redirect_stderr(errors):
+            thread = threading.Thread(target=check, daemon=True)
+            thread.start()
+            thread.join(1.0)
+            hung = thread.is_alive()
+            if hung:  # a writer releases the open() that waits for one, so the thread can end
+                with open(fifo, "w"):
+                    pass
+                thread.join(5.0)
+        self.assertFalse(hung, "the check waited on the FIFO for more than a second")
+        self.assertEqual(outcome, ["drain"])
+        self.assertTrue(draining.is_set())
+        self.assertIn("'{}' (it could not be read as a regular file, taken as drain)".format(fifo), errors.getvalue())
+        message = refusal([str(self.nested)])
+        self.assertIn("could not be read as a regular file", message)
 
     def test_resume_removes_the_file_and_says_when_there_is_none(self):
         self.stop_all(self.library)

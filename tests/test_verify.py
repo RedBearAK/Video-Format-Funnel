@@ -19,6 +19,7 @@ import io
 import json
 import os
 import shutil
+import sys
 import tempfile
 import types
 import unittest
@@ -518,6 +519,221 @@ class VerifyAgainTest(unittest.TestCase):
         self.assertEqual(on_disk["score"], 100)
         self.assertIn("now has status 'retired'", args.stream.getvalue())
         self.assertIn("1 skipped", args.stream.getvalue())
+
+
+    def test_the_counting_lines_carry_the_item_tag_and_go_to_the_item_stream(self):
+        """count_frames gets the item's progress: its start line is tagged and goes where the item's lines go."""
+        import vidfunnel.probe
+        args = argparse.Namespace(paths=[str(self.root)], ffmpeg=None, quiet=False, verbose=False, log=None,
+                                  yes=False, ssim_check=False, ssim_threshold=0.97, samples=None,
+                                  stream=io.StringIO())
+        stdout = io.StringIO()
+        with unittest.mock.patch.object(vidfunnel.probe, "ANNOUNCE_BYTES", 0), contextlib.redirect_stdout(stdout):
+            run(args)
+        counting = [line for line in args.stream.getvalue().splitlines() if "counting packets" in line]
+        self.assertEqual(len(counting), 2, "the output's count and the source's count:\n{}".format(
+            args.stream.getvalue()))
+        for line in counting:
+            self.assertTrue(line.startswith("[verify 1/1] counting packets of stream "), line)
+        self.assertNotIn("counting packets", stdout.getvalue())
+
+
+class StopCase(unittest.TestCase):
+    """Clean drain flags and stop-file state around each test."""
+
+    def setUp(self):
+        import vidfunnel.interrupt
+        import vidfunnel.stopfile
+        for flag in (vidfunnel.interrupt.interrupted, vidfunnel.interrupt.draining):
+            flag.clear()
+            self.addCleanup(flag.clear)
+        vidfunnel.interrupt.drain_tally.reset()
+        self.addCleanup(vidfunnel.interrupt.drain_tally.reset)
+        vidfunnel.stopfile.reset()
+        self.addCleanup(vidfunnel.stopfile.reset)
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "library"
+        self.root.mkdir()
+
+    def tally(self):
+        import vidfunnel.interrupt
+        tally = vidfunnel.interrupt.drain_tally
+        return tally.seen, tally.finished, tally.left
+
+
+class VerifyDrainTests(StopCase):
+    """verify's loop asks for a drain before each folder and each record; hand-written records, no ffmpeg."""
+
+    LAYOUT = (("first", "harbour"), ("second", "meadow"), ("second", "orchard"), ("third", "valley"))
+
+    def setUp(self):
+        from vidfunnel.record import new_record
+        StopCase.setUp(self)
+        for folder, stem in self.LAYOUT:
+            source = self.root / folder / (stem + ".avi")
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(b"hand-written source " * 64)
+            record = new_record(source)
+            set_status(record, "converted")
+            record["output"]["name"] = stem + ".mp4"
+            save_record(source, record)
+
+    def verify_drained_in(self, draining_stem):
+        """verify.run with verify_record replaced; the drain begins in `draining_stem`'s record.
+
+        Returns (stems verified, folders locked)."""
+        import vidfunnel.interrupt
+        import vidfunnel.verify as verify_module
+        verified = []
+        locked = []
+        real_lock = verify_module.FolderLock
+
+        def lock(folder, *rest, **options):
+            locked.append(Path(folder).name)
+            return real_lock(folder, *rest, **options)
+
+        def verify_one(tools, key, record, options, progress=None):
+            verified.append(Path(key).stem)
+            if verified[-1] == draining_stem:
+                vidfunnel.interrupt.draining.set()
+            return dict(record, status="verified", score=95)
+
+        args = argparse.Namespace(paths=[str(self.root)], ffmpeg=None, quiet=True, verbose=False, log=None,
+                                  yes=False, ssim_check=False, ssim_threshold=0.97, samples=None,
+                                  stream=io.StringIO())
+        with unittest.mock.patch("vidfunnel.deps.require", return_value=None), \
+                unittest.mock.patch.object(verify_module, "FolderLock", side_effect=lock), \
+                unittest.mock.patch.object(verify_module, "verify_record", side_effect=verify_one):
+            run(args)
+        return verified, locked
+
+    def test_a_drain_in_the_last_record_of_a_folder_takes_no_further_folder_lock(self):
+        self.assertEqual(self.verify_drained_in("harbour"), (["harbour"], ["first"]))
+        self.assertEqual(self.tally(), (True, 1, 3))
+
+    def test_a_drain_in_a_record_starts_no_further_record_of_its_folder(self):
+        self.assertEqual(self.verify_drained_in("meadow"), (["harbour", "meadow"], ["first", "second"]))
+        self.assertEqual(self.tally(), (True, 1, 2))
+
+    def test_a_now_stop_file_stops_before_the_next_record(self):
+        import vidfunnel.stopfile
+        from vidfunnel.record import _write_json_atomic
+        _write_json_atomic(vidfunnel.stopfile.stop_path(str(self.root / "second")),
+                           {"host": "elsewhere", "requested": None, "mode": "now"})
+        with unittest.mock.patch("sys.stderr", io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                self.verify_drained_in(None)
+        self.assertTrue(vidfunnel.stopfile.stopped_now)
+
+
+STOP_FIXTURES = (REMUX_FIXTURE, MP4_FIXTURE, SUBTITLE_FIXTURE)
+
+
+@unittest.skipIf(TOOLS is None or not hasattr(os, "killpg"),
+                 "ffmpeg not found on PATH (or no process groups); verify stop integration tests skipped")
+class VerifyStopIntegrationTests(StopCase):
+    """'vidfunnel verify' in a process of its own, stopped while its first record's decode runs.
+
+    The --ffmpeg stand-in sleeps 3 s before each null decode and then runs
+    the real ffmpeg, so the first record is still in progress when the
+    signal or the stop file comes.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.template = None
+        if [name for name in STOP_FIXTURES if not os.path.exists(os.path.join(FIXTURE_DIR, name))]:
+            return
+        cls.template = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.template.cleanup)
+        library = Path(cls.template.name) / "library"
+        library.mkdir()
+        convert_folder(library, STOP_FIXTURES)
+        fake_bin = Path(cls.template.name) / "bin"
+        fake_bin.mkdir()
+        stand_in = fake_bin / "ffmpeg"
+        stand_in.write_text('#!/bin/sh\ncase " $* " in *" -f null "*) sleep 3 ;; esac\nexec {} "$@"\n'.format(
+            TOOLS.ffmpeg), encoding="utf-8")
+        os.chmod(str(stand_in), 0o755)
+        os.symlink(TOOLS.ffprobe, str(fake_bin / "ffprobe"))
+        cls.stand_in = str(stand_in)
+
+    def setUp(self):
+        StopCase.setUp(self)
+        if self.template is None:
+            self.skipTest("fixtures missing; run tests/make_fixtures.sh")
+        os.rmdir(str(self.root))
+        shutil.copytree(str(Path(self.template.name) / "library"), str(self.root), symlinks=True)
+        self.environment = dict(os.environ, PYTHONPATH=REPO_ROOT,
+                                XDG_CACHE_HOME=str(Path(self.temporary.name) / "cache"))
+        self.before = self.record_files()
+
+    def record_files(self):
+        folder = self.root / ".vidfunnel"
+        return {path.name: path.read_bytes() for path in folder.glob("*.json") if path.name != "folder.json"}
+
+    def run_stopped(self, act):
+        import signal
+        import subprocess
+        import time
+        process = subprocess.Popen([sys.executable, "-m", "vidfunnel", "--ffmpeg", self.stand_in, "verify",
+                                    str(self.root)], cwd=REPO_ROOT, env=self.environment, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                                   start_new_session=True)
+        self.addCleanup(lambda: process.poll() is None and os.killpg(process.pid, signal.SIGKILL))
+        lines = []
+        for line in process.stdout:
+            lines.append(line)
+            if "[verify 1/3]" in line:
+                break
+        else:
+            process.wait(30)
+            self.fail("'[verify 1/3]' never appeared; output:\n{}".format("".join(lines)))
+        time.sleep(0.5)
+        act(process)
+        started = time.monotonic()
+        rest, errors = process.communicate(timeout=120)
+        return process.returncode, "".join(lines) + rest, errors, time.monotonic() - started
+
+    def stop_all(self, *options):
+        import subprocess
+        result = subprocess.run([sys.executable, "-m", "vidfunnel", "stop-all"] + list(options) + [str(self.root)],
+                                cwd=REPO_ROOT, env=self.environment, capture_output=True, universal_newlines=True,
+                                timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def changed(self):
+        after = self.record_files()
+        self.assertEqual(sorted(after), sorted(self.before))
+        self.assertFalse((self.root / ".vidfunnel" / "lock").exists(), "a lock was left behind")
+        return sorted(name for name in after if after[name] != self.before[name])
+
+    def test_verify_drained_by_sigusr1(self):
+        import signal
+        code, output, errors, _seconds = self.run_stopped(lambda process: os.kill(process.pid, signal.SIGUSR1))
+        self.assertEqual(code, 0, "stdout:\n{}\nstderr:\n{}".format(output, errors))
+        self.assertIn("vidfunnel: drained: finished 1 in progress, started no more (2 not started)", errors)
+        changed = self.changed()
+        self.assertEqual(len(changed), 1, changed)
+        self.assertEqual(load_record(self.root / changed[0][:-len(".json")])["stages"]["verify"]["decode"]["returncode"],
+                         0)
+
+    def test_verify_drained_by_a_stop_file(self):
+        code, output, errors, _seconds = self.run_stopped(lambda process: self.stop_all())
+        self.assertEqual(code, 0, "stdout:\n{}\nstderr:\n{}".format(output, errors))
+        self.assertIn("(drain): finishing the items in progress, starting no more", errors)
+        # The first record's next ffprobe finds the file (check_now), so that record counts as in progress.
+        self.assertIn("vidfunnel: drained: finished 1 in progress, started no more (2 not started)", errors)
+        self.assertEqual(len(self.changed()), 1)
+
+    def test_verify_stopped_by_a_now_stop_file(self):
+        code, output, errors, seconds = self.run_stopped(lambda process: self.stop_all("--now"))
+        self.assertEqual(code, 1, "stdout:\n{}\nstderr:\n{}".format(output, errors))
+        self.assertIn("(now): stopping now", errors)
+        self.assertIn("vidfunnel: stopped (a stop file asked for it)", errors)
+        self.assertLess(seconds, 10.0)
+        self.assertEqual(self.changed(), [], "a record was written by a verify that was stopped")
 
 
 if __name__ == "__main__":

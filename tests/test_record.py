@@ -959,12 +959,43 @@ class FlockHolderTests(TempDirCase):
         """plan --jobs holds several folder locks at once; every child gets all of them."""
         from vidfunnel.ffmpeg import run
         other = self.base / "other"
+        check = "import os, sys\nfor number in sys.argv[1:]:\n    os.fstat(int(number))\n"
         with FolderLock(self.base) as first, FolderLock(other) as second:
-            check = "import os, sys\nfor number in sys.argv[1:]:\n    os.fstat(int(number))\n"
+            # Taken inside the block: release() sets handle to None.
+            released = first.handle
             completed = run([sys.executable, "-c", check, str(first.handle), str(second.handle)], check=False)
             self.assertEqual(completed.returncode, 0, completed.stderr)
-        completed = run([sys.executable, "-c", check, str(first.handle)], check=False)
+        self.assertIsInstance(released, int)
+        completed = run([sys.executable, "-c", check, str(released)], check=False)
         self.assertNotEqual(completed.returncode, 0, "a released lock's descriptor is passed no more")
+        self.assertIn("Bad file descriptor", completed.stderr)
+
+    def test_release_reads_the_lock_through_its_own_descriptor(self):
+        """release() never opens the lock path (on NFS a close of any descriptor can drop the flock)."""
+        import builtins
+        lock = FolderLock(self.base, warn=self.fail)
+        lock.acquire()
+        lock_path = str(lock.path)
+        real_open = builtins.open
+        real_os_open = os.open
+        opened = []
+
+        def refuse_open(file, *args, **kwargs):
+            if isinstance(file, (str, os.PathLike)) and os.fspath(file) == lock_path:
+                opened.append(file)
+                raise PermissionError("the test refuses to open '{}'".format(lock_path))
+            return real_open(file, *args, **kwargs)
+
+        def refuse_os_open(path, *args, **kwargs):
+            if os.fspath(path) == lock_path:
+                opened.append(path)
+                raise PermissionError("the test refuses to open '{}'".format(lock_path))
+            return real_os_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", refuse_open), mock.patch("os.open", refuse_os_open):
+            lock.release()
+        self.assertEqual(opened, [], "release() opened the lock path")
+        self.assertFalse(os.path.exists(lock_path), "release() left the lock file in place")
 
     def test_an_orphaned_child_keeps_the_lock_until_it_exits(self):
         """The holder is killed while its 'ffmpeg' runs; the lock stays held until that child ends."""

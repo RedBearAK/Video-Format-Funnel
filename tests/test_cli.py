@@ -1,6 +1,6 @@
 """Tests for the command-line entry points: --version, dispatch, the launcher."""
 
-VERSION = "20261108"
+VERSION = "20261109"
 
 import contextlib
 import errno
@@ -449,7 +449,7 @@ class SigtermTests(unittest.TestCase):
 
         code, _out, err = self.run_with_dispatch(dispatch)
         self.assertEqual(code, 0)
-        self.assertIn("'check' does not stop between items; it ran to its end", err)
+        self.assertIn("'check': it has no items to stop between; it ran to its end", err)
 
     def test_sigterm_during_a_drain_stops_now(self):
         self.capture_fd2()

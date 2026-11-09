@@ -1285,6 +1285,76 @@ class WriteParityTest(unittest.TestCase):
             self.assertEqual(check.returncode, 0, check.stdout)
 
 
+class Par2StandInTest(unittest.TestCase):
+    """write_par2 with a stand-in par2 on PATH: what the child inherits and when it is not started."""
+
+    def setUp(self):
+        import vidfunnel.stopfile
+        from vidfunnel.interrupt import interrupted
+        self.addCleanup(interrupted.clear)
+        self.addCleanup(vidfunnel.stopfile.reset)
+        holder = tempfile.TemporaryDirectory(prefix="vidfunnel-par2-test-")
+        self.addCleanup(holder.cleanup)
+        self.folder = Path(holder.name) / "library"
+        self.folder.mkdir()
+        self.marker = Path(holder.name) / "par2-started"
+        fake_bin = Path(holder.name) / "bin"
+        fake_bin.mkdir()
+        stand_in = fake_bin / "par2"
+        # Fails unless the descriptor named in HELD_DESCRIPTOR is open, then writes the index file par2 would.
+        stand_in.write_text("#!{}\nimport os, sys\nopen({!r}, 'w').close()\n"
+                            "os.fstat(int(os.environ['HELD_DESCRIPTOR']))\n"
+                            "open(sys.argv[sys.argv.index('--') + 1], 'w').close()\n".format(
+                                sys.executable, str(self.marker)), encoding="utf-8")
+        os.chmod(str(stand_in), 0o755)
+        path = unittest.mock.patch.dict(os.environ, {"PATH": "{}:{}".format(fake_bin, os.environ.get("PATH", ""))})
+        path.start()
+        self.addCleanup(path.stop)
+        self.output = self.folder / "harbour.mp4"
+        self.output.write_bytes(b"converted output " * 256)
+
+    def test_par2_inherits_the_folder_lock_descriptor(self):
+        from vidfunnel.record import FolderLock
+        with FolderLock(self.folder) as lock:
+            with unittest.mock.patch.dict(os.environ, {"HELD_DESCRIPTOR": str(lock.handle)}):
+                files = write_par2(self.output, 5, progress=quiet())
+        self.assertTrue(self.marker.exists())
+        self.assertEqual([path.name for path in files], ["harbour.mp4.par2"])
+
+    def test_par2_is_not_started_under_a_now_stop_file(self):
+        import vidfunnel.stopfile
+        from vidfunnel.record import _write_json_atomic
+        _write_json_atomic(vidfunnel.stopfile.stop_path(str(self.folder)),
+                           {"host": "elsewhere", "requested": None, "mode": "now"})
+        vidfunnel.stopfile._current.folder = str(self.folder)  # this thread's item, as check_item sets it
+        with unittest.mock.patch.dict(os.environ, {"HELD_DESCRIPTOR": "0"}), \
+                unittest.mock.patch("sys.stderr", io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                write_par2(self.output, 5, progress=quiet())
+        self.assertFalse(self.marker.exists(), "par2 was started under a 'now' stop file")
+
+
+class LineStreamPipeTest(unittest.TestCase):
+    def test_a_tagged_line_stream_over_a_closed_pipe_ends_quietly(self):
+        """The reader of stdout is gone: the lines are dropped and the run exits 0, without Python's
+        'Exception ignored on flushing sys.stdout' and exit status 120 (needs _LineStream.fileno)."""
+        script = ("import sys\n"
+                  "from vidfunnel.encode import _LineStream\n"
+                  "from vidfunnel.progress import say, tagged\n"
+                  "sys.stdin.readline()\n"
+                  "stream = tagged(_LineStream(sys.stdout), '[convert 1/2]')\n"
+                  "for number in range(3):\n"
+                  "    say('line {}'.format(number), stream)\n"
+                  "print('after the lines')\n")
+        process = subprocess.Popen([sys.executable, "-c", script], cwd=REPO_ROOT,
+                                   env=dict(os.environ, PYTHONPATH=REPO_ROOT), stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        process.stdout.close()  # the reader is gone before the first line is written
+        _out, errors = process.communicate("go\n", timeout=30)
+        self.assertNotIn("BrokenPipeError", errors)
+        self.assertEqual(process.returncode, 0, errors)
+
+
 if __name__ == "__main__":
     unittest.main()
 

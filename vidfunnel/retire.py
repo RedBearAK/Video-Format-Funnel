@@ -29,6 +29,14 @@ sidecar name taken by another file is checked by the
 'retire' stage and the status 'retired', and stays where it is as the audit
 trail. Output files are never removed, and records that are not 'verified'
 are never touched.
+
+`run` asks vidfunnel.interrupt.drain_before_next before each folder and each
+source, which also looks for a stop file above the folder: on a drain
+(SIGUSR1, 'stop-all') no further source is started, and a 'now' stop file
+stops the run as Ctrl+C would. A source already started is not stopped by a
+stop file: its folder is forgotten for vidfunnel.stopfile.check_now
+(forget_item), so the PAR2 redo, which runs after the original has been
+moved, is never cut off by one and the item is not left half done.
 """
 
 VERSION = "20261109"
@@ -40,6 +48,7 @@ import sys
 import types
 from pathlib import Path
 
+from vidfunnel.interrupt import drain_after_item, drain_before_next
 from vidfunnel.progress import Progress, StageSummary, is_tty, say
 from vidfunnel.record import (
     FolderLock,
@@ -56,6 +65,7 @@ from vidfunnel.record import (
     set_status,
     sha256_file,
 )
+from vidfunnel.stopfile import forget_item
 
 GUARDS = (
     "no-record",
@@ -772,7 +782,11 @@ def run(args):
     position = 0
 
     if not destroy:
-        for folder, members in groups:
+        drained = False
+        for group_number, (folder, members) in enumerate(groups):
+            later = sum(len(after) for _folder, after in groups[group_number + 1:])
+            if drain_before_next(len(members) + later, folder):
+                break
             try:
                 lock = FolderLock(folder)
                 lock.acquire()
@@ -783,14 +797,21 @@ def run(args):
                 position += len(members)
                 continue
             try:
-                for candidate in members:
+                for member_number, candidate in enumerate(members):
+                    if drain_before_next(len(members) - member_number + later, folder):
+                        drained = True
+                        break
+                    forget_item()
                     position += 1
                     prefix = "[retire {}/{}]".format(position, total)
                     say("{} '{}' -> quarantine".format(prefix, candidate.display))
                     _retire_candidate(candidate, prefix, quarantine_dir, False, allow_review, quiet,
                                       summary, problems, allow_larger)
+                    drain_after_item()
             finally:
                 lock.release()
+            if drained:
+                break
     else:
         with contextlib.ExitStack() as stack:
             held = []
@@ -805,7 +826,10 @@ def run(args):
                     continue
                 held.extend(members)
             eligible = []
-            for candidate in held:
+            for number, candidate in enumerate(held):
+                if drain_before_next(len(held) - number, candidate.folder):
+                    break
+                forget_item()
                 position += 1
                 prefix = "[retire {}/{}]".format(position, total)
                 say("{} '{}' checking before destroy".format(prefix, candidate.display))
@@ -822,12 +846,18 @@ def run(args):
                     problems.append(str(error))
                     continue
                 eligible.append((prefix, candidate, eligibility["members"]))
-            if eligible and confirm_destroy([str(path) for _prefix, _candidate, paths in eligible
-                                             for path in paths], yes=yes):
-                for prefix, candidate, _paths in eligible:
+            if eligible and drain_before_next(len(eligible)):
+                pass  # drained during the checks: nothing is destroyed, the checked sources count as not started
+            elif eligible and confirm_destroy([str(path) for _prefix, _candidate, paths in eligible
+                                               for path in paths], yes=yes):
+                for number, (prefix, candidate, _paths) in enumerate(eligible):
+                    if drain_before_next(len(eligible) - number, candidate.folder):
+                        break
+                    forget_item()
                     say("{} '{}' -> destroy".format(prefix, candidate.display))
                     _retire_candidate(candidate, prefix, quarantine_dir, True, allow_review, quiet,
                                       summary, problems, allow_larger)
+                    drain_after_item()
             elif eligible:
                 summary.add("cancelled", len(eligible))
             elif not quiet:

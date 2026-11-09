@@ -803,6 +803,216 @@ class RunTests(RetireCase):
         self.assertNotIn(str(self.beach_source), listing.split("permanently delete")[1])
 
 
+class StopCase(unittest.TestCase):
+    """Clean drain flags, stop-file state and signal handlers around each test."""
+
+    def setUp(self):
+        import vidfunnel.interrupt
+        import vidfunnel.stopfile
+        for flag in (vidfunnel.interrupt.interrupted, vidfunnel.interrupt.draining):
+            flag.clear()
+            self.addCleanup(flag.clear)
+        vidfunnel.interrupt.drain_tally.reset()
+        self.addCleanup(vidfunnel.interrupt.drain_tally.reset)
+        vidfunnel.stopfile.reset()
+        self.addCleanup(vidfunnel.stopfile.reset)
+        self.holder = tempfile.TemporaryDirectory(prefix="vidfunnel-retire-stop-test-")
+        self.addCleanup(self.holder.cleanup)
+        self.root = Path(self.holder.name) / "library"
+
+    def tally(self):
+        import vidfunnel.interrupt
+        tally = vidfunnel.interrupt.drain_tally
+        return tally.seen, tally.finished, tally.left
+
+
+class RetireDrainTests(StopCase):
+    """retire's loops ask for a drain before each folder and each source (vidfunnel.interrupt.drain_before_next)."""
+
+    LAYOUT = (("first", "harbour"), ("second", "meadow"), ("second", "orchard"), ("third", "valley"))
+
+    def setUp(self):
+        StopCase.setUp(self)
+        for folder, stem in self.LAYOUT:
+            make_verified(self.root / folder / (stem + ".avi"), self.root / folder / (stem + ".mp4"), stem + ".mp4")
+
+    def namespace(self, *arguments):
+        parser = argparse.ArgumentParser()
+        add_arguments(parser)
+        args = parser.parse_args(list(arguments) + [str(self.root)])
+        args.quiet, args.verbose, args.yes = True, False, True
+        return args
+
+    def retire_drained_in(self, draining_stem, *arguments):
+        """Run retire with _retire_candidate replaced; the drain begins in `draining_stem`'s item.
+
+        Returns (stems started, folders locked)."""
+        import vidfunnel.interrupt
+        started = []
+        locked = []
+        real_lock = retire.FolderLock
+
+        def lock(folder, *rest, **options):
+            locked.append(Path(folder).name)
+            return real_lock(folder, *rest, **options)
+
+        def retire_candidate(candidate, *rest, **options):
+            started.append(Path(candidate.name).stem)
+            if started[-1] == draining_stem:
+                vidfunnel.interrupt.draining.set()
+
+        with mock.patch.object(retire, "FolderLock", side_effect=lock), \
+                mock.patch.object(retire, "_retire_candidate", side_effect=retire_candidate), \
+                mock.patch.object(sys, "stdout", io.StringIO()), mock.patch.object(sys, "stderr", io.StringIO()):
+            run(self.namespace(*arguments))
+        return started, locked
+
+    def test_a_drain_in_the_last_source_of_a_folder_takes_no_further_folder_lock(self):
+        self.assertEqual(self.retire_drained_in("harbour"), (["harbour"], ["first"]))
+        self.assertEqual(self.tally(), (True, 1, 3))
+
+    def test_a_drain_in_a_source_starts_no_further_source_of_its_folder(self):
+        self.assertEqual(self.retire_drained_in("meadow"), (["harbour", "meadow"], ["first", "second"]))
+        self.assertEqual(self.tally(), (True, 1, 2))
+
+    def test_a_drain_while_destroying_destroys_no_further_source(self):
+        started, locked = self.retire_drained_in("meadow", "--destroy-originals-now")
+        self.assertEqual(started, ["harbour", "meadow"])
+        self.assertEqual(locked, ["first", "second", "third"], "destroy takes every lock before it checks")
+        self.assertEqual(self.tally(), (True, 1, 2))
+
+    def test_a_drain_during_the_checks_before_destroy_destroys_nothing(self):
+        import vidfunnel.interrupt
+        checked = []
+        real_check = retire.check_eligible
+
+        def check(source, *rest, **options):
+            checked.append(Path(source).stem)
+            if checked[-1] == "meadow":
+                vidfunnel.interrupt.draining.set()
+            return real_check(source, *rest, **options)
+
+        with mock.patch.object(retire, "check_eligible", side_effect=check), \
+                mock.patch.object(retire, "confirm_destroy", return_value=True) as confirm:
+            started, _locked = self.retire_drained_in(None, "--destroy-originals-now")
+        self.assertEqual(checked, ["harbour", "meadow"])
+        self.assertEqual(started, [])
+        confirm.assert_not_called()
+        self.assertEqual(self.tally(), (True, 0, 4), "two never checked, two checked and not destroyed")
+
+    def test_a_now_stop_file_written_during_a_source_does_not_cut_it_short(self):
+        """The PAR2 redo runs after the original has moved; only the next source sees the stop file."""
+        import vidfunnel.stopfile
+        from vidfunnel.record import _write_json_atomic
+        finished = []
+
+        def retire_candidate(candidate, *rest, **options):
+            _write_json_atomic(vidfunnel.stopfile.stop_path(str(self.root)),
+                               {"host": "elsewhere", "requested": None, "mode": "now"})
+            vidfunnel.stopfile.raise_if_stopped_now("par2")  # what write_par2 does before par2 starts
+            finished.append(Path(candidate.name).stem)
+
+        with mock.patch.object(retire, "_retire_candidate", side_effect=retire_candidate), \
+                mock.patch.object(sys, "stdout", io.StringIO()), mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                run(self.namespace())
+        self.assertEqual(finished, ["harbour"])
+        self.assertTrue(vidfunnel.stopfile.stopped_now)
+
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STOP_STEMS = ("harbour", "meadow", "orchard")
+
+
+@unittest.skipIf(not hasattr(os, "killpg"), "no process groups here; retire stop integration tests skipped")
+class RetireStopIntegrationTests(StopCase):
+    """'vidfunnel retire' in a process of its own, stopped while its first source's PAR2 is being redone.
+
+    A stand-in par2 on PATH sleeps 2 s before it writes the index file, so
+    the first source is still in progress when the signal or stop file comes.
+    """
+
+    def setUp(self):
+        StopCase.setUp(self)
+        self.records = {}
+        for stem in STOP_STEMS:
+            source = self.root / (stem + ".mp4")
+            interim = self.root / (stem + ".vidfunnel.mp4")
+            self.records[stem] = make_verified(source, interim, stem + ".mp4", interim_name=interim.name)
+            write_bytes(self.root / (interim.name + ".par2"), b"par2 for the interim name")
+        fake_bin = Path(self.holder.name) / "bin"
+        fake_bin.mkdir()
+        stand_in = fake_bin / "par2"
+        stand_in.write_text("#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nsleep 2\n: > \"$2\"\n",
+                            encoding="utf-8")
+        os.chmod(str(stand_in), 0o755)
+        self.environment = dict(os.environ, PYTHONPATH=REPO_ROOT,
+                                PATH="{}:{}".format(fake_bin, os.environ.get("PATH", "")))
+        self.before = snapshot(self.root)
+
+    def run_stopped(self, act):
+        import signal
+        import subprocess
+        import time
+        process = subprocess.Popen([sys.executable, "-m", "vidfunnel", "retire", str(self.root)], cwd=REPO_ROOT,
+                                   env=self.environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, universal_newlines=True, start_new_session=True)
+        self.addCleanup(lambda: process.poll() is None and os.killpg(process.pid, signal.SIGKILL))
+        lines = []
+        for line in process.stdout:
+            lines.append(line)
+            if "[retire 1/3]" in line:
+                break
+        else:
+            process.wait(30)
+            self.fail("'[retire 1/3]' never appeared; output:\n{}".format("".join(lines)))
+        time.sleep(0.5)
+        act(process)
+        rest, errors = process.communicate(timeout=60)
+        return process.returncode, "".join(lines) + rest, errors
+
+    def stop_all(self, *options):
+        import subprocess
+        result = subprocess.run([sys.executable, "-m", "vidfunnel", "stop-all"] + list(options) + [str(self.root)],
+                                cwd=REPO_ROOT, env=self.environment, capture_output=True, universal_newlines=True,
+                                timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def assert_first_retired_only(self, output, errors):
+        statuses = {stem: load_record(self.root / (stem + ".mp4"))["status"] for stem in STOP_STEMS}
+        self.assertEqual(statuses, {"harbour": "retired", "meadow": "verified", "orchard": "verified"},
+                         "stdout:\n{}\nstderr:\n{}".format(output, errors))
+        retired = load_record(self.root / "harbour.mp4")["stages"]["retire"]
+        self.assertEqual(retired["par2_recreated"], ["harbour.mp4.par2"])
+        after = snapshot(self.root)
+        for stem in ("meadow", "orchard"):
+            for name in (stem + ".mp4", stem + ".vidfunnel.mp4", stem + ".vidfunnel.mp4.par2"):
+                self.assertEqual(after.get(name), self.before[name], name)
+        self.assertNotIn(os.path.join(".vidfunnel", "lock"), after)
+
+    def test_retire_drained_by_sigusr1(self):
+        import signal
+        code, output, errors = self.run_stopped(lambda process: os.kill(process.pid, signal.SIGUSR1))
+        self.assertEqual(code, 0, errors)
+        self.assertIn("vidfunnel: drained: finished 1 in progress, started no more (2 not started)", errors)
+        self.assert_first_retired_only(output, errors)
+
+    def test_retire_drained_by_a_stop_file(self):
+        code, output, errors = self.run_stopped(lambda process: self.stop_all())
+        self.assertEqual(code, 0, errors)
+        self.assertIn("(drain): finishing the items in progress, starting no more", errors)
+        # The run sees the file only when it is about to start the next source, so none counts as in progress.
+        self.assertIn("vidfunnel: drained: finished 0 in progress, started no more (2 not started)", errors)
+        self.assert_first_retired_only(output, errors)
+
+    def test_retire_stopped_by_a_now_stop_file_finishes_the_source_in_progress(self):
+        code, output, errors = self.run_stopped(lambda process: self.stop_all("--now"))
+        self.assertEqual(code, 1, errors)
+        self.assertIn("(now): stopping now", errors)
+        self.assertIn("vidfunnel: stopped (a stop file asked for it)", errors)
+        self.assert_first_retired_only(output, errors)
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -420,11 +420,15 @@ def count_frames(tools, path, stream_index, progress=None):
 
     For video one packet is one frame (field-coded streams carry a frame per
     packet too). Raises FfmpegError when ffprobe fails or reports no count.
+    `progress` is None, a vidfunnel.progress.Progress, or an item's progress
+    namespace (its 'stream' only, as verify passes): the start line for a
+    large file goes to its stream, and update() is called when it has one.
     """
     absolute = os.path.abspath(os.fspath(path))
     _announce(absolute, "counting packets of stream {}".format(stream_index), progress)
-    if progress is not None:
-        progress.update(extra="counting packets, stream {}".format(stream_index))
+    update = getattr(progress, "update", None)
+    if update is not None:
+        update(extra="counting packets, stream {}".format(stream_index))
     argv = [
         tools.ffprobe,
         "-v",
@@ -450,8 +454,8 @@ def count_frames(tools, path, stream_index, progress=None):
             completed.returncode,
             completed.stderr,
         )
-    if progress is not None:
-        progress.update(extra="{} packets".format(count))
+    if update is not None:
+        update(extra="{} packets".format(count))
     return count
 
 

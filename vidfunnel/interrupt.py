@@ -32,15 +32,15 @@ handled the same way.
 
 SIGUSR1 drains: vidfunnel.cli's handler sets `draining` (a Flag, so the
 handler takes no lock). run_pool() then hands out no further task, and the
-sequential loops of plan and convert ask drain_before_next() before each
-next item; the tasks in progress run to their end, nothing signals their
+sequential loops of plan, convert (and --refit), verify and retire ask
+drain_before_next() before each next item; the tasks in progress run to their end, nothing signals their
 children and `interrupted` stays clear, so their results are applied as
 usual. The main thread counts, in `drain_tally`, the tasks that were still
 running when the drain began and the items never started, for the line
 vidfunnel.cli.main prints at the end.
 """
 
-VERSION = "20261108"
+VERSION = "20261109"
 
 import queue
 import threading
@@ -125,8 +125,13 @@ def drain_before_next(left, folder=None):
 
 
 def drain_after_item(count=1):
-    """For sequential loops, after each item: count it as finished in the drain when the drain has begun."""
+    """For sequential loops, after each item: count it as finished in the drain when the drain has begun.
+
+    It marks the drain as seen, so a drain that began during the last item
+    is reported with its counts, not as a run that ignored it.
+    """
     if draining.is_set():
+        drain_tally.seen = True
         drain_tally.finished += count
 
 # A worker whose child died the way a Ctrl+C kills it waits this long for the main

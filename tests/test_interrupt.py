@@ -8,7 +8,7 @@ check what is left on disk. Tests that need ffmpeg or the fixtures skip
 with a message when they are missing.
 """
 
-VERSION = "20261108"
+VERSION = "20261109"
 
 import _thread
 import glob
@@ -366,6 +366,133 @@ class DrainPoolTests(unittest.TestCase):
         drain.drain_after_item()
         self.assertTrue(drain.drain_before_next(2))
         self.assertEqual((drain.drain_tally.seen, drain.drain_tally.finished, drain.drain_tally.left), (True, 1, 2))
+
+
+def _hand_record(folder, name, status, **fields):
+    """A record for a small hand-written source, saved; no ffmpeg needed."""
+    from vidfunnel.record import new_record, save_record, set_status
+    source = Path(folder) / name
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"hand-written source " * 64)
+    record = new_record(source)
+    set_status(record, status)
+    record["output"]["name"] = source.stem + ".mp4"
+    record.update(fields)
+    save_record(source, record)
+    return source
+
+
+class SequentialDrainTests(unittest.TestCase):
+    """The sequential loops of convert, convert --refit and plan stop between items on a drain; no ffmpeg needed."""
+
+    def setUp(self):
+        import vidfunnel.stopfile
+        for flag in (interrupted, vidfunnel.interrupt.draining):
+            flag.clear()
+            self.addCleanup(flag.clear)
+        vidfunnel.interrupt.drain_tally.reset()
+        self.addCleanup(vidfunnel.interrupt.drain_tally.reset)
+        vidfunnel.stopfile.reset()
+        self.addCleanup(vidfunnel.stopfile.reset)
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "library"
+        self.root.mkdir()
+
+    def tally(self):
+        tally = vidfunnel.interrupt.drain_tally
+        return tally.seen, tally.finished, tally.left
+
+    def test_a_drain_during_the_only_item_of_a_sequential_convert_reports_its_counts(self):
+        """The drain begins in the last item: the line gives the counts, not 'ran to its end'."""
+        import contextlib
+        from vidfunnel import cli
+        _hand_record(self.root, "harbour.avi", "planned")
+
+        def convert_one(*args, **kwargs):
+            vidfunnel.interrupt.draining.set()
+            return {"outcome": "ok"}
+
+        errors = io.StringIO()
+        with unittest.mock.patch("vidfunnel.deps.require", return_value=None), \
+                unittest.mock.patch.object(vidfunnel.encode, "convert_one", side_effect=convert_one) as converted, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
+            code = cli.main(["convert", str(self.root)])
+        self.assertEqual(code, 0, errors.getvalue())
+        self.assertEqual(converted.call_count, 1)
+        self.assertIn("vidfunnel: drained: finished 1 in progress, started no more (0 left planned)",
+                      errors.getvalue())
+
+    def refit_records(self):
+        for name in ("harbour.avi", "meadow.avi"):
+            _hand_record(self.root, name, "converted", action="reencode", flags=["output-larger"])
+
+    def refit(self, jobs, refit_one):
+        options = types.SimpleNamespace(par2=None, verbose=False, jobs=jobs, dry_run=False, refit=True)
+        with unittest.mock.patch.object(vidfunnel.encode, "refit_one", side_effect=refit_one) as refitted:
+            vidfunnel.encode.refit_paths(None, [str(self.root)], options, quiet())
+        return refitted.call_count
+
+    def test_a_sequential_refit_starts_no_item_after_a_drain(self):
+        self.refit_records()
+
+        def refit_one(*args, **kwargs):
+            vidfunnel.interrupt.draining.set()
+            return "refitted", None
+
+        self.assertEqual(self.refit(1, refit_one), 1)
+        self.assertEqual(self.tally(), (True, 1, 1))
+
+    def test_a_refit_looks_for_a_stop_file_before_each_item(self):
+        """Sequential and with --jobs: a drain stop file above the records starts no refit."""
+        from vidfunnel.record import _write_json_atomic
+        from vidfunnel.stopfile import stop_path
+        self.refit_records()
+        _write_json_atomic(stop_path(str(self.root)), {"host": "elsewhere", "requested": None, "mode": "drain"})
+        for jobs in (1, 2):
+            vidfunnel.interrupt.draining.clear()
+            vidfunnel.interrupt.drain_tally.reset()
+            with unittest.mock.patch("sys.stderr", io.StringIO()):
+                count = self.refit(jobs, lambda *args, **kwargs: ("refitted", None))
+            self.assertEqual(count, 0, "jobs {}".format(jobs))
+            self.assertEqual(self.tally(), (True, 0, 2), "jobs {}".format(jobs))
+
+    def plan_drained_in(self, draining_item):
+        """_plan_sequential over 'first' [one], 'second' [two, three], 'third' [four], drained during `draining_item`.
+
+        Returns (items planned, folders locked)."""
+        folders = [str(self.root / name) for name in ("first", "second", "third")]
+        by_folder = {folders[0]: [("one", None)], folders[1]: [("two", None), ("three", None)],
+                     folders[2]: [("four", None)]}
+        locked = []
+        planned = []
+
+        def take_lock(folder, entries, summary, stream):
+            locked.append(os.path.basename(folder))
+            return unittest.mock.Mock()
+
+        def plan_entry(tools, work, *args, **kwargs):
+            planned.append(work)
+            if work == draining_item:
+                vidfunnel.interrupt.draining.set()
+            return "planned", None
+
+        with unittest.mock.patch.object(vidfunnel.plan, "_take_folder_lock", side_effect=take_lock), \
+                unittest.mock.patch.object(vidfunnel.plan, "_plan_entry", side_effect=plan_entry), \
+                unittest.mock.patch.object(vidfunnel.plan, "_update_folder_file"):
+            vidfunnel.plan._plan_sequential(None, None, None, io.StringIO(), unittest.mock.Mock(), None,
+                                            folders, by_folder, {}, 4)
+        return planned, locked
+
+    def test_a_sequential_plan_takes_no_further_folder_lock_after_a_drain(self):
+        """Drained in the last item of a folder: the per-folder check stops before the next folder's lock."""
+        self.assertEqual(self.plan_drained_in("one"), (["one"], ["first"]))
+        self.assertEqual(self.tally(), (True, 1, 3))
+
+    def test_a_sequential_plan_starts_no_further_item_in_the_folder_after_a_drain(self):
+        """Drained in a folder's first item: the per-item check stops before its second."""
+        self.assertEqual(self.plan_drained_in("two"), (["one", "two"], ["first", "second"]))
+        self.assertEqual(self.tally(), (True, 1, 2))
 
 
 def _needs(*names):

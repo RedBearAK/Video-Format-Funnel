@@ -35,7 +35,10 @@ else output.name, and checked:
 `run` collects the records first and then, inside each folder's lock, reads
 each record again from disk and verifies that copy; a record whose status is
 no longer 'converted' or 'verified' (a retire finished in between) or that is
-gone is skipped, so verify never overwrites a later stage.
+gone is skipped, so verify never overwrites a later stage. Before each folder
+and each record it asks vidfunnel.interrupt.drain_before_next, which also
+looks for a stop file above the folder: on a drain (SIGUSR1, 'stop-all') no
+further record starts, and a 'now' stop file stops the run as Ctrl+C would.
 
 The score is 100 minus the penalties the record carried before any verify
 (the analysis, and plan's own VOB/DVD penalties) minus this run's
@@ -61,6 +64,7 @@ from pathlib import Path
 from vidfunnel.analyze import DEFAULT_SAMPLES, WINDOW_SECONDS, decide_decode, sample_windows
 from vidfunnel.ffmpeg import FfmpegError, null_decode
 from vidfunnel.ffmpeg import run as run_tool
+from vidfunnel.interrupt import drain_after_item, drain_before_next
 from vidfunnel.plan import HASH_PROGRESS_BYTES, IDENTITY_KEY, video_filters
 from vidfunnel.probe import count_frames, probe_file
 from vidfunnel.progress import Progress, StageSummary, ffmpeg_progress_callback, format_bytes, item_tag, say, tagged
@@ -510,8 +514,11 @@ def _fail(record, key, stage, message, stream):
     return record
 
 
-def _measure_source_frames(tools, folder, record, stream):
-    """(count, how) for the source video frames: nb_frames, an exact count of the files, or (None, why)."""
+def _measure_source_frames(tools, folder, record, stream, progress=None):
+    """(count, how) for the source video frames: nb_frames, an exact count of the files, or (None, why).
+
+    `progress` (the item's, with its tagged stream) gets the count's start line.
+    """
     video = _source_probe(record).get("video") or {}
     if video.get("nb_frames"):
         return None, "nb_frames"
@@ -523,7 +530,7 @@ def _measure_source_frames(tools, folder, record, stream):
     try:
         total = 0
         for path in paths:
-            total += count_frames(tools, path, video["index"])
+            total += count_frames(tools, path, video["index"], progress)
         return total, "counted"
     except FfmpegError as error:
         say("  could not count source frames: {}".format(error), stream)
@@ -595,11 +602,12 @@ def verify_record(tools, source, record, options, progress=None):
     stage["identity"] = identity
 
     try:
-        actual_frames = count_frames(tools, output_path, video["index"]) if video.get("index") is not None else None
+        actual_frames = (count_frames(tools, output_path, video["index"], progress)
+                         if video.get("index") is not None else None)
     except FfmpegError as error:
         say("  could not count output frames: {}".format(error), stream)
         actual_frames = None
-    measured, how = _measure_source_frames(tools, folder, record, stream)
+    measured, how = _measure_source_frames(tools, folder, record, stream, progress)
     frames = compare_frames(expected_frames(record, measured), actual_frames)
     frames.update(source_frames=measured, source_frames_from=how,
                   fps_multiplier=_cadence(record).get("fps_multiplier"), cadence=_cadence(record).get("kind"))
@@ -756,20 +764,29 @@ def run(args):
                 by_folder[str(folder)] = []
                 order.append(str(folder))
             by_folder[str(folder)].append(record)
-    total = sum(1 for folder in order for record in by_folder[folder]
-                if record.get("status") in VERIFIABLE_STATUSES)
+    wanted_in = {folder: [record for record in by_folder[folder] if record.get("status") in VERIFIABLE_STATUSES]
+                 for folder in order}
+    total = sum(len(wanted_in[folder]) for folder in order)
     position = 0
-    for folder in order:
+    drained = False
+    for folder_number, folder in enumerate(order):
         records = by_folder[folder]
-        wanted = [record for record in records if record.get("status") in VERIFIABLE_STATUSES]
+        wanted = wanted_in[folder]
         if len(wanted) < len(records):
             summary.add("skipped", len(records) - len(wanted))
         if not wanted:
             continue
+        later = sum(len(wanted_in[after]) for after in order[folder_number + 1:])
+        # A drain (SIGUSR1, a stop file) starts no further item; a 'now' stop file raises KeyboardInterrupt here.
+        if drain_before_next(len(wanted) + later, folder):
+            break
         first_position = position
         try:
             with FolderLock(folder, warn=lambda message: say(message, stream)):
-                for collected in wanted:
+                for item_number, collected in enumerate(wanted):
+                    if drain_before_next(len(wanted) - item_number + later, folder):
+                        drained = True
+                        break
                     key = record_key(folder, collected)
                     position += 1
                     # Every line of this item starts with its counter, as convert's do.
@@ -784,19 +801,23 @@ def run(args):
                     except RecordError as error:
                         say("failed: '{}': {}".format(key.name, error), item.stream)
                         summary.add("failed")
+                        drain_after_item()
                         continue
                     if record is None or record.get("status") not in VERIFIABLE_STATUSES:
                         say("skipping '{}': its record {} since it was listed".format(
                             key.name, "is gone" if record is None
                             else "now has status '{}'".format(record.get("status"))), item.stream)
                         summary.add("skipped")
+                        drain_after_item()
                         continue
                     try:
                         result = verify_record(tools, key, record, args, progress=item)
                     except (OSError, RecordError, FfmpegError) as error:
                         say("failed: '{}': {}".format(key.name, error), item.stream)
                         summary.add("failed")
+                        drain_after_item()
                         continue
+                    drain_after_item()
                     if result.get("status") == "failed":
                         summary.add("failed")
                     else:
@@ -805,6 +826,8 @@ def run(args):
             say("skipping folder '{}': {}".format(folder, error), stream)
             summary.add("skipped", len(wanted))
             position = first_position + len(wanted)
+        if drained:
+            break
     say(summary.format("'{}/' under each folder".format(RECORD_DIR)), stream)
     return EXIT_ERROR if summary.counts.get("failed") else EXIT_OK
 

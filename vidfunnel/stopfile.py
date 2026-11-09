@@ -1,12 +1,14 @@
-"""`stop-all` and `resume`: a stop request written on the share, seen by every run under it on every host.
+"""`stop-all` and `resume`: a stop request written on the share, seen by the runs under it on every host.
 
 `vidfunnel stop-all PATH...` writes '<PATH>/.vidfunnel/stop', a small JSON
 file {"host", "pid", "requested", "mode", "user"}; `vidfunnel resume
 PATH...` removes it. Nothing else writes or removes it, and it is not a
-record or a lock. A run looks for it by walking up from an item's folder
-to the file system root, one stat per level, every time it is about to
-start an item (find_stop, check_item), so a request on a library's root
-reaches every folder below it from any host that sees the share:
+record or a lock. A plan, convert (with --refit too), verify or retire run
+looks for it by walking up from an item's folder to the file system root,
+one stat per level, every time it is about to start an item (find_stop,
+check_item), so a request on a library's root reaches every folder below
+it from any host that sees the share. The other subcommands (check,
+report, find, index, stop-all, resume) have no items and do not look:
 
 - mode "drain" sets vidfunnel.interrupt.draining exactly as SIGUSR1 does
   (the items in progress finish, no further item starts) and says so once;
@@ -16,6 +18,10 @@ reaches every folder below it from any host that sees the share:
   starts (check_now, from vidfunnel.ffmpeg.run and encode.write_par2), so
   it takes effect at the next item or child start; a child already running
   is stopped when another check in this run fires, not by the file itself.
+  retire looks before each item only (vidfunnel.retire.run calls
+  forget_item once an item has started), since its one child, par2, runs
+  after the original has been moved and stopping it then would leave that
+  item half done.
 
 A stop, once seen, holds for the rest of the run: removing the file does
 not undo it. A stage that is about to start (plan, convert, verify,
@@ -23,12 +29,13 @@ retire) under a stop file at or above one of its PATHs refuses before it
 takes any folder lock (refusal).
 """
 
-VERSION = "20261108"
+VERSION = "20261109"
 
 import getpass
 import json
 import os
 import socket
+import stat
 import sys
 import threading
 
@@ -59,20 +66,29 @@ def find_stop(folder):
     Walks the absolute path's parents up to the root with one os.stat per
     level. A file that exists but cannot be read or parsed counts as a
     drain request, so a half-written or damaged file still stops new work.
+    Anything there that is not a regular file (a FIFO, a device, a folder)
+    counts as such an unreadable file and is never opened, since opening a
+    FIFO waits for a writer and would hang the run.
     """
     current = os.path.abspath(os.fspath(folder))
     while True:
         candidate = stop_path(current)
         try:
-            os.stat(candidate)
+            found = os.stat(candidate)
         except OSError:
             pass
         else:
+            if not stat.S_ISREG(found.st_mode):
+                return candidate, _unreadable("it could not be read as a regular file")
             return candidate, _read(candidate)
         parent = os.path.dirname(current)
         if parent == current:
             return None, None
         current = parent
+
+
+def _unreadable(reason):
+    return {"mode": "drain", "host": None, "requested": None, "unreadable": True, "reason": reason}
 
 
 def _read(path):
@@ -82,7 +98,7 @@ def _read(path):
     except (OSError, ValueError):
         data = None
     if not isinstance(data, dict):
-        return {"mode": "drain", "host": None, "requested": None, "unreadable": True}
+        return _unreadable("unreadable")
     if data.get("mode") not in MODES:
         data = dict(data, mode="drain")
     return data
@@ -91,7 +107,7 @@ def _read(path):
 def describe(path, data):
     """'from host H at T (mode)' for messages; an unreadable file says so."""
     if data.get("unreadable"):
-        return "in '{}' (unreadable, taken as drain)".format(path)
+        return "in '{}' ({}, taken as drain)".format(path, data.get("reason") or "unreadable")
     return "from host '{}' at {} ({})".format(data.get("host"), data.get("requested"), data.get("mode"))
 
 
@@ -196,7 +212,8 @@ def refusal(paths):
 
 def add_arguments(parser):
     parser.add_argument("paths", nargs="+", metavar="PATH",
-                        help="folders whose runs to stop: every run working at or below PATH, on any host")
+                        help="folders whose runs to stop: every plan, convert, verify or retire run working "
+                        "at or below PATH, on any host")
     parser.add_argument("--now", action="store_true",
                         help="stop at once (as Ctrl+C), instead of finishing the items in progress")
 
@@ -223,7 +240,8 @@ def run(args):
             print("vidfunnel stop-all: cannot write '{}': {}".format(path, error), file=sys.stderr)
             code = EXIT_ERROR
             continue
-        print("vidfunnel stop-all: wrote '{}' ({}): runs at or below '{}' on every host {}; lift it with: "
+        print("vidfunnel stop-all: wrote '{}' ({}): plan, convert, verify and retire runs at or below '{}' "
+              "on every host {}; lift it with: "
               "vidfunnel resume '{}'".format(
                   path, mode, given, "stop at their next item or child process" if mode == "now"
                   else "finish their items in progress and start no more", given))

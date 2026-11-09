@@ -22,14 +22,15 @@ later ones do nothing, so they cannot cut that cleanup short.
 
 SIGUSR1 drains instead (its default action would end the process): the
 handler sets vidfunnel.interrupt.draining and writes one line to stderr,
-and run_pool() and the sequential loops of plan and convert start no
-further item, while the items in progress run to their end and are
-recorded as usual. main() then prints 'vidfunnel: drained: ...' and returns
-the stage's own exit code. A second SIGUSR1 does nothing; SIGTERM, SIGHUP,
+and run_pool() and the sequential loops of plan, convert (--refit too),
+verify and retire start no further item, while the items in progress run to
+their end and are recorded as usual. main() then prints 'vidfunnel:
+drained: ...' and returns the stage's own exit code; the other subcommands
+have no items and say that they ran to their end. A second SIGUSR1 does nothing; SIGTERM, SIGHUP,
 SIGQUIT or Ctrl+C during a drain stop the run as they always do.
 """
 
-VERSION = "20261108"
+VERSION = "20261109"
 
 import argparse
 import importlib
@@ -70,13 +71,15 @@ SUBCOMMANDS = (
     ("index", "vidfunnel.index", "add_arguments", "run",
      "build or rebuild the optional SQLite index from the records"),
     ("stop-all", "vidfunnel.stopfile", "add_arguments", "run",
-     "ask every vidfunnel run under PATH, on every host, to finish its current items and start no more "
+     "ask every plan, convert, verify and retire run under PATH, on every host, to finish its current items "
+     "and start no more "
      "(--now: stop at once); lifted by 'resume'"),
     ("resume", "vidfunnel.stopfile", "add_resume_arguments", "run_resume",
      "remove the stop file 'stop-all' wrote under PATH, so runs can start there again"),
 )
 
-# Stages that refuse to start under a stop file at or above one of their PATHs (vidfunnel.stopfile.refusal).
+# Stages that run items: they refuse to start under a stop file at or above one of their PATHs
+# (vidfunnel.stopfile.refusal), and they look for one before each item and stop between items on a drain.
 STOPPABLE = ("plan", "convert", "verify", "retire")
 
 
@@ -368,7 +371,11 @@ def _report_drain(args):
     if not draining.is_set():
         return
     if not drain_tally.seen:
-        _print_error("vidfunnel: drained: '{}' does not stop between items; it ran to its end".format(args.command))
+        if args.command in STOPPABLE:
+            words = "no item was left to start when the drain began; it ran to its end"
+        else:
+            words = "it has no items to stop between; it ran to its end"
+        _print_error("vidfunnel: drained: '{}': {}".format(args.command, words))
         return
     left_words = "left planned" if args.command == "convert" and not getattr(args, "refit", False) \
         else "not started"
