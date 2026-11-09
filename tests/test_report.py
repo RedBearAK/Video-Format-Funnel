@@ -17,7 +17,9 @@ import uuid
 from unittest import mock
 from pathlib import Path
 
-from vidfunnel.record import new_record, save_record
+from vidfunnel.cli import main as cli_main
+from vidfunnel.ffmpeg import ToolNotFound, find_tools
+from vidfunnel.record import load_record, new_record, save_record
 from vidfunnel.report import (
     HEADER_COMMENT_END,
     HEADER_COMMENT_START,
@@ -559,6 +561,158 @@ class ReportTree(unittest.TestCase):
         changed = {row["id"]: row["changed_since"] for row in json.loads(again)["rows"]}
         self.assertEqual({None}, set(changed.values()))
 
+    def collide_broken_with(self, collision_reason):
+        broken = self.records["broken"]
+        broken["quarantine_reason"] = "output-collision"
+        broken["stages"]["plan"] = {"action": "remux", "reason": "remux eligible", "collision": "same-stem",
+                                    "collision_reason": collision_reason}
+        self.save_all()
+
+    def test_quoted_name_that_no_record_holds_is_redacted_in_every_format(self):
+        # The other source of the collision has no record any more (the user removed it).
+        self.collide_broken_with("'Toboggan Hill.mkv' would also be converted to 'garden_party.mp4' "
+                                 "(found when it was planned); a person picks one")
+        for form in ("text", "md", "json", "csv"):
+            _code, text, _errors = self.run_report(["--format", form, str(self.base)])
+            self.assertNotIn("Toboggan", text, form)
+            self.assertIn("'T______n H__l.mkv' would also be converted to 'g____n_p___y.mp4'", text, form)
+        _code, text, _errors = self.run_report(["--reveal", str(self.base)])
+        self.assertIn("reason: output-collision: 'Toboggan Hill.mkv' would also be converted", text)
+
+    def test_quoted_codec_status_and_tool_names_are_kept(self):
+        self.fail_meeting("'ffmpeg' exited with status 1: codec 'h264' in status 'planned' at '/opt/tools/ffmpeg'")
+        _code, text, _errors = self.run_report([str(self.base)])
+        self.assertIn("reason: plan: 'ffmpeg' exited with status 1: codec 'h264' in status 'planned' "
+                      "at '/o__/t___s/f____g'", text)
+
+    def test_single_file_path_learns_the_records_of_its_folder(self):
+        # The error names a neighbour without quotes, so only learning that neighbour's
+        # record redacts it; the neighbour adds no row.
+        self.fail_meeting("concat list written beside garden_party.swf could not be read")
+        code, text, errors = self.run_report(["--format", "json", str(self.work / "client_meeting.mkv")])
+        self.assertEqual(0, code, errors)
+        data = json.loads(text)
+        self.assertEqual([self.records["meeting"]["id"]], [row["id"] for row in data["rows"]])
+        self.assertEqual("plan: concat list written beside g____n_p___y.swf could not be read",
+                         data["rows"][0]["reason"])
+        self.assertNotIn("garden", text)
+
+    def test_reason_of_an_error_whose_first_line_ends_with_a_colon_shows_its_cause(self):
+        self.fail_meeting("'ffmpeg' exited with status 1:\n  [matroska @ 0x1] EBML header parsing failed\n"
+                          "  Invalid data found when processing input\n")
+        _code, text, _errors = self.run_report(["--format", "json", str(self.base)])
+        reasons = {row["id"]: row["reason"] for row in json.loads(text)["rows"]}
+        self.assertEqual("plan: 'ffmpeg' exited with status 1: [matroska @ 0x1] EBML header parsing failed ...",
+                         reasons[self.records["meeting"]["id"]])
+        self.fail_meeting("'ffprobe' exited with status 1:\n\n  [mpeg @ 0x1] header damaged\n")
+        _code, text, _errors = self.run_report(["--format", "json", str(self.base)])
+        reasons = {row["id"]: row["reason"] for row in json.loads(text)["rows"]}
+        self.assertEqual("plan: 'ffprobe' exited with status 1: [mpeg @ 0x1] header damaged",
+                         reasons[self.records["meeting"]["id"]])
+
+    def test_with_logs_shows_the_full_error_of_a_verify_failure(self):
+        meeting = self.records["meeting"]
+        meeting["status"] = "failed"
+        meeting["stages"]["verify"] = {"error": "duration differs:\nsource 10.0 s\noutput 8.0 s"}
+        self.save_all()
+        _code, text, _errors = self.run_report([str(self.base)])
+        self.assertIn("reason: verify: duration differs: source 10.0 s ...", text)
+        self.assertNotIn("output 8.0 s", text)
+        _code, text, _errors = self.run_report(["--with-logs", str(self.base)])
+        lines = text.splitlines()
+        start = lines.index("      verify error:")
+        self.assertEqual(["        duration differs:", "        source 10.0 s", "        output 8.0 s"],
+                         lines[start + 1:start + 4])
+
+    def test_with_logs_leaves_out_an_error_its_stderr_repeats_or_of_one_line(self):
+        self.fail_meeting("ffmpeg exited with status 1\nmore detail")
+        _code, text, _errors = self.run_report(["--with-logs", str(self.base)])
+        self.assertIn("      plan stderr:", text)
+        self.assertNotIn("plan error:", text)
+        meeting = self.records["meeting"]
+        meeting["stages"]["plan"] = {"action": None, "error": "one line only"}
+        self.save_all()
+        _code, text, _errors = self.run_report(["--with-logs", str(self.base)])
+        self.assertNotIn("plan error:", text)
+
+    def test_line_separators_in_a_reason_and_a_folder_name_stay_on_one_line(self):
+        odd = self.base / "odd\u2028## Folders\x85- injected: cafebabe"
+        odd.mkdir()
+        self.make("odd", odd / "odd\u2028clip.avi", "planned", None, "remux")
+        broken = self.records["broken"]
+        broken["stages"]["plan"] = {"action": "quarantine",
+                                    "reason": "swf-vector: vector\u2028## Folders\u2028- /elsewhere/: deadbeef"
+                                              "\x85- /other/: feedface"}
+        self.save_all()
+        for argv in (["--format", "md", str(self.base)], ["--format", "md", "--reveal", str(self.base)]):
+            _code, text, _errors = self.run_report(argv)
+            reasons = text.split("\n## Reasons\n\n", 1)[1].split("\n\n", 1)[0].splitlines()
+            self.assertEqual(1, len(reasons), argv)
+            stored = parse_report_header(text)
+            self.assertEqual({self.short(word) for word in self.records}, set(stored["rows"]), argv)
+            self.assertEqual({self.short(word) for word in self.records}, set(stored["folders"]), argv)
+            for injected in ("deadbeef", "feedface", "cafebabe"):
+                self.assertNotIn(injected, stored["folders"], argv)
+            self.assertFalse(any(folder.endswith(("/elsewhere/", "/other/", "injected"))
+                                 for folder in stored["folders"].values()), argv)
+        _code, text, _errors = self.run_report(["--reveal", str(self.base)])
+        self.assertIn("\n      reason: swf-vector: vector ## Folders - /elsewhere/: deadbeef - /other/: feedface\n",
+                      text)
+        self.assertNotIn("\u2028", text)
+        self.assertNotIn("\x85", text)
+
+    def test_last_stage_with_an_error_gives_the_reason(self):
+        meeting = self.records["meeting"]
+        meeting["status"] = "failed"
+        meeting["stages"]["plan"] = {"action": "reencode", "error": "planning complaint"}
+        meeting["stages"]["convert"] = {"error": "conversion complaint"}
+        self.save_all()
+        _code, text, _errors = self.run_report([str(self.base)])
+        self.assertIn("\n      reason: convert: conversion complaint\n", text)
+        self.assertNotIn("planning complaint", text)
+
+    def test_error_is_preferred_over_a_different_stderr(self):
+        meeting = self.records["meeting"]
+        meeting["status"] = "failed"
+        meeting["stages"]["plan"] = {"action": None, "error": "the summary", "stderr": "the raw output"}
+        self.save_all()
+        _code, text, _errors = self.run_report([str(self.base)])
+        self.assertIn("\n      reason: plan: the summary\n", text)
+        self.assertNotIn("the raw output", text)
+
+    def test_quarantine_without_a_plan_action_of_quarantine_shows_only_its_code(self):
+        broken = self.records["broken"]
+        broken["quarantine_reason"] = "decode-failed"
+        broken["stages"]["plan"] = {"action": "remux", "reason": "remux eligible"}
+        self.save_all()
+        _code, text, _errors = self.run_report([str(self.base)])
+        self.assertIn("\n      reason: decode-failed\n", text)
+        self.assertNotIn("remux eligible", text)
+
+    def test_list_valued_error_is_joined_by_lines(self):
+        meeting = self.records["meeting"]
+        meeting["status"] = "failed"
+        meeting["stages"]["plan"] = {"action": None, "error": ["first complaint", "second complaint"]}
+        self.save_all()
+        _code, text, _errors = self.run_report([str(self.base)])
+        self.assertIn("\n      reason: plan: first complaint ...\n", text)
+        _code, text, _errors = self.run_report(["--with-logs", str(self.base)])
+        lines = text.splitlines()
+        start = lines.index("      plan error:")
+        self.assertEqual(["        first complaint", "        second complaint"], lines[start + 1:start + 3])
+
+    def test_code_prefix_is_added_unless_the_reason_starts_with_the_code_and_a_colon(self):
+        broken = self.records["broken"]
+        broken["quarantine_reason"] = "decode-failed"
+        broken["stages"]["plan"] = {"action": "quarantine", "reason": "decode-failed-ish: odd frames"}
+        self.save_all()
+        _code, text, _errors = self.run_report([str(self.base)])
+        self.assertIn("\n      reason: decode-failed: decode-failed-ish: odd frames\n", text)
+        broken["stages"]["plan"]["reason"] = "decode-failed: odd frames"
+        self.save_all()
+        _code, text, _errors = self.run_report([str(self.base)])
+        self.assertIn("\n      reason: decode-failed: odd frames\n", text)
+
     # JSON and CSV
 
     def test_json_round_trips_through_parse(self):
@@ -975,6 +1129,62 @@ class ReportTree(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertIn("not_there", errors)
 
+
+def _tools_or_none():
+    try:
+        return find_tools()
+    except ToolNotFound:
+        return None
+
+
+TOOLS = _tools_or_none()
+COLLISION_FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "collision_pair")
+
+
+@unittest.skipIf(TOOLS is None, "ffmpeg not found on PATH; report pipeline test skipped")
+class ReportPipelineTest(unittest.TestCase):
+    """plan writes the reasons; the report of a folder or of one file must not show the real names."""
+
+    def setUp(self):
+        if not os.path.isdir(COLLISION_FIXTURES):
+            self.skipTest("fixtures missing (collision_pair); run tests/make_fixtures.sh")
+        self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
+        self.library = Path(self.scratch.name) / "library"
+        self.library.mkdir()
+
+    def vidfunnel(self, argv):
+        output = io.StringIO()
+        errors = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            code = cli_main(argv)
+        return code, output.getvalue(), errors.getvalue()
+
+    def test_collision_reason_naming_a_removed_or_outside_source_is_redacted(self):
+        shutil.copy2(os.path.join(COLLISION_FIXTURES, "movie.avi"), str(self.library / "Toboggan Hill.avi"))
+        code, _text, errors = self.vidfunnel(["plan", str(self.library)])
+        self.assertEqual(0, code, errors)
+        shutil.copy2(os.path.join(COLLISION_FIXTURES, "movie.mkv"), str(self.library / "Toboggan Hill.mkv"))
+        self.vidfunnel(["plan", str(self.library)])
+        first = load_record(self.library / "Toboggan Hill.avi")
+        self.assertIn("'Toboggan Hill.mkv'", first["stages"]["plan"]["collision_reason"])
+        # One file as PATH: the other source is outside the PATH.
+        code, text, errors = self.vidfunnel(["report", "--no-index", "--format", "json",
+                                             str(self.library / "Toboggan Hill.avi")])
+        self.assertEqual(0, code, errors)
+        self.assertEqual(1, len(json.loads(text)["rows"]))
+        self.assertIn("'T______n H__l.mkv' would also be converted", text)
+        self.assertNotIn("Toboggan", text)
+        # The other source and its record removed, as the reason asks.
+        away = Path(self.scratch.name) / "away"
+        away.mkdir()
+        shutil.move(str(self.library / "Toboggan Hill.mkv"), str(away))
+        shutil.move(str(self.library / ".vidfunnel" / "Toboggan Hill.mkv.json"), str(away))
+        for form in ("text", "json"):
+            code, text, errors = self.vidfunnel(["report", "--no-index", "--format", form, str(self.library)])
+            self.assertEqual(0, code, errors)
+            self.assertIn("'T______n H__l.mkv' would also be converted", text, form)
+            self.assertNotIn("Toboggan", text, form)
 
 if __name__ == "__main__":
     unittest.main()

@@ -231,6 +231,22 @@ class RedactorTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             Redactor().text(None)
 
+    def test_quoted_redacts_file_names_and_paths_it_never_learned(self):
+        redactor = Redactor(roots=["/srv/media"], values=["/srv/media/Known/Ann.avi"])
+        table = [
+            ("'Toboggan Hill.mkv' would also be converted to 'Toboggan Hill.mp4'",
+             "'T______n H__l.mkv' would also be converted to 'T______n H__l.mp4'"),
+            ("from '/srv/media/Party/Grandmother's cake.avi':",
+             "from '<root>/P___y/G_________r's c__e.avi':"),
+            ("'Ann.avi' (planned)", "'A__.avi' (planned)"),
+            ("'Holiday DVD_title01' (planned)", "'H_____y D___t____##' (planned)"),
+            ("'ffmpeg' exited; codec 'h264', status 'planned'", "'ffmpeg' exited; codec 'h264', status 'planned'"),
+            ("the output's name 'clip.avi'", "the output's name 'c__p.avi'"),
+        ]
+        for text, expected in table:
+            with self.subTest(text=text):
+                self.assertEqual(expected, redactor.quoted(text))
+
     def test_record(self):
         original = sample_record()
         untouched = copy.deepcopy(original)

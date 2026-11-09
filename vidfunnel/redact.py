@@ -62,6 +62,13 @@ _YEAR_AT_START = re.compile(r"^\s*(\d{4})")
 _YEAR_ANYWHERE = re.compile(r"(?<!\d)(\d{4})(?!\d)")
 # A match must not sit inside a longer word: no letter or digit right before or after it.
 _BOUNDED = r"(?<![^\W_])(?:{})(?![^\W_])"
+# A single-quoted stretch of a message, as vidfunnel writes file names into reasons and
+# errors: the opening quote at the start or after a space or bracket, the closing one at
+# the end or before a space, bracket or punctuation, so an apostrophe inside a name
+# ("Grandmother's party.mkv") does not end it. One line at most.
+_QUOTED = re.compile(r"(?<![^\s(\[,])'([^\n]+?)'(?=$|[\s:;,.!?)\]])", re.MULTILINE)
+# The record key name of a DVD title (plan._record_key_name), which has no extension.
+_DVD_TITLE_KEY = re.compile(r"_title\d{2}$")
 
 
 def _is_word_char(char):
@@ -195,6 +202,16 @@ def redact_name(name):
     """Redact a file name word by word, keeping separators and the extension."""
     stem, extension = split_extension(name)
     return _redact_words(stem) + extension
+
+
+def looks_like_file(text):
+    """True for a quoted message part that names a file or folder.
+
+    A path (it holds '/'), a name with a plausible extension, or a DVD title's
+    record key name ('<folder>_title01'). Codec, status and tool names ('h264',
+    'planned', 'ffmpeg') have none of these and are left alone.
+    """
+    return "/" in text or bool(split_extension(text)[1]) or bool(_DVD_TITLE_KEY.search(text))
 
 
 def redact_metadata_value(value):
@@ -389,6 +406,32 @@ class Redactor:
         if pattern is None:
             return text
         return pattern.sub(lambda match: self._substitutions[match.group(0)], text)
+
+    def quoted(self, text):
+        """Redact every single-quoted file name or path in text, learned or not.
+
+        A reason or error can name a file that no collected record holds (the
+        other source of an output collision, removed since, or outside the
+        PATH), which text() cannot know. Each quoted part that looks_like_file()
+        is replaced by its learned redacted form, else redacted as a path (when
+        it holds '/') or a name. Call it on real text, before text().
+        """
+        if not isinstance(text, str):
+            raise TypeError("Redactor.quoted() takes a str, got {}".format(type(text).__name__))
+
+        def replace(match):
+            inner = match.group(1)
+            if not looks_like_file(inner):
+                return match.group(0)
+            if inner in self._substitutions:
+                redacted = self._substitutions[inner]
+            elif "/" in inner:
+                redacted = self.path(inner, last_is_file=not inner.endswith("/"))
+            else:
+                redacted = redact_name(inner)
+            return "'" + redacted + "'"
+
+        return _QUOTED.sub(replace, text)
 
     # Records.
 

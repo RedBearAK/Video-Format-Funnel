@@ -57,7 +57,8 @@ from pathlib import Path
 
 import vidfunnel
 from vidfunnel.progress import format_bytes, say
-from vidfunnel.record import STATUSES, STAGES, RecordError, band, iter_records, load_record, now_iso
+from vidfunnel.record import (FOLDER_FILE, RECORD_SUFFIX, STATUSES, STAGES, RecordError, band, iter_records,
+                              load_record, now_iso, record_dir)
 from vidfunnel.redact import ROOT_MARK, Redactor, redact_path
 
 FORMATS = ("text", "md", "json", "csv")
@@ -169,6 +170,30 @@ def _from_index(paths, db_path):
     return items
 
 
+def _folder_records(folder, args=None):
+    """The records in folder's own '.vidfunnel/' (not its subfolders); an unreadable one is named on stderr."""
+    location = record_dir(folder)
+    try:
+        entries = sorted(os.listdir(str(location)))
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        _stderr("report: cannot read '{}' to learn the names to redact: {}".format(location, error), args)
+        return []
+    records = []
+    for entry in entries:
+        if entry.startswith(".") or entry == FOLDER_FILE or not entry.endswith(RECORD_SUFFIX):
+            continue
+        try:
+            record = load_record(Path(folder) / entry[:-len(RECORD_SUFFIX)])
+        except RecordError as error:
+            _stderr("report: cannot read '{}' to learn the names to redact: {}".format(entry, error), args)
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
 def collect(paths, use_index=False, db_path=None, errors=None):
     """Return (folder, record) pairs for every record under paths, each record ID once.
 
@@ -236,7 +261,23 @@ def filter_items(items, min_score=None, max_score=None, statuses=None):
 
 
 
+def _stage_text(section, key):
+    """A stage's stored text under key as one string (a list is joined by lines); None for none."""
+    value = section.get(key)
+    if isinstance(value, list):
+        value = "\n".join(str(line) for line in value)
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
 def _logs(record):
+    """[{'stage', 'kind', 'text'}] of every stage's stored logs, in STAGES order.
+
+    A stage's 'error' comes first when it has more than one non-empty line (the
+    reason line shows only its start) and no LOG_KEYS entry of that stage holds
+    the same text; a verify failure stores only 'error'.
+    """
     stages = record.get("stages") or {}
     order = [name for name in STAGES if name in stages]
     order.extend(sorted(name for name in stages if name not in STAGES))
@@ -245,21 +286,28 @@ def _logs(record):
         section = stages.get(stage)
         if not isinstance(section, dict):
             continue
-        for key in LOG_KEYS:
-            value = section.get(key)
-            if isinstance(value, list):
-                value = "\n".join(str(line) for line in value)
-            if isinstance(value, str) and value.strip():
-                entries.append({"stage": stage, "kind": key, "text": value})
+        logs = [(key, _stage_text(section, key)) for key in LOG_KEYS]
+        logs = [(key, text) for key, text in logs if text is not None]
+        error = _stage_text(section, "error")
+        if (error is not None and len([line for line in error.splitlines() if line.strip()]) > 1
+                and all(text.strip() != error.strip() for _key, text in logs)):
+            entries.append({"stage": stage, "kind": "error", "text": error})
+        for key, text in logs:
+            entries.append({"stage": stage, "kind": key, "text": text})
     return entries
 
 
 def _first_line(text):
-    """The first non-empty line of text, with ' ...' when more non-empty lines follow; None for none."""
+    """The first non-empty line of text, with ' ...' when more non-empty lines follow; None for none.
+
+    A first line that ends with ':' ("'ffmpeg' exited with status 1:") announces
+    its cause on the next line, so the next non-empty line is joined to it.
+    """
     lines = [line.strip() for line in str(text).splitlines() if line.strip()]
     if not lines:
         return None
-    return lines[0] + (" ..." if len(lines) > 1 else "")
+    shown = 2 if lines[0].endswith(":") and len(lines) > 1 else 1
+    return " ".join(lines[:shown]) + (" ..." if len(lines) > shown else "")
 
 
 def _reason(record):
@@ -268,10 +316,10 @@ def _reason(record):
     Quarantined: the plan stage's collision_reason (set when a later source's plan
     quarantined this planned record, whose plan reason is still its planning reason),
     else the plan stage's reason when its action is 'quarantine', prefixed with the
-    quarantine_reason code when the text does not start with it; the code alone when
-    neither is stored. Failed: the 'error' of the last stage (in record.STAGES order,
-    unknown stages after) that stored one, prefixed with the stage name, as its first
-    line plus ' ...' when it has more; else the first line of that stage's stderr.
+    quarantine_reason code when the text does not start with the code and ':'; the
+    code alone when neither is stored. Failed: the 'error' of the last stage (in
+    record.STAGES order, unknown stages after) that stored one, else that stage's
+    stderr, prefixed with the stage name and shortened by _first_line.
     """
     status = record.get("status")
     stages = record.get("stages") or {}
@@ -284,7 +332,7 @@ def _reason(record):
         if not (isinstance(text, str) and text.strip()):
             return _one_line(code) if code else None
         text = _one_line(text).strip()
-        if code and not text.startswith(str(code)):
+        if code and not text.startswith(str(code) + ":"):
             text = "{}: {}".format(code, text)
         return text
     if status == "failed":
@@ -295,10 +343,8 @@ def _reason(record):
             if not isinstance(section, dict):
                 continue
             for key in ("error", "stderr"):
-                value = section.get(key)
-                if isinstance(value, list):
-                    value = "\n".join(str(line) for line in value)
-                if isinstance(value, str) and value.strip():
+                value = _stage_text(section, key)
+                if value is not None:
                     return "{}: {}".format(stage, _first_line(value))
     return None
 
@@ -337,8 +383,15 @@ def rows_from_records(items, redactor=None, with_logs=False, args=None):
             return redactor.text(value)
         return value
 
+    def clean_message(value):
+        # Reasons and logs are taken from the real record: a quoted file name in them
+        # may be one no record holds, which only Redactor.quoted() redacts.
+        if redactor is not None and isinstance(value, str):
+            return redactor.text(redactor.quoted(value))
+        return value
+
     rows = []
-    for record, group in zip(prepared, groups):
+    for (_folder, real_record), record, group in zip(items, prepared, groups):
         source = record.get("source") or {}
         output = record.get("output") or {}
         folder = source.get("folder") or ""
@@ -376,11 +429,11 @@ def rows_from_records(items, redactor=None, with_logs=False, args=None):
             "path": clean(path),
             "output_name": clean(output_name),
             "changed_since": None,
-            "reason": clean(_reason(record)),
+            "reason": clean_message(_reason(real_record)),
             FOLDER_GROUP_KEY: group,
         }
         if with_logs:
-            row["logs"] = [dict(entry, text=clean(entry["text"])) for entry in _logs(record)]
+            row["logs"] = [dict(entry, text=clean_message(entry["text"])) for entry in _logs(real_record)]
         rows.append(row)
     return rows
 
@@ -497,9 +550,19 @@ def _score_text(score):
     return "--" if score is None else str(score)
 
 
+def _single_line(value):
+    """value on one line: every line boundary str.splitlines() knows (also U+2028, U+0085) becomes a space.
+
+    parse_report_header splits a report with splitlines(), so a field written with
+    any of those inside would start a line of its own (a '## Folders' heading, a
+    table row) in a report read back with --from.
+    """
+    return " ".join(("" if value is None else str(value)).splitlines())
+
+
 def _cell(value):
     text = "" if value is None else str(value)
-    return text.replace("\\", "\\\\").replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+    return _single_line(text.replace("\\", "\\\\").replace("|", "\\|"))
 
 
 def _fence(text):
@@ -576,8 +639,8 @@ def _group_by_folder(rows):
 
 
 def _one_line(value):
-    """A text-report field on one line: carriage returns and newlines become spaces."""
-    return ("" if value is None else str(value)).replace("\r", " ").replace("\n", " ")
+    """A text-report field on one line (see _single_line)."""
+    return _single_line(value)
 
 
 def _header_lines(header):
@@ -676,12 +739,12 @@ def render_markdown(header, rows, shown=None):
     if explained:
         lines.extend(["", REASONS_HEADING, ""])
         for row in explained:
-            lines.append("- {}: {}".format(shown.get(str(row.get("id") or "")), _one_line(row["reason"])))
+            lines.append("- {}: {}".format(shown.get(str(row.get("id") or "")), _single_line(row["reason"])))
     if rows:
         lines.extend(["", FOLDERS_HEADING, ""])
         for folder, members in _group_by_folder(rows):
             lines.append("- {}: {}".format(
-                (folder or "./").replace("\r", " ").replace("\n", " "),
+                _single_line(folder or "./"),
                 ", ".join(shown.get(str(row.get("id") or "")) for row in members)))
     logged = [row for row in rows if row.get("logs")]
     if header.get("with_logs"):
@@ -1005,6 +1068,13 @@ def produce(args, stored=None, from_report_id=None):
         # may name another record's file (an output collision names the other source).
         for _folder, record in collected:
             redactor.learn(record)
+        # A PATH that is one file collects only its own record, but its reason may name a
+        # neighbour (the other source of an output collision): the records of its folder
+        # are learned too, for the redactor only; they add no rows.
+        for path in paths:
+            if Path(path).is_file():
+                for record in _folder_records(Path(path).absolute().parent, args):
+                    redactor.learn(record)
     rows = rows_from_records(items, redactor=redactor, with_logs=getattr(args, "with_logs", False), args=args)
     if stored is not None:
         missing = mark_changed(rows, stored_rows)
