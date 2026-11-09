@@ -33,6 +33,7 @@ import vidfunnel.encode
 import vidfunnel.ffmpeg
 import vidfunnel.interrupt
 import vidfunnel.plan
+from vidfunnel.cli import DRAIN_SIGNAL, STOP_SIGNALS
 from vidfunnel.ffmpeg import FfmpegError, ToolNotFound, find_tools, null_decode, run
 from vidfunnel.interrupt import Interrupted, interrupted, run_pool
 from vidfunnel.record import RECORD_DIR, cheap_fingerprint, fingerprint_matches, load_record, record_path, sha256_file
@@ -759,6 +760,23 @@ def _make_long_clip(path):
                     "-shortest", str(path)], check=True)
 
 
+_RESET_IN_CHILD = tuple(getattr(signal, name) for name in ("SIGINT",) + STOP_SIGNALS + (DRAIN_SIGNAL,))
+
+
+def _default_signal_actions():
+    """preexec_fn: SIGINT, the stop signals and the drain signal start at their default action in the child.
+
+    A disposition of SIG_IGN is inherited across fork and exec, and vidfunnel
+    leaves an inherited SIG_IGN alone (the nohup rule in
+    install_sigterm_handler). 'sh -c "... && python3 -m unittest"' (the CI
+    container job) runs the suite with SIGQUIT ignored: busybox ash ignores
+    SIGQUIT itself and execs its last command without restoring it. Without
+    this reset the signal a test sends would be ignored.
+    """
+    for signum in _RESET_IN_CHILD:
+        signal.signal(signum, signal.SIG_DFL)
+
+
 def _interrupt_command(arguments, trigger, settle, signum=signal.SIGINT, group=True, groups=None,
                        again_after=None, environment=None, timeout=60, act=None):
     """Run vidfunnel with `arguments`, SIGINT its process group `settle` s after a stdout line holding `trigger`.
@@ -775,7 +793,7 @@ def _interrupt_command(arguments, trigger, settle, signum=signal.SIGINT, group=T
     process = subprocess.Popen([sys.executable, "-m", "vidfunnel"] + arguments, cwd=REPO_ROOT, env=environment,
                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                universal_newlines=True, start_new_session=True,
-                               preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+                               preexec_fn=_default_signal_actions)
     if groups is not None:
         groups.append(process.pid)
     lines = []

@@ -785,6 +785,17 @@ class FlockHolderTests(TempDirCase):
         except ProcessLookupError:
             pass
 
+    @staticmethod
+    def has_ended(pid):
+        """True once `pid` has exited. An orphan is reparented to PID 1 (or a subreaper); when that is this
+        test process ('podman run ... sh -c "... && python3 -m unittest"': ash execs its last command), the
+        exited orphan stays a zombie that os.kill(pid, 0) still finds until it is reaped here."""
+        try:
+            reaped, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return not pid_alive(pid)
+        return reaped == pid
+
     def judge(self, warnings):
         with mock.patch("vidfunnel.record.in_container", return_value=False):
             with FolderLock(self.base, warn=warnings.append):
@@ -1020,7 +1031,7 @@ class FlockHolderTests(TempDirCase):
         self.assertIn("still holds the lock file's flock", str(caught.exception))
         os.kill(child_pid, 9)
         deadline = datetime.datetime.now() + datetime.timedelta(seconds=10)
-        while pid_alive(child_pid):
+        while not self.has_ended(child_pid):
             self.assertLess(datetime.datetime.now(), deadline, "the stand-in did not end")
             time.sleep(0.02)
         warnings = []
