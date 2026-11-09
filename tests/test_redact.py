@@ -4,7 +4,7 @@ Each table is a list of (input, expected) pairs; reading the table is reading
 the behaviour.
 """
 
-VERSION = "20261102"
+VERSION = "20261108"
 
 import copy
 import random
@@ -20,56 +20,70 @@ from vidfunnel.redact import (
 )
 
 WORD_TABLE = [
-    ("Client", "C_____"),
+    ("Client", "C____t"),
     ("part2", "p___#"),
     ("2019", "####"),
     ("2nd", "#__"),
     ("x", "x"),
     ("7", "#"),
-    ("Éléphant", "É_______"),
+    ("Éléphant", "É______t"),
     ("ÉLAN42", "É___##"),
     ("東京", "東_"),
+    ("Day", "D__"),
+    ("Wedd", "W__d"),
+    ("Weddi", "W___i"),
+    ("Wedding", "W_____g"),
+    ("reception", "r_______n"),
+    ("ab12", "a_##"),
+    ("abc1", "a__#"),
+    ("café", "c__é"),
+    ("cafe\u0301", "c__e\u0301"),
+    ("cafe\u0301s", "c____s"),
     ("", ""),
 ]
 
 NAME_TABLE = [
     ("Client Name - Deposition 2019-03-14 part2.avi",
-     "C_____ N___ - D_________ ####-##-## p___#.avi"),
-    ("Holiday (Paris) [1998] final.mkv", "H______ (P____) [####] f____.mkv"),
-    ("Éléphant.mov", "É_______.mov"),
-    ("1998 summer.mpg", "#### s_____.mpg"),
-    ("NoExtension", "N__________"),
-    ("movie.part1.avi", "m____.p___#.avi"),
-    ("Dr. Smith interview", "D_. S____ i________"),
-    ("archive.tar.gz", "a______.t__.gz"),
-    ("clip.m2ts", "c___.m2ts"),
-    ("tape_03-side_B.vob", "t____##-s____B.vob"),
-    (".hidden", ".h_____"),
-    ("Bob's Party!.flv", "B__'s P____!.flv"),
+     "C____t N__e - D________n ####-##-## p___#.avi"),
+    ("Holiday (Paris) [1998] final.mkv", "H_____y (P___s) [####] f___l.mkv"),
+    ("Éléphant.mov", "É______t.mov"),
+    ("1998 summer.mpg", "#### s____r.mpg"),
+    ("NoExtension", "N_________n"),
+    ("movie.part1.avi", "m___e.p___#.avi"),
+    ("Dr. Smith interview", "D_. S___h i_______w"),
+    ("archive.tar.gz", "a_____e.t__.gz"),
+    ("clip.m2ts", "c__p.m2ts"),
+    ("tape_03-side_B.vob", "t__e_##-s__e_B.vob"),
+    (".hidden", ".h____n"),
+    ("Bob's Party!.flv", "B__'s P___y!.flv"),
+    ("Wedding Day reception 2004-06-12 part 2.avi", "W_____g D__ r_______n ####-##-## p__t #.avi"),
+    ("Jean-Pierre and Marie-Claire.mkv", "J__n-P____e a__ M___e-C____e.mkv"),
+    ("tape.v2.final cut 03.avi", "t__e.v#.f___l c__ ##.avi"),
+    ("Été à Montréal 1987.mov", "É__ à M______l ####.mov"),
 ]
 
 PATH_ROOTS = ("/srv/media/Family Videos",)
 
 PATH_TABLE = [
-    ("/srv/media/Family Videos/Paris 1998/Holiday.avi", "<root>/P____ ####/H______.avi"),
+    ("/srv/media/Family Videos/Paris 1998/Holiday.avi", "<root>/P___s ####/H_____y.avi"),
     ("/srv/media/Family Videos", "<root>"),
-    ("/srv/media/Family Videos Extra/Clip.avi", "/s__/m____/F_____ V_____ E____/C___.avi"),
-    ("/home/kris/Client Name/tape 2.mpg", "/h___/k___/C_____ N___/t___ #.mpg"),
-    ("relative/dir/movie.avi", "r_______/d__/m____.avi"),
+    ("/srv/media/Family Videos Extra/Clip.avi", "/s__/m___a/F____y V____s E___a/C__p.avi"),
+    ("/home/kris/Client Name/tape 2.mpg", "/h__e/k__s/C____t N__e/t__e #.mpg"),
+    ("relative/dir/movie.avi", "r______e/d__/m___e.avi"),
     ("/a/../b/./c.dv", "/a/../b/./c.dv"),
 ]
 
 METADATA_TABLE = [
-    ("Client Name deposition, day 2", "C_____ N___ d_________, d__ #"),
-    ("Smith v. Jones (2019)", "S____ v. J____ (####)"),
-    ("SoundHandler", "S___________"),
+    ("Client Name deposition, day 2", "C____t N__e d________n, d__ #"),
+    ("Smith v. Jones (2019)", "S___h v. J___s (####)"),
+    ("SoundHandler", "S__________r"),
     ("", ""),
 ]
 
 YEAR_TABLE = [
     (("2019-03-14T10:22:33.000000Z", "creation_time"), "2019"),
     (("Thu Mar 14 10:22:33 2019", "creation_time"), "2019"),
-    (("unknown", "date"), "u______"),
+    (("unknown", "date"), "u_____n"),
     ((1552558953, "mtime"), 1546300800),
     ((1552558953.5, "mtime"), 1546300800.0),
     ((1552558953123456789, "mtime_ns"), 1546300800000000000),
@@ -94,7 +108,7 @@ class TableTests(unittest.TestCase):
                 self.assertEqual(redact_path(path, PATH_ROOTS), expected)
 
     def test_folder_path_keeps_no_extension(self):
-        self.assertEqual(redact_path("/data/Season.avi", last_is_file=False), "/d___/S_____.a__")
+        self.assertEqual(redact_path("/data/Season.avi", last_is_file=False), "/d__a/S____n.a__")
 
     def test_metadata(self):
         for value, expected in METADATA_TABLE:
@@ -134,9 +148,9 @@ class PropertyTests(unittest.TestCase):
 SOURCE_FOLDER = "/srv/media/Family Videos/Client Name"
 SOURCE_PATH = SOURCE_FOLDER + "/Client Name - Deposition 2019-03-14 part2.avi"
 OUTPUT_PATH = SOURCE_FOLDER + "/Client Name - Deposition 2019-03-14 part2.mp4"
-REDACTED_FOLDER = "<root>/C_____ N___"
-REDACTED_SOURCE = REDACTED_FOLDER + "/C_____ N___ - D_________ ####-##-## p___#.avi"
-REDACTED_OUTPUT = REDACTED_FOLDER + "/C_____ N___ - D_________ ####-##-## p___#.mp4"
+REDACTED_FOLDER = "<root>/C____t N__e"
+REDACTED_SOURCE = REDACTED_FOLDER + "/C____t N__e - D________n ####-##-## p___#.avi"
+REDACTED_OUTPUT = REDACTED_FOLDER + "/C____t N__e - D________n ####-##-## p___#.mp4"
 
 
 def sample_record():
@@ -201,8 +215,8 @@ class RedactorTests(unittest.TestCase):
     def test_text_longest_first_and_word_bounded(self):
         redactor = Redactor(values=["/data/Clients", "/data/Clients/Ann.avi", "Ann"])
         table = [
-            ("open /data/Clients/Ann.avi now", "open /d___/C______/A__.avi now"),
-            ("folder /data/Clients:", "folder /d___/C______:"),
+            ("open /data/Clients/Ann.avi now", "open /d__a/C_____s/A__.avi now"),
+            ("folder /data/Clients:", "folder /d__a/C_____s:"),
             ("Ann said; Annual report", "A__ said; Annual report"),
         ]
         for text, expected in table:
@@ -221,22 +235,22 @@ class RedactorTests(unittest.TestCase):
         self.assertEqual(original, untouched, "record() must not modify its argument")
 
         changed = [
-            (redacted["source"]["name"], "C_____ N___ - D_________ ####-##-## p___#.avi"),
+            (redacted["source"]["name"], "C____t N__e - D________n ####-##-## p___#.avi"),
             (redacted["source"]["folder"], REDACTED_FOLDER),
-            (redacted["output"]["name"], "C_____ N___ - D_________ ####-##-## p___#.mp4"),
-            (redacted["output"]["sidecars"], ["C_____ N___ - D_________ ####-##-## p___#.srt"]),
+            (redacted["output"]["name"], "C____t N__e - D________n ####-##-## p___#.mp4"),
+            (redacted["output"]["sidecars"], ["C____t N__e - D________n ####-##-## p___#.srt"]),
             (redacted["stages"]["probe"]["path"], REDACTED_SOURCE),
-            (redacted["stages"]["probe"]["format"]["tags"]["title"], "D_________ o_ C_____ N___"),
-            (redacted["stages"]["probe"]["streams"][0]["title"], "C_____ L___"),
-            (redacted["stages"]["probe"]["streams"][0]["tags"]["handler_name"], "C_____ L___"),
-            (redacted["stages"]["probe"]["streams"][1]["tags"]["comment"], "R_______ a_ S____ o_____"),
-            (redacted["stages"]["probe"]["chapters"][0]["title"], "O______ s________"),
+            (redacted["stages"]["probe"]["format"]["tags"]["title"], "D________n o_ C____t N__e"),
+            (redacted["stages"]["probe"]["streams"][0]["title"], "C____a L__t"),
+            (redacted["stages"]["probe"]["streams"][0]["tags"]["handler_name"], "C____a L__t"),
+            (redacted["stages"]["probe"]["streams"][1]["tags"]["comment"], "R______d a_ S___h o____e"),
+            (redacted["stages"]["probe"]["chapters"][0]["title"], "O_____g s_______t"),
             (redacted["stages"]["plan"]["argv"],
              ["/usr/bin/ffmpeg", "-i", REDACTED_SOURCE, "-c:v", "libx264",
-              "-metadata", "title=D_________ o_ C_____ N___", REDACTED_OUTPUT]),
+              "-metadata", "title=D________n o_ C____t N__e", REDACTED_OUTPUT]),
             (redacted["stages"]["convert"]["stderr"],
              "Input #0, avi, from '" + REDACTED_SOURCE + "':\n"
-             "    title           : D_________ o_ C_____ N___\n"),
+             "    title           : D________n o_ C____t N__e\n"),
             (redacted["stages"]["convert"]["message_classes"],
              {"[mpeg4] error in '" + REDACTED_SOURCE + "'": 2}),
         ]
@@ -281,7 +295,7 @@ class RedactorTests(unittest.TestCase):
         record["history"] = [sample_record()]
         redacted = Redactor().record(record)
         self.assertEqual(redacted["history"][0]["source"]["name"],
-                         "C_____ N___ - D_________ ####-##-## p___#.avi")
+                         "C____t N__e - D________n ####-##-## p___#.avi")
         self.assertEqual(redacted["history"][0]["id"], record["id"])
 
 

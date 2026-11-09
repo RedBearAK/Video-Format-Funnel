@@ -2,13 +2,15 @@
 
 Every rule here is a pure function of the string: deterministic, no salt, no
 state. A word that starts with a letter keeps that letter; every further letter
-becomes '_' and every further digit '#'. A word that starts with a digit is
-masked completely by class. Anything that is not a letter, digit or combining
-mark (space, '_', '-', '.', parentheses, brackets and any other punctuation) is
-a separator and is kept as it is, so length and separator positions survive.
+becomes '_' and every further digit '#', except that a word of four or more
+characters also keeps its last character when that is a letter. A word that
+starts with a digit is masked completely by class. Anything that is not a
+letter, digit or combining mark (space, '_', '-', '.', parentheses, brackets
+and any other punctuation) is a separator and is kept as it is, so length and
+separator positions survive.
 
     Client Name - Deposition 2019-03-14 part2.avi
-    C_____ N___ - D_________ ####-##-## p___#.avi
+    C____t N__e - D________n ####-##-## p___#.avi
 
 The Redactor class applies these rules to whole records and substitutes every
 real path and metadata value it has seen inside free text (ffmpeg argv and
@@ -16,7 +18,7 @@ stderr, rendered report rows). Records on disk are never redacted; this module
 only transforms copies for output.
 """
 
-VERSION = "20261102"
+VERSION = "20261108"
 
 import copy
 import datetime
@@ -76,10 +78,17 @@ def _mask_char(char):
     return char
 
 
+def _is_mark(char):
+    return unicodedata.category(char).startswith("M")
+
+
 def redact_word(word):
     """Redact one word: keep a non-digit first character, mask the rest by class.
 
-    A word starting with a digit is masked completely. Characters that are not
+    A word of four or more characters (combining marks not counted) also keeps
+    its last character, with any combining marks on it, when that character is
+    a letter: 'Wedding' -> 'W_____g', 'Day' -> 'D__', 'part2' -> 'p___#'. A
+    word starting with a digit is masked completely. Characters that are not
     letters, digits or combining marks are returned unchanged.
     """
     if not word:
@@ -87,6 +96,12 @@ def redact_word(word):
     first = word[0]
     if _is_digit_char(first):
         return "".join(_mask_char(char) for char in word)
+    last = len(word) - 1
+    while last > 0 and _is_mark(word[last]):
+        last -= 1
+    characters = sum(1 for char in word if not _is_mark(char))
+    if characters >= 4 and last > 0 and word[last].isalpha() and not _is_digit_char(word[last]):
+        return first + "".join(_mask_char(char) for char in word[1:last]) + word[last:]
     return first + "".join(_mask_char(char) for char in word[1:])
 
 

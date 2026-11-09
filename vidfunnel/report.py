@@ -17,6 +17,18 @@ and each row's status and score back. CSV is plain RFC 4180 data (one column
 name row, then one row per record); its header goes to stderr and it cannot be
 used with --from.
 
+The text format (the default) is for reading in a terminal: the header as
+plain lines, then the rows grouped by folder, the folder line printed once per
+group. Groups are ordered by the position of their worst row in the sort order
+below, and rows inside a group keep that order, so the worst row of the whole
+report is still the first row printed. It cannot be read back with --from.
+
+Text and Markdown show each record ID as its first 8 characters (longer only
+when two rows of the report would share them), which 'vidfunnel find' accepts
+as a prefix. '--from' resolves such prefixes against the records it finds; a
+prefix that matches more than one record is an error naming both. JSON and CSV
+keep the full IDs.
+
 A redacted report records its paths as '<root>', which is what keeps the
 directory structure out of it. '--from' on such a report therefore needs the
 PATH arguments again, or the central index (rows are then found by record ID).
@@ -25,6 +37,7 @@ PATH arguments again, or the central index (rows are then found by record ID).
 VERSION = "20261108"
 
 import argparse
+import bisect
 import csv
 import io
 import json
@@ -40,8 +53,8 @@ from vidfunnel.progress import format_bytes, say
 from vidfunnel.record import STATUSES, STAGES, RecordError, band, iter_records, load_record, now_iso
 from vidfunnel.redact import ROOT_MARK, Redactor, redact_path
 
-FORMATS = ("md", "json", "csv")
-DEFAULT_FORMAT = "md"
+FORMATS = ("text", "md", "json", "csv")
+DEFAULT_FORMAT = "text"
 
 HINT_REDACTED = (
     "Names in this report are redacted. To see them, re-run the same command with --reveal, "
@@ -61,12 +74,21 @@ ROW_FIELDS = (
     "source_size", "output_size", "ratio", "path", "output_name", "changed_since",
 )
 LOG_KEYS = ("stderr", "log", "run_log")
-MD_COLUMNS = ("ID", "score", "band", "status", "action", "flags", "source -> output", "path")
+MD_COLUMNS = ("ID", "score", "band", "status", "action", "flags", "source", "size")
+# The table of reports written before 20261108; --from still reads it.
+OLD_MD_COLUMNS = ("ID", "score", "band", "status", "action", "flags", "source -> output", "path")
+SHORT_ID_LENGTH = 8
+FOLDERS_HEADING = "## Folders"
+TEXT_TITLE = "vidfunnel report"
 
 
 
 class ReportError(Exception):
     """A report cannot be produced or read back; the message says why."""
+
+
+class ReportUsageError(ReportError):
+    """The report given to --from is of a kind that cannot be read back (a text report)."""
 
 
 def _stderr(message, args=None):
@@ -245,6 +267,12 @@ def rows_from_records(items, redactor=None, with_logs=False):
         ratio = None
         if isinstance(source_size, int) and isinstance(output_size, int) and source_size > 0:
             ratio = round(float(output_size) / source_size, 3)
+        # Until retire renames it, an interim-named output ('<stem>.vidfunnel.mp4') is the file on disk.
+        output_name = output.get("name")
+        if output.get("interim_name") and record.get("status") != "retired":
+            output_name = output.get("interim_name")
+        elif not output_name:
+            output_name = output.get("interim_name")
         score = record.get("score")
         row = {
             "id": record.get("id"),
@@ -258,7 +286,7 @@ def rows_from_records(items, redactor=None, with_logs=False):
             "output_size": output_size,
             "ratio": ratio,
             "path": clean(path),
-            "output_name": clean(output.get("name") or output.get("interim_name")),
+            "output_name": clean(output_name),
             "changed_since": None,
         }
         if with_logs:
@@ -385,44 +413,143 @@ def _fence(text):
     return "`" * max(3, longest + 1)
 
 
+def short_ids(rows):
+    """{full ID: shown ID}: the first 8 characters, more where two rows of the report share them."""
+    ids = [str(row.get("id") or "") for row in rows]
+    shown = {}
+    for record_id in ids:
+        length = SHORT_ID_LENGTH
+        while length < len(record_id) and any(
+                other != record_id and other[:length] == record_id[:length] for other in ids):
+            length += 1
+        shown[record_id] = record_id[:length]
+    return shown
+
+
+def _split_path(path):
+    """(folder with a trailing '/', file name) of a row's path."""
+    text = str(path or "")
+    if "/" not in text:
+        return "", text
+    folder, name = text.rsplit("/", 1)
+    return folder + "/", name
+
+
+def _size_text(size):
+    return "--" if size is None else format_bytes(size)
+
+
+def _sizes(row):
+    return "{} -> {}".format(_size_text(row.get("source_size")), _size_text(row.get("output_size")))
+
+
+def _output_differs(source_name, output_name):
+    """True when the output name is not the source stem plus '.mp4' (interim name, DVD title)."""
+    if not output_name:
+        return False
+    return output_name != os.path.splitext(source_name)[0] + ".mp4"
+
+
+def _group_by_folder(rows):
+    """[(folder, [rows])]: folders in the order of their first (worst) row, rows in report order."""
+    groups = {}
+    for row in rows:
+        folder, _name = _split_path(row.get("path"))
+        groups.setdefault(folder, []).append(row)
+    return list(groups.items())
+
+
+def _header_lines(header):
+    lines = ["report ID: {}".format(header.get("report_id")),
+             "generated at: {}".format(header.get("generated_at")),
+             "tool version: {}".format(header.get("tool_version")),
+             "invocation: {}".format(header.get("command")),
+             "redacted: {}{}".format("yes" if header.get("redacted") else "no",
+                                     ", dates to the year" if header.get("redact_dates") else ""),
+             "records: {}".format(header.get("records"))]
+    if header.get("unreadable_records"):
+        lines.append("unreadable records skipped: {}".format(header.get("unreadable_records")))
+    if header.get("from_report"):
+        lines.append("reissue of report: {}".format(header.get("from_report")))
+    return lines
+
+
+def render_text(header, rows):
+    """Plain header lines, then one block per row grouped by folder, columns aligned over the report."""
+    lines = [TEXT_TITLE, "", header.get("hint", ""), ""]
+    lines.extend(_header_lines(header))
+    shown = short_ids(rows)
+    table = []
+    for row in rows:
+        table.append((_score_text(row.get("score")), row.get("band") or "--", row.get("status") or "--",
+                      row.get("action") or "--", ", ".join(row.get("flags") or ()) or "--",
+                      shown.get(str(row.get("id") or ""), "")))
+    widths = [max([len(cells[column]) for cells in table] or [0]) for column in range(6)]
+    cells_of = {id(row): cells for row, cells in zip(rows, table)}
+    indent = " " * (2 + widths[0] + 2)
+    if not rows:
+        lines.extend(["", "No records."])
+    for folder, members in _group_by_folder(rows):
+        lines.extend(["", folder or "./"])
+        for row in members:
+            cells = cells_of[id(row)]
+            first = "  " + cells[0].rjust(widths[0]) + "  " + "  ".join(
+                cells[column].ljust(widths[column]) for column in range(1, 5)) + "  " + cells[5]
+            lines.append(first)
+            _folder, name = _split_path(row.get("path"))
+            second = indent + name
+            if row.get("output_name"):
+                second += "  ->  " + row["output_name"]
+            lines.append(second + "   (" + _sizes(row) + ")")
+            if row.get("changed_since"):
+                lines.append(indent + "changed since: " + row["changed_since"])
+            for entry in row.get("logs") or ():
+                lines.append(indent + "{} {}:".format(entry["stage"], entry["kind"]))
+                for log_line in entry["text"].rstrip("\n").split("\n"):
+                    lines.append(indent + "  " + log_line)
+    if header.get("with_logs") and not any(row.get("logs") for row in rows):
+        lines.extend(["", "No stderr or run log is stored in these records."])
+    return "\n".join(lines) + "\n"
+
+
 def render_markdown(header, rows):
     """Hint line, header list, machine-readable header comment, table, then logs if any."""
     lines = ["# vidfunnel report", "", "> " + header.get("hint", ""), ""]
-    lines.append("- report ID: {}".format(header.get("report_id")))
-    lines.append("- generated at: {}".format(header.get("generated_at")))
-    lines.append("- tool version: {}".format(header.get("tool_version")))
-    lines.append("- invocation: {}".format(_cell(header.get("command"))))
-    lines.append("- redacted: {}{}".format("yes" if header.get("redacted") else "no",
-                                           ", dates to the year" if header.get("redact_dates") else ""))
-    lines.append("- records: {}".format(header.get("records")))
-    if header.get("unreadable_records"):
-        lines.append("- unreadable records skipped: {}".format(header.get("unreadable_records")))
-    if header.get("from_report"):
-        lines.append("- reissue of report: {}".format(header.get("from_report")))
+    for line in _header_lines(header):
+        if line.startswith("invocation: "):
+            line = "invocation: " + _cell(header.get("command"))
+        lines.append("- " + line)
     # JSON never puts '>' outside a string, so escaping it keeps '-->' out of the comment.
     machine = json.dumps(header, sort_keys=True, ensure_ascii=False).replace(">", "\\u003e")
     lines.extend(["", HEADER_COMMENT_START + machine + HEADER_COMMENT_END, ""])
     lines.append("| " + " | ".join(MD_COLUMNS) + " |")
     lines.append("|" + "|".join("---" for _column in MD_COLUMNS) + "|")
+    shown = short_ids(rows)
     for row in rows:
         status = row.get("status") or "--"
         if row.get("changed_since"):
             status = "{} (changed-since: {})".format(status, row["changed_since"])
-        sizes = "{} -> {}".format(format_bytes(row.get("source_size")),
-                                  format_bytes(row.get("output_size")))
-        if row.get("output_name"):
-            sizes = "{} ({})".format(sizes, row["output_name"])
-        cells = (row.get("id"), _score_text(row.get("score")), row.get("band") or "--", status,
-                 row.get("action") or "--", ", ".join(row.get("flags") or ()) or "--", sizes,
-                 row.get("path"))
+        _folder, name = _split_path(row.get("path"))
+        source = name
+        if _output_differs(name, row.get("output_name")):
+            source = "{} -> {}".format(name, row["output_name"])
+        cells = (shown.get(str(row.get("id") or "")), _score_text(row.get("score")), row.get("band") or "--",
+                 status, row.get("action") or "--", ", ".join(row.get("flags") or ()) or "--", source,
+                 _sizes(row))
         lines.append("| " + " | ".join(_cell(cell) for cell in cells) + " |")
+    if rows:
+        lines.extend(["", FOLDERS_HEADING, ""])
+        for folder, members in _group_by_folder(rows):
+            lines.append("- {}: {}".format(
+                (folder or "./").replace("\r", " ").replace("\n", " "),
+                ", ".join(shown.get(str(row.get("id") or "")) for row in members)))
     logged = [row for row in rows if row.get("logs")]
     if header.get("with_logs"):
         lines.extend(["", "## Logs"])
         if not logged:
             lines.extend(["", "No stderr or run log is stored in these records."])
         for row in logged:
-            lines.extend(["", "### {}".format(row.get("id"))])
+            lines.extend(["", "### {}".format(shown.get(str(row.get("id") or "")))])
             for entry in row["logs"]:
                 fence = _fence(entry["text"])
                 lines.extend(["", "{} {}:".format(entry["stage"], entry["kind"]), "",
@@ -457,7 +584,7 @@ def render_csv(header, rows):
     return buffer.getvalue()
 
 
-RENDERERS = {"md": render_markdown, "json": render_json, "csv": render_csv}
+RENDERERS = {"text": render_text, "md": render_markdown, "json": render_json, "csv": render_csv}
 
 
 # ---------------------------------------------------------------- reading a report back
@@ -477,8 +604,12 @@ def parse_report_header(text):
     """Read a Markdown or JSON report back.
 
     Returns {'format': 'md'|'json', 'header': dict, 'invocation': list,
-    'rows': {id: {'status': ..., 'score': ...}}}. Raises ReportError for CSV or
-    anything else without a vidfunnel report header.
+    'rows': {id: {'status': ..., 'score': ...}}, 'folders': {id: folder}}. The
+    row keys are the IDs as the report shows them: full IDs in JSON and in
+    Markdown written before 20261108, prefixes in newer Markdown (see
+    resolve_stored_rows). 'folders' comes from the Markdown Folders section
+    (empty for JSON and the old layout). Raises ReportUsageError for a text
+    report and ReportError for CSV or anything else without a report header.
     """
     stripped = text.lstrip()
     if stripped.startswith("{"):
@@ -494,10 +625,13 @@ def parse_report_header(text):
                 rows[row["id"]] = {"status": row.get("status"), "score": row.get("score")}
         header = data["header"]
         return {"format": "json", "header": header, "invocation": list(header.get("invocation") or ()),
-                "rows": rows}
+                "rows": rows, "folders": {}}
     header = None
     rows = {}
+    folders = {}
     in_table = False
+    in_folders = False
+    columns = 0
     for line in text.splitlines():
         if line.startswith(HEADER_COMMENT_START) and line.endswith(HEADER_COMMENT_END):
             payload = line[len(HEADER_COMMENT_START):len(line) - len(HEADER_COMMENT_END)]
@@ -506,8 +640,26 @@ def parse_report_header(text):
             except ValueError as error:
                 raise ReportError("the report header comment is not valid JSON: {}".format(error))
             continue
-        if line.startswith("| ID |"):
+        if line.strip() == "## Logs":
+            # Everything below is log text, which may hold any line at all.
+            break
+        if line.startswith("| ID |") and not columns:
+            names = tuple(cell.strip() for cell in line.strip().split("|")[1:-1])
+            if names not in (MD_COLUMNS, OLD_MD_COLUMNS):
+                raise ReportError("the report table has unknown columns: {}".format(", ".join(names)))
+            columns = len(names)
             in_table = True
+            continue
+        if line.startswith("#"):
+            in_folders = line.strip() == FOLDERS_HEADING
+            continue
+        if in_folders and line.startswith("- "):
+            folder, separator, listed = line[2:].rpartition(": ")
+            if not separator:
+                raise ReportError("a line of the Folders section has no ': ': '{}'".format(line))
+            for shown_id in listed.split(","):
+                if shown_id.strip():
+                    folders[shown_id.strip()] = folder
             continue
         if in_table:
             if not line.startswith("|"):
@@ -516,17 +668,53 @@ def parse_report_header(text):
             if line.startswith("|---"):
                 continue
             cells = [cell.strip() for cell in re.split(r"(?<!\\)\|", line.strip())[1:-1]]
-            if len(cells) < len(MD_COLUMNS):
+            if len(cells) < columns:
                 raise ReportError("a report table row has {} cells, expected {}".format(
-                    len(cells), len(MD_COLUMNS)))
+                    len(cells), columns))
             status = cells[3].split(" ", 1)[0]
             rows[cells[0]] = {"status": None if status == "--" else status,
                               "score": _parse_score(cells[1])}
     if not isinstance(header, dict):
+        first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        if first == TEXT_TITLE:
+            raise ReportUsageError("this is a text report, which is for reading and cannot be read "
+                                   "back; give --from a Markdown or JSON report (--format md or json)")
         raise ReportError("no vidfunnel report header found (only Markdown and JSON reports "
                           "can be read back; CSV carries no header)")
     return {"format": "md", "header": header, "invocation": list(header.get("invocation") or ()),
-            "rows": rows}
+            "rows": rows, "folders": folders}
+
+
+def resolve_stored_rows(stored_rows, items):
+    """Map the IDs of a stored report (full IDs or prefixes) to the records found now.
+
+    Returns ({full ID: stored entry}, [shown IDs no record matches]). Matching is
+    the rule of 'vidfunnel find': case-insensitive, the ID equals or starts with
+    the shown one. A shown ID that matches more than one record raises ReportError
+    naming two of them.
+    """
+    ids = sorted({(str(record.get("id")).lower(), str(record.get("id")))
+                  for _folder, record in items if record.get("id")})
+    keys = [lowered for lowered, _record_id in ids]
+    resolved = {}
+    missing = []
+    for shown_id, entry in stored_rows.items():
+        prefix = str(shown_id).strip().lower()
+        matches = []
+        position = bisect.bisect_left(keys, prefix) if prefix else len(keys)
+        while position < len(keys) and keys[position].startswith(prefix):
+            matches.append(ids[position][1])
+            position += 1
+        if len(matches) > 1:
+            raise ReportError("the ID '{}' of the earlier report matches more than one record: '{}' and "
+                              "'{}'{}; give PATH arguments that hold only one of them".format(
+                                  shown_id, matches[0], matches[1],
+                                  " and {} more".format(len(matches) - 2) if len(matches) > 2 else ""))
+        if matches:
+            resolved[matches[0]] = entry
+        else:
+            missing.append(shown_id)
+    return resolved, missing
 
 
 # ---------------------------------------------------------------- command line
@@ -536,7 +724,7 @@ def add_arguments(parser):
     parser.add_argument("paths", nargs="*", metavar="PATH",
                         help="folders (walked for .vidfunnel records) or source files")
     parser.add_argument("--format", choices=FORMATS, default=None,
-                        help="output format (default md)")
+                        help="output format: text (the default, for reading), md, json or csv")
     parser.add_argument("--min-score", type=int, default=None, metavar="N",
                         help="only rows with a score of at least N (drops unscored rows)")
     parser.add_argument("--max-score", type=int, default=None, metavar="N",
@@ -572,8 +760,14 @@ def _stored_args(invocation):
             " ".join(shlex.quote(str(part)) for part in invocation)))
 
 
-def _merge(current, stored):
-    """The stored invocation with whatever the current command line adds or overrides."""
+def _merge(current, stored, folders=None):
+    """The stored invocation with whatever the current command line adds or overrides.
+
+    folders: the folders of a Markdown report's Folders section. When the stored
+    report was revealed, its invocation names no PATH (it read the index) and the
+    current command line gives none, those folders become the PATHs and only the
+    stored rows are kept ('only_stored_rows').
+    """
     merged = argparse.Namespace(**vars(stored))
     for attribute in ("format", "min_score", "max_score", "status", "db"):
         value = getattr(current, attribute, None)
@@ -584,12 +778,20 @@ def _merge(current, stored):
             setattr(merged, attribute, True)
     stored_paths = [path for path in stored.paths or () if not str(path).startswith(ROOT_MARK)]
     redacted_paths = len(stored_paths) != len(stored.paths or ())
+    merged.only_stored_rows = False
     if getattr(current, "paths", None):
         merged.paths = list(current.paths)
     elif redacted_paths:
         merged.paths = []
     else:
         merged.paths = stored_paths
+    real_folders = []
+    for folder in (folders or {}).values():
+        if folder and not folder.startswith(ROOT_MARK) and folder not in real_folders:
+            real_folders.append(folder)
+    if not merged.paths and not redacted_paths and stored.reveal and real_folders:
+        merged.paths = real_folders
+        merged.only_stored_rows = True
     merged.from_report = None
     for attribute in ("quiet", "verbose"):
         setattr(merged, attribute, getattr(current, attribute, False))
@@ -614,9 +816,13 @@ def produce(args, stored=None, from_report_id=None):
     for path in paths:
         _stderr("report: reading records under '{}'".format(path), args)
     items = collect(paths, use_index=use_index, db_path=getattr(args, "db", None), errors=errors)
-    if not paths and stored is not None:
-        wanted = set(stored["rows"])
-        items = [(folder, record) for folder, record in items if record.get("id") in wanted]
+    stored_rows = {}
+    if stored is not None:
+        stored_rows, unmatched = resolve_stored_rows(stored["rows"], items)
+        for shown_id in unmatched:
+            _stderr("report: record {} from the earlier report was not found now".format(shown_id), args)
+        if not paths or getattr(args, "only_stored_rows", False):
+            items = [(folder, record) for folder, record in items if record.get("id") in stored_rows]
     items = filter_items(items, getattr(args, "min_score", None), getattr(args, "max_score", None),
                          getattr(args, "status", None))
     redactor = None
@@ -627,9 +833,10 @@ def produce(args, stored=None, from_report_id=None):
         redactor = Redactor(roots=roots, redact_dates=getattr(args, "redact_dates", False))
     rows = rows_from_records(items, redactor=redactor, with_logs=getattr(args, "with_logs", False))
     if stored is not None:
-        missing = mark_changed(rows, stored["rows"])
+        missing = mark_changed(rows, stored_rows)
         for record_id in missing:
-            _stderr("report: record {} from the earlier report was not found now".format(record_id), args)
+            _stderr("report: record {} from the earlier report is not in the rows now".format(record_id),
+                    args)
     rows = sort_rows(rows)
     header = build_header(args, len(rows), redactor=redactor, from_report=from_report_id,
                           unreadable=len(errors))
@@ -654,9 +861,12 @@ def run(args):
             except OSError as error:
                 say("report: cannot read '{}': {}".format(location, error), stream=sys.stderr)
                 return EXIT_ERROR
+            except ReportUsageError as error:
+                say("report: '{}': {}".format(location, error), stream=sys.stderr)
+                return EXIT_USAGE
             from_report_id = stored["header"].get("report_id")
             stored_args = _stored_args(stored["invocation"])
-            args, redacted_paths = _merge(args, stored_args)
+            args, redacted_paths = _merge(args, stored_args, stored.get("folders"))
             if redacted_paths and not args.paths and getattr(args, "no_index", False):
                 say("report: '{}' records its paths redacted as '<root>'; give the PATH arguments "
                     "again, or drop --no-index to find the rows in the index".format(location),

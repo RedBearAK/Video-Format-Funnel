@@ -52,7 +52,7 @@ SUBCOMMANDS = (
     ("verify", "vidfunnel.verify", "add_arguments", "run",
      "re-check converted outputs and update their scores"),
     ("report", "vidfunnel.report", "add_arguments", "run",
-     "print a sorted table from the records, redacted unless --reveal"),
+     "print the records as a report, worst first: text by default, or md, json, csv; redacted unless --reveal"),
     ("find", "vidfunnel.index", "add_find_arguments", "run_find",
      "resolve a record ID from a report to its path and status"),
     ("retire", "vidfunnel.retire", "add_arguments", "run",
