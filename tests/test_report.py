@@ -756,6 +756,28 @@ class ReportTree(unittest.TestCase):
         self.assertEqual(len(compiled), 1, "one compile with every name, not one per record")
         self.assertLess(elapsed, 10, "4000 records redacted in {:.1f} s".format(elapsed))
 
+    def redaction_notice(self, count, args=None):
+        items = []
+        for number in range(count):
+            source = self.base / "notice" / "clip {}.avi".format(number)
+            source.parent.mkdir(exist_ok=True)
+            source.write_bytes(b"x")
+            items.append((source.parent, new_record(source)))
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            rows = rows_from_records(items, redactor=Redactor(roots=[str(self.base)]), args=args)
+        self.assertEqual(len(rows), count)
+        return errors.getvalue()
+
+    def test_redaction_of_many_records_says_so(self):
+        self.assertEqual(self.redaction_notice(501), "report: redacting 501 records\n")
+
+    def test_redaction_of_few_records_is_silent(self):
+        self.assertEqual(self.redaction_notice(10), "")
+
+    def test_redaction_notice_respects_quiet(self):
+        self.assertEqual(self.redaction_notice(501, args=argparse.Namespace(quiet=True)), "")
+
     def test_no_path_reads_the_current_directory_and_says_so(self):
         previous = os.getcwd()
         os.chdir(str(self.base))

@@ -101,6 +101,10 @@ class ReportUsageError(ReportError):
     """The report given to --from is of a kind that cannot be read back (a text report)."""
 
 
+# Above this many records rows_from_records says it is redacting (about 0.6 s per thousand).
+REDACTION_NOTICE_RECORDS = 500
+
+
 def _stderr(message, args=None):
     if args is not None and getattr(args, "quiet", False):
         return
@@ -244,18 +248,22 @@ def _logs(record):
     return entries
 
 
-def rows_from_records(items, redactor=None, with_logs=False):
+def rows_from_records(items, redactor=None, with_logs=False, args=None):
     """One row dict per (folder, record); with a redactor, rows come from redacted copies.
 
     Every record is passed to redactor.learn() before any is redacted, so the
     redactor compiles its pattern once with every real name in it; learning
     and redacting record by record recompiled an ever longer pattern for each
-    record and took minutes for a few thousand records.
+    record and took minutes for a few thousand records. Redaction takes about
+    0.6 s per thousand records, so above REDACTION_NOTICE_RECORDS records a line
+    on stderr says it is running (silenced by --quiet through args).
     """
     prepared = []
     groups = []
     group_numbers = {}
     if redactor is not None:
+        if len(items) > REDACTION_NOTICE_RECORDS:
+            _stderr("report: redacting {} records".format(len(items)), args)
         for _folder, record in items:
             redactor.learn(record)
     for folder, record in items:
@@ -928,7 +936,7 @@ def produce(args, stored=None, from_report_id=None):
         if not roots and items:
             roots = [os.path.commonpath([str(Path(folder).absolute()) for folder, _record in items])]
         redactor = Redactor(roots=roots, redact_dates=getattr(args, "redact_dates", False))
-    rows = rows_from_records(items, redactor=redactor, with_logs=getattr(args, "with_logs", False))
+    rows = rows_from_records(items, redactor=redactor, with_logs=getattr(args, "with_logs", False), args=args)
     if stored is not None:
         missing = mark_changed(rows, stored_rows)
         for record_id in missing:

@@ -60,6 +60,8 @@ KEPT_KEYS = (
 _EXTENSION_PATTERN = re.compile(r"^(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{1,4}$")
 _YEAR_AT_START = re.compile(r"^\s*(\d{4})")
 _YEAR_ANYWHERE = re.compile(r"(?<!\d)(\d{4})(?!\d)")
+# A match must not sit inside a longer word: no letter or digit right before or after it.
+_BOUNDED = r"(?<![^\W_])(?:{})(?![^\W_])"
 
 
 def _is_word_char(char):
@@ -110,35 +112,53 @@ def trie_pattern(words):
 
     A flat alternation 'a|b|c|...' makes the engine try every alternative at
     every position: with ten thousand names a report took minutes. In the
-    trie shape ('cl(?:ip(?: 1|2)?|ock)') the engine follows one branch per
-    character. At a node that ends a word and also continues, the
-    continuation is tried first (a greedy optional group), so the longest
-    word wins, as the sorted flat alternation did. With no words the pattern
-    is '(?!)', which matches nothing (an empty source would match everywhere).
+    trie shape the engine follows one branch per character: 'clip', 'clip 1',
+    'clip2' and 'clock' give 'cl(?:ip(?:\\ 1|2)?|ock)'. At a node that ends a
+    word and also continues, the continuation is tried first (a greedy
+    optional group), so the longest word wins, as the sorted flat alternation
+    did. Empty words are skipped. With no words the pattern is '(?!)', which
+    matches nothing (an empty source would match everywhere).
+
+    The source is built with an explicit stack, not by recursion, because a
+    learned metadata value (a description) can be thousands of characters
+    long, one trie level per character.
     """
     root = {}
     for word in words:
+        if not word:
+            continue
         node = root
         for character in word:
             node = node.setdefault(character, {})
         node[""] = {}  # end of a word
 
-    def render(node):
-        ends = "" in node
-        branches = []
-        for character in sorted(key for key in node if key != ""):
-            child = node[character]
-            branches.append(re.escape(character) + render(child))
-        if not branches:
-            return ""
-        body = branches[0] if len(branches) == 1 else "(?:" + "|".join(branches) + ")"
-        if ends:
-            return "(?:" + body + ")?"
-        return body
-
     if not root:
         return "(?!)"
-    return render(root)
+    pieces = []
+    # Work items: a node to render, or a string to emit as it is.
+    stack = [root]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            pieces.append(item)
+            continue
+        ends = "" in item
+        characters = sorted(key for key in item if key != "")
+        if not characters:
+            continue
+        grouped = ends or len(characters) > 1
+        work = []
+        if grouped:
+            work.append("(?:")
+        for number, character in enumerate(characters):
+            if number:
+                work.append("|")
+            work.append(re.escape(character))
+            work.append(item[character])
+        if grouped:
+            work.append(")?" if ends else ")")
+        stack.extend(reversed(work))
+    return "".join(pieces)
 
 
 def _redact_words(text):
@@ -346,7 +366,15 @@ class Redactor:
 
     def _compiled(self):
         if self._pattern is None and self._substitutions:
-            self._pattern = re.compile(r"(?<![^\W_])(?:" + trie_pattern(self._substitutions) + r")(?![^\W_])")
+            try:
+                self._pattern = re.compile(_BOUNDED.format(trie_pattern(self._substitutions)))
+            except RecursionError:
+                # Python's regex parser recurses once per nested group: several hundred
+                # values that are each a prefix of the next nest that deep. The flat
+                # alternation, longest first, matches the same and is only slower.
+                ordered = sorted(self._substitutions, key=lambda item: (-len(item), item))
+                alternatives = "|".join(re.escape(item) for item in ordered)
+                self._pattern = re.compile(_BOUNDED.format(alternatives))
         return self._pattern
 
     def text(self, text):

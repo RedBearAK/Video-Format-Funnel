@@ -10,6 +10,7 @@ import copy
 import random
 import re
 import unittest
+from unittest import mock
 
 from vidfunnel.redact import (
     Redactor,
@@ -355,6 +356,68 @@ class TriePatternTests(unittest.TestCase):
         for text in ("", "a", "clip 1"):
             with self.subTest(text=text):
                 self.assertIsNone(compiled.search(text))
+
+    def test_empty_words_are_skipped(self):
+        self.assertEqual(trie_pattern([""]), "(?!)")
+        self.assertEqual(trie_pattern(["", "a"]), "a")
+        compiled = re.compile(trie_pattern(["", "clip"]))
+        self.assertIsNone(compiled.search("nothing here"))
+
+    def test_word_that_ends_and_branches_has_one_optional_group(self):
+        self.assertEqual(trie_pattern(["clip", "clip 1", "clip2", "clock"]),
+                         r"cl(?:ip(?:\ 1|2)?|ock)")
+        self.assertEqual(trie_pattern(["clip", "clip 1", "clip 2", "clock"]),
+                         r"cl(?:ip(?:\ (?:1|2))?|ock)")
+
+    def test_word_of_five_thousand_characters(self):
+        # One trie level per character: a recursive renderer hit Python's recursion limit
+        # near 1,000 characters.
+        word = "description " * 416 + "end"
+        self.assertGreater(len(word), 4990)
+        pattern = trie_pattern([word, word + " more"])
+        self.assertEqual(re.compile(pattern).match(word + " more").group(0), word + " more")
+        self.assertEqual(trie_pattern([word]), re.escape(word))
+
+
+class RedactorDepthTests(unittest.TestCase):
+
+    def test_value_of_five_thousand_characters_is_redacted(self):
+        value = "A long description of the holiday " * 147 + "at the lake"
+        self.assertGreater(len(value), 5000)
+        redactor = Redactor(values=[value])
+        text = "comment=" + value + "; done"
+        self.assertEqual(redactor.text(text), "comment=" + redact_metadata_value(value) + "; done")
+        # The trie itself compiled; the flat fallback would hide a renderer that cannot go this deep.
+        self.assertEqual(redactor._compiled().pattern, BOUNDED.format(trie_pattern([value])))
+
+    def test_chain_of_a_thousand_prefixes_is_redacted(self):
+        # Each value is a prefix of the next: the trie nests one optional group per value,
+        # deeper than Python 3.13's regex parser compiles, so there the flat alternation is used.
+        values = ["P" + "a" * length for length in range(1, 1001)]
+        redactor = Redactor(values=values)
+        for value in (values[0], values[499], values[-1]):
+            with self.subTest(length=len(value)):
+                self.assertEqual(redactor.text("[" + value + "]"),
+                                 "[" + redact_metadata_value(value) + "]")
+        self.assertEqual(redactor.text("P " + values[-1] + "a"), "P " + values[-1] + "a")
+
+    def test_compile_recursion_falls_back_to_the_flat_alternation(self):
+        values = ["clip", "clip 1", "clock"]
+        sources = []
+        real_compile = re.compile
+
+        def failing_first(source, *rest, **options):
+            sources.append(source)
+            if len(sources) == 1:
+                raise RecursionError("maximum recursion depth exceeded")
+            return real_compile(source, *rest, **options)
+
+        redactor = Redactor(values=values)
+        with mock.patch("vidfunnel.redact.re.compile", side_effect=failing_first):
+            self.assertEqual(redactor.text("clip 1 and clock"),
+                             redact_metadata_value("clip 1") + " and " + redact_metadata_value("clock"))
+        self.assertEqual(sources, [BOUNDED.format(trie_pattern(values)),
+                                   BOUNDED.format(r"clip\ 1|clock|clip")])
 
 
 if __name__ == "__main__":
