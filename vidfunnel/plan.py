@@ -20,8 +20,9 @@ What the record carries for the later stages:
   are the identity tag's 'src';
 - stages.plan.argv: the ffmpeg argv as rendered on the planning machine,
   argv[0] the ffmpeg path, every path absolute, ending in the output path;
-  a preview for report and for reading the record, which convert neither
-  runs nor reads (it renders its own, HANDOFF 6.3);
+  kept for reading the record by eye. convert never executes it (it renders
+  its own, HANDOFF 6.3); convert --refit reads the CRF from it only for a
+  record converted before convert recorded its own command;
 - stages.plan.ffmpeg: {'path', 'version', 'configuration_sha256'} of the
   ffmpeg the plan was made with (vidfunnel.ffmpeg.plan_identity), information
   about the analysis that convert does not compare with its own ffmpeg;
@@ -1340,6 +1341,13 @@ CADENCE_FILTER_FORM = re.compile(r"fieldmatch,decimate|bwdif=mode=[01]:parity=(?
 # probe._fraction_text (ffprobe's r_frame_rate) and analyze._double_rate: 'N/D'.
 FRAME_RATE_FORM = re.compile(r"[1-9][0-9]{0,9}/[1-9][0-9]{0,9}")
 FPS_MULTIPLIERS = (0.8, 1.0, 2.0)
+# Every frame rate the rendering reads or computes (the probe's fps and avg_fps, the
+# cadence output_fps as N/D, and the source rate times fps_multiplier) is at most
+# 1000000 frames per second. The probe's fps is ffprobe's r_frame_rate, which for
+# real MPEG-TS, ASF and variable-rate Matroska streams can be a timebase-derived
+# value such as 90000/1, so the bound is not a plausible video rate: it only keeps
+# the keyframe arithmetic finite (1.7e308 would overflow) and the values sane.
+FPS_CEILING = 1000000
 # analyze.decide_pixelart: a 2x or 3x nearest-neighbour upscale.
 PIXELART_FILTER_FORM = re.compile(r"scale=iw\*([23]):ih\*\1:flags=neighbor")
 PIXELART_TUNES = ("animation",)
@@ -1422,12 +1430,13 @@ def _whole(field, value, lowest, highest=None, optional=False):
             lowest, "" if highest is None else " to {}".format(highest)))
 
 
-def _finite(field, value, positive=False, optional=True):
+def _finite(field, value, positive=False, optional=True, highest=None):
     if value is None and optional:
         return
     if (not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value)
-            or (positive and value <= 0)):
-        _fail(field, value, "a finite {}number".format("positive " if positive else ""))
+            or (positive and value <= 0) or (highest is not None and value > highest)):
+        _fail(field, value, "a finite {}number{}".format("positive " if positive else "",
+                                                          "" if highest is None else " up to {}".format(highest)))
 
 
 def _flag(field, value, optional=True):
@@ -1448,6 +1457,10 @@ def _check_key(record):
     _plain_name("source.name", source.get("name"))
     if _source_kind(source) == "dvd-title":
         _whole("source.dvd_title", source.get("dvd_title"), 1, DVD_TITLE_CAP)
+    if _source_kind(source) == "vob-group":
+        _sequence("source.members", source.get("members"))
+    _mapping("stages", record.get("stages"))
+    _mapping("output", record.get("output"))
     return source
 
 
@@ -1494,8 +1507,8 @@ def _check_values(record):
     video = _mapping("stages.probe.video", probe.get("video"), optional=False)
     _whole("stages.probe.video.index", video.get("index"), 0)
     _whole("stages.probe.video.height", video.get("height"), 1, optional=True)
-    _finite("stages.probe.video.fps", video.get("fps"), positive=True)
-    _finite("stages.probe.video.avg_fps", video.get("avg_fps"), positive=True)
+    _finite("stages.probe.video.fps", video.get("fps"), positive=True, highest=FPS_CEILING)
+    _finite("stages.probe.video.avg_fps", video.get("avg_fps"), positive=True, highest=FPS_CEILING)
     for position, stream in enumerate(_sequence("stages.probe.streams", probe.get("streams"))):
         _mapping("stages.probe.streams[{}]".format(position), stream, optional=False)
 
@@ -1506,12 +1519,20 @@ def _check_values(record):
     _choice("stages.analyze.cadence.result.level", cadence.get("level"), MAX_LEVELS)
     _form("stages.analyze.cadence.result.output_fps", cadence.get("output_fps"), FRAME_RATE_FORM,
           "a frame rate 'N/D'")
+    fraction = _fraction_value(cadence.get("output_fps"))
+    if fraction is not None and fraction > FPS_CEILING:
+        _fail("stages.analyze.cadence.result.output_fps", cadence["output_fps"],
+              "a frame rate 'N/D' up to {} frames per second".format(FPS_CEILING))
     multiplier = cadence.get("fps_multiplier")
     if multiplier is not None:
         _finite("stages.analyze.cadence.result.fps_multiplier", multiplier)
         if multiplier not in FPS_MULTIPLIERS:
             _fail("stages.analyze.cadence.result.fps_multiplier", multiplier,
                   "one of {}".format(", ".join(str(value) for value in FPS_MULTIPLIERS)))
+    rate = output_fps(probe, analysis)
+    if rate is not None and rate > FPS_CEILING:
+        _fail("stages.analyze.cadence.result.fps_multiplier", multiplier,
+              "a multiplier that keeps the source rate times it at most {} frames per second".format(FPS_CEILING))
     pixelart = _analysis_result(analysis, "pixelart")
     _form("stages.analyze.pixelart.result.filter", pixelart.get("filter"), PIXELART_FILTER_FORM,
           "'scale=iw*N:ih*N:flags=neighbor' with N 2 or 3")
@@ -1550,7 +1571,10 @@ def record_key_problem(record):
     """None when source.kind, source.name and (for a DVD title) source.dvd_title can key the record, else why.
 
     The key (encode.record_key) is the folder joined with the source name, so
-    a name with a directory part would lead to another folder's record.
+    a name with a directory part would lead to another folder's record. Also
+    checks the shapes convert reads before its other checks run: 'stages' and
+    'output' are objects and a VOB group's source.members is a list, when
+    present.
     """
     try:
         _check_key(record)
@@ -1603,7 +1627,7 @@ def record_inputs(folder, record):
     return [str(folder / source["name"])], None
 
 
-def render_record(tools, folder, record, plan=None):
+def render_record(tools, folder, record, plan=None, sidecars=True):
     """{'argv', 'sidecars', 'output_path'}: the ffmpeg commands of a planned record, rendered here.
 
     Built from the record (probe, analysis, action, the plan's plain_mp4,
@@ -1611,11 +1635,16 @@ def render_record(tools, folder, record, plan=None):
     and output names), the folder the record sits in, and tools.ffmpeg. The
     main argv ends in folder / (output.interim_name or output.name); the
     sidecars are those of build_sidecar_argvs without the ones plan skipped,
-    under interim names when planned with --mark-outputs. `plan` is the plan
-    stage (default: stages.plan). Never reads stages.plan.argv or its
-    sidecars. The values are assumed checked (record_value_problem); raises
-    PlanError when a path cannot be expressed or when the sidecar names do
-    not match output.sidecars (or output.interim_sidecars).
+    under interim names when planned with --mark-outputs. When the record
+    lists its sidecars (output.sidecars, and output.interim_sidecars under
+    --mark-outputs), only the listed ones are kept, in the rendered order: a
+    record planned before every text stream got an '.srt' lists fewer, and
+    the record's own list decides. `sidecars` False renders no sidecars and
+    compares no names (refit writes none). `plan` is the plan stage
+    (default: stages.plan). Never reads stages.plan.argv or its sidecars.
+    The values are assumed checked (record_value_problem); raises PlanError
+    when a path cannot be expressed or when a listed sidecar name is not one
+    the rendering gives.
     """
     stages = record["stages"]
     plan = stages["plan"] if plan is None else plan
@@ -1627,23 +1656,29 @@ def render_record(tools, folder, record, plan=None):
     analysis = stages["analyze"]
     argv = build_argv(tools, inputs, output_path, stages["probe"], analysis, record["action"], options,
                       record["id"], record["source"]["sha256"], dvd_title)
+    if not sidecars:
+        return {"argv": argv, "sidecars": [], "output_path": output_path}
     final_path = folder / output["name"]
     skipped = set(plan.get("sidecars_skipped") or [])
-    sidecars = [entry for entry in build_sidecar_argvs(tools, inputs, final_path, analysis, dvd_title)
+    rendered = [entry for entry in build_sidecar_argvs(tools, inputs, final_path, analysis, dvd_title)
                 if Path(entry["path"]).name not in skipped]
-    _match_sidecar_names("output.sidecars", output.get("sidecars"), sidecars)
+    rendered = _listed_sidecars("output.sidecars", output.get("sidecars"), rendered)
     if plan.get("mark_outputs") and output.get("interim_name"):
-        sidecars = interim_sidecars(sidecars, final_path, folder / output["interim_name"])
-        _match_sidecar_names("output.interim_sidecars", output.get("interim_sidecars"), sidecars)
-    return {"argv": argv, "sidecars": sidecars, "output_path": output_path}
+        rendered = interim_sidecars(rendered, final_path, folder / output["interim_name"])
+        rendered = _listed_sidecars("output.interim_sidecars", output.get("interim_sidecars"), rendered)
+    return {"argv": argv, "sidecars": rendered, "output_path": output_path}
 
 
-def _match_sidecar_names(field, recorded, sidecars):
+def _listed_sidecars(field, recorded, sidecars):
+    """The sidecars whose names `recorded` lists, in their rendered order (all when None); PlanError on a stranger."""
+    if recorded is None:
+        return sidecars
     names = [Path(entry["path"]).name for entry in sidecars]
-    if recorded is not None and list(recorded) != names:
+    if any(name not in names for name in recorded):
         raise PlanError("{} lists {} but the record's analysis gives {}; plan again with --replan".format(
             field, ", ".join("'{}'".format(name) for name in recorded) or "none",
             ", ".join("'{}'".format(name) for name in names) or "none"))
+    return [entry for entry in sidecars if Path(entry["path"]).name in recorded]
 
 
 def _collision_reason(collision, names, taken):

@@ -355,6 +355,10 @@ REJECTED_SHAPES = [
     ("file", ["stages", "probe", "video", "fps"], float("inf")),
     ("file", ["stages", "probe", "video", "fps"], True),
     ("file", ["stages", "probe", "video", "avg_fps"], -25.0),
+    ("file", ["stages", "probe", "video", "fps"], 1.7e308),
+    ("file", ["stages", "probe", "video", "fps"], 1000000.5),
+    ("file", ["stages", "probe", "video", "avg_fps"], 1000001.0),
+    ("file", ["stages", "probe", "video", "avg_fps"], 1.7e308),
     ("file", ["stages", "probe", "streams"], "video,audio"),
     ("file", ["stages", "probe", "streams"], ["video"]),
     ("file", CADENCE + ["filter"], "movie=/etc/passwd"),
@@ -370,6 +374,8 @@ REJECTED_SHAPES = [
     ("file", CADENCE + ["output_fps"], "0/1"),
     ("file", CADENCE + ["output_fps"], "abc"),
     ("file", CADENCE + ["output_fps"], 25),
+    ("file", CADENCE + ["output_fps"], "1000001/1"),
+    ("file", CADENCE + ["output_fps"], "9999999999/1"),
     ("file", CADENCE + ["fps_multiplier"], "2.0"),
     ("file", CADENCE + ["fps_multiplier"], 3.0),
     ("file", CADENCE + ["fps_multiplier"], True),
@@ -624,6 +630,165 @@ class RenderedRecordTest(unittest.TestCase):
         rendered = render_record(self.tools, folder, record)["sidecars"]
         self.assertEqual([entry["path"] for entry in rendered], [str(folder / "h264_mkv_srt_subtitles.srt")])
 
+    def test_a_record_listing_fewer_sidecars_than_the_analysis_gives_renders_only_those(self):
+        # A record planned before 2026-11-07: an .srt only for styled streams, so none for this subrip stream.
+        folder = self.folder()
+        _key, record = captured_record(folder, "h264_mkv_srt_subtitles.mkv", "remux")
+        self.assertEqual(record["output"]["sidecars"], ["h264_mkv_srt_subtitles.srt"])
+        record["output"]["sidecars"] = []
+        self.assertIsNone(record_value_problem(record))
+        rendered = render_record(self.tools, folder, record)
+        self.assertEqual(rendered["sidecars"], [])
+        self.assertIn("mov_text", rendered["argv"])
+
+    def test_an_older_subtitle_record_flagged_larger_is_selected_and_rendered_by_refit(self):
+        # Refit writes no sidecars, so no sidecar list blocks it: the older record's empty one, or a stranger name.
+        for listed in ([], ["h264_mkv_srt_subtitles.2.srt"]):
+            with self.subTest(sidecars=listed):
+                folder = self.folder()
+                key, record = captured_record(folder, "h264_mkv_srt_subtitles.mkv", "reencode", stand_in=self.stored)
+                record["output"]["sidecars"] = listed
+                set_status(record, "converted")
+                record["flags"] = ["output-larger"]
+                source_size = (folder / "h264_mkv_srt_subtitles.mkv").stat().st_size
+                (folder / "h264_mkv_srt_subtitles.mp4").write_bytes(b"larger converted output " * 400)
+                record["stages"]["convert"] = {"outcome": "ok", "source_size": source_size, "output_size": None,
+                                               "argv": [str(self.stand_in), "-c:v", "libx264", "-crf", "18", "-f",
+                                                        "mp4", str(folder / "h264_mkv_srt_subtitles.mp4")]}
+                save_record(key, record)
+                record_bytes = record_path(key).read_bytes()
+                _summary, text = self.convert(folder, refit=True, dry_run=True)
+                self.assertIn("would refit 'h264_mkv_srt_subtitles.mkv': CRF 18 -> ", text)
+                self.assertNotIn("would skip", text)
+                self.assertEqual(record_path(key).read_bytes(), record_bytes)
+                self.assertEqual([call for call in self.calls_made() if call != "version"], [], text)
+
+    def test_a_record_listing_a_sidecar_the_analysis_does_not_give_is_skipped(self):
+        folder, key = self.saved("h264_mkv_srt_subtitles.mkv", "remux",
+                                 change=ShapeSetter(["output", "sidecars"],
+                                                    ["h264_mkv_srt_subtitles.srt", "h264_mkv_srt_subtitles.sup"]))
+        self.convert_untouched(folder, key, None,
+                               "output.sidecars lists 'h264_mkv_srt_subtitles.srt', 'h264_mkv_srt_subtitles.sup' "
+                               "but the record's analysis gives 'h264_mkv_srt_subtitles.srt'")
+
+    def test_a_marked_record_listing_an_interim_sidecar_the_rendering_does_not_give_is_skipped(self):
+        folder = self.folder()
+        key, record = captured_record(folder, "h264_mkv_srt_subtitles.mkv", "remux", stand_in=self.stored)
+        record["stages"]["plan"]["mark_outputs"] = True
+        record["output"]["interim_name"] = "h264_mkv_srt_subtitles.vidfunnel.mp4"
+        record["output"]["interim_sidecars"] = ["h264_mkv_srt_subtitles.vidfunnel.2.srt"]
+        save_record(key, record)
+        self.convert_untouched(folder, key, None,
+                               "output.interim_sidecars lists 'h264_mkv_srt_subtitles.vidfunnel.2.srt' but the "
+                               "record's analysis gives 'h264_mkv_srt_subtitles.vidfunnel.srt'")
+
+    def test_a_marked_record_listing_its_interim_sidecar_reaches_ffmpeg(self):
+        folder = self.folder()
+        key, record = captured_record(folder, "h264_mkv_srt_subtitles.mkv", "remux", stand_in=self.stored)
+        record["stages"]["plan"]["mark_outputs"] = True
+        record["output"]["interim_name"] = "h264_mkv_srt_subtitles.vidfunnel.mp4"
+        record["output"]["interim_sidecars"] = ["h264_mkv_srt_subtitles.vidfunnel.srt"]
+        rendered = render_record(self.tools, folder, record)
+        self.assertEqual([entry["path"] for entry in rendered["sidecars"]],
+                         [str(folder / "h264_mkv_srt_subtitles.vidfunnel.srt")])
+
+    def test_a_source_rate_times_the_multiplier_above_the_ceiling_is_skipped(self):
+        class BothChanges(object):
+            def apply(self, record):
+                record["stages"]["analyze"]["cadence"]["result"]["output_fps"] = None
+                record["stages"]["probe"]["video"]["fps"] = 600000.0
+        folder, key = self.saved("h264_1080i_tff_ts_ac3.ts", "reencode", change=BothChanges())
+        self.convert_untouched(folder, key, None, "stages.analyze.cadence.result.fps_multiplier is 2.0 (type float), "
+                                                  "not a multiplier that keeps the source rate times it at most "
+                                                  "1000000 ")
+
+    def test_a_timebase_like_frame_rate_from_a_real_stream_is_converted(self):
+        # ffprobe's r_frame_rate of MPEG-TS, ASF and variable-rate MKV streams can read 90000/1.
+        def from_fps(record):
+            record["stages"]["probe"]["video"]["fps"] = 90000.0
+            record["stages"]["analyze"]["cadence"]["result"]["output_fps"] = None
+
+        def from_output_fps(record):
+            record["stages"]["analyze"]["cadence"]["result"]["output_fps"] = "90000/1"
+
+        for change in (from_fps, from_output_fps):
+            with self.subTest(change=change.__name__):
+                folder = self.folder()
+                key, record = captured_record(folder, "xvid_avi_mp3.avi", "reencode", stand_in=self.stored)
+                change(record)
+                self.assertIsNone(record_value_problem(record))
+                argv = render_record(self.tools, folder, record)["argv"]
+                self.assertEqual(argv[argv.index("-g") + 1], "180000")
+                save_record(key, record)
+                summary, text = self.convert(folder)
+                self.assertEqual(summary.counts["skipped"], 0, text)
+                self.assertEqual(summary.counts["failed"], 1, text)
+                self.assertIn("run {}".format(part_path(folder / "xvid_avi_mp3.mp4", FIRST_RECORD_ID)),
+                              self.calls_made())
+
+    def test_an_arithmetic_error_while_rendering_skips_the_record_and_the_run_goes_on(self):
+        folder = self.folder()
+        for fixture, record_id in (("xvid_avi_mp3.avi", FIRST_RECORD_ID), ("h264_avi_mp3.avi", SECOND_RECORD_ID)):
+            key, record = captured_record(folder, fixture, "reencode", stand_in=self.stored)
+            record["id"] = record_id
+            save_record(key, record)
+        first_bytes = record_path(folder / "xvid_avi_mp3.avi").read_bytes()
+
+        def overflowing(tools, where, record, *rest, **values):
+            if record["id"] == FIRST_RECORD_ID:
+                raise OverflowError("cannot convert float infinity to integer")
+            return render_record(tools, where, record, *rest, **values)
+
+        with unittest.mock.patch("vidfunnel.encode.render_record", side_effect=overflowing):
+            summary, text = self.convert(folder)
+        self.assertEqual(summary.counts["skipped"], 1, text)
+        self.assertEqual(summary.counts["failed"], 1, text)
+        self.assertIn("skipping 'xvid_avi_mp3.avi': the command cannot be rendered from the record: cannot convert "
+                      "float infinity to integer", text)
+        self.assertIn("made-up stand-in failure", text)
+        self.assertEqual(record_path(folder / "xvid_avi_mp3.avi").read_bytes(), first_bytes)
+        self.assertEqual(load_record(folder / "h264_avi_mp3.avi")["status"], "failed")
+
+    def test_record_shapes_that_crashed_before_the_checks_are_skipped_in_both_modes(self):
+        for kind, path, value in (("file", ["stages"], 7), ("file", ["output"], "xvid_avi_mp3.mp4"),
+                                  ("file", ["output"], ["xvid_avi_mp3.mp4"]), ("vob-group", ["source", "members"], 5)):
+            for dry_run in (True, False):
+                change = ShapeSetter(path, value)
+                with self.subTest(field=change.field(), value=value, dry_run=dry_run):
+                    folder = self.folder()
+                    key, record = captured_record(folder, "xvid_avi_mp3.avi", "reencode", kind, self.stored)
+                    change.apply(record)
+                    save_record(key, record)
+                    good_key, good = captured_record(folder, "h264_avi_mp3.avi", "reencode", stand_in=self.stored)
+                    good["id"] = SECOND_RECORD_ID
+                    save_record(good_key, good)
+                    record_bytes = record_path(key).read_bytes()
+                    summary, text = self.convert(folder, dry_run=dry_run)
+                    self.assertRegex(text, r"skipping a record in '[^']+': {} is ".format(re.escape(change.field())))
+                    self.assertEqual(summary.counts["skipped"], 1, text)
+                    self.assertEqual(record_path(key).read_bytes(), record_bytes)
+                    if dry_run:
+                        self.assertIn("would re-encode 'h264_avi_mp3.avi'", text)
+                    else:
+                        self.assertEqual(summary.counts["failed"], 1, text)
+                        self.assertIn("made-up stand-in failure", text)
+                        self.assertEqual(load_record(good_key)["status"], "failed")
+
+    def test_missing_mov_text_encoder_skips_the_record(self):
+        folder, key = self.saved("h264_mkv_srt_subtitles.mkv", "remux")
+        self.convert_untouched(folder, key, listing_without("encoders", "mov_text"),
+                               "ffmpeg '{}' has no encoder 'mov_text'".format(self.stand_in))
+
+    def test_missing_sidecar_encoder_skips_the_record(self):
+        folder, key = self.saved("h264_mkv_srt_subtitles.mkv", "remux")
+        self.convert_untouched(folder, key, listing_without("encoders", "srt"),
+                               "ffmpeg '{}' has no encoder 'srt'".format(self.stand_in))
+
+    def test_missing_sidecar_muxer_skips_the_record(self):
+        folder, key = self.saved("h264_mkv_srt_subtitles.mkv", "remux")
+        self.convert_untouched(folder, key, listing_without("muxers", "srt"),
+                               "ffmpeg '{}' has no muxer 'srt'".format(self.stand_in))
+
     def test_argv_needs(self):
         argv = ["ffmpeg", "-f", "dvdvideo", "-title", "1", "-i", "/disc", "-map", "0:v:0",
                 "-vf", "bwdif=mode=1:parity=0,setparams=range=tv", "-c:v", "libx264", "-c:a:0", "copy",
@@ -631,7 +796,12 @@ class RenderedRecordTest(unittest.TestCase):
                 "-c:s", "mov_text", "-f", "mp4", "/out.mp4"]
         self.assertEqual(argv_needs(argv), [("demuxers", "dvdvideo"), ("filters", "bwdif"), ("filters", "setparams"),
                                             ("encoders", "libx264"), ("encoders", "aac"), ("filters", "aresample"),
-                                            ("filters", "atempo"), ("bsfs", "h264_metadata")])
+                                            ("filters", "atempo"), ("bsfs", "h264_metadata"),
+                                            ("encoders", "mov_text"), ("muxers", "mp4")])
+        sidecar = ["ffmpeg", "-i", "/in.mkv", "-map", "0:s:0", "-c:s", "srt", "-f", "srt", "/out.srt"]
+        self.assertEqual(argv_needs(sidecar), [("encoders", "srt"), ("muxers", "srt")])
+        copied = ["ffmpeg", "-i", "/in.mkv", "-map", "0:s:0", "-c:s", "copy", "-f", "sup", "/out.sup"]
+        self.assertEqual(argv_needs(copied), [("muxers", "sup")])
 
     def test_capability_problem_names_every_missing_item_and_the_path(self):
         argv = ["ffmpeg", "-i", "/in", "-vf", "hqdn3d=2:1:2:3", "-c:v", "libx264", "-f", "mp4", "/out.mp4"]
@@ -1043,6 +1213,46 @@ class ConvertRunTest(unittest.TestCase):
                     rendered = render_record(TOOLS, self.root, record)
                     self.assertEqual(rendered["argv"], record["stages"]["plan"]["argv"], name)
                     self.assertEqual(rendered["sidecars"], record["stages"]["plan"]["sidecars"], name)
+
+    def subtitle_record(self):
+        if not os.path.exists(os.path.join(FIXTURE_DIR, SUBTITLE_SOURCE)):
+            self.skipTest("fixture '{}' missing; run tests/make_fixtures.sh".format(SUBTITLE_SOURCE))
+        return self.plan(SUBTITLE_SOURCE)[SUBTITLE_SOURCE]
+
+    def test_an_older_record_without_a_text_sidecar_converts_without_one(self):
+        # As planned before 2026-11-07: the subrip stream goes into the MP4 as mov_text, with no .srt listed.
+        record = self.subtitle_record()
+        for entry in record["stages"]["analyze"]["subtitles"]["result"]:
+            entry.pop("sidecar", None)
+        record["output"]["sidecars"] = []
+        record["stages"]["plan"]["sidecars"] = []
+        save_record(self.root / SUBTITLE_SOURCE, record)
+        stage = self.convert(SUBTITLE_SOURCE, record)
+        self.assertEqual(stage["outcome"], "ok", stage)
+        self.assertEqual([name for name in os.listdir(str(self.root)) if name.endswith(".srt")], [])
+        saved = load_record(self.root / SUBTITLE_SOURCE)
+        self.assertIn(saved["status"], DONE)
+        self.assertEqual(saved["stages"]["convert"]["sidecar_argvs"], [])
+        self.assertEqual(saved["stages"]["convert"]["sidecars_written"], [])
+        self.assertIn("mov_text", saved["stages"]["convert"]["argv"])
+
+    def test_the_stored_sidecar_commands_are_never_run(self):
+        record = self.subtitle_record()
+        marker = Path(self.temporary.name) / "stored-sidecar-ran"
+        script = Path(self.temporary.name) / "stored-sidecar-command"
+        script.write_text("#!/bin/sh\necho ran > '{}'\nexit 0\n".format(marker))
+        script.chmod(script.stat().st_mode | stat.S_IXUSR)
+        stored = record["stages"]["plan"]["sidecars"]
+        self.assertEqual(len(stored), 1, stored)
+        stored[0]["argv"][0] = str(script)
+        save_record(self.root / SUBTITLE_SOURCE, record)
+        stage = self.convert(SUBTITLE_SOURCE, record)
+        self.assertEqual(stage["outcome"], "ok", stage)
+        self.assertFalse(marker.exists())
+        self.assertIn("-->", (self.root / "h264_mkv_srt_subtitles.srt").read_text(errors="replace"))
+        saved = load_record(self.root / SUBTITLE_SOURCE)
+        self.assertEqual(saved["stages"]["convert"]["sidecars_written"], ["h264_mkv_srt_subtitles.srt"])
+        self.assertEqual(saved["stages"]["convert"]["sidecar_argvs"][0][0], TOOLS.ffmpeg)
 
     def test_every_line_of_an_item_carries_its_counter_tag(self):
         record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]

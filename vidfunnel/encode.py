@@ -8,7 +8,8 @@ the command plan stored under stages.plan.argv, which is a preview, also in
 records written before this rule. Before rendering, the values the rendering
 reads are checked for the forms analyze writes (plan.record_value_problem),
 and before running, this ffmpeg's capability listing is checked for every
-encoder, filter, bitstream filter and input format the command names
+encoder (video, audio and subtitle), filter, bitstream filter, input format
+and output format the command and each subtitle sidecar command name
 (capability_problem); a record that fails either is skipped, counted as
 skipped, and left untouched, with a reason that names the field or the
 missing item and the ffmpeg's path.
@@ -259,17 +260,19 @@ def _refusal(record, folder, output_path):
     return None
 
 
-CAPABILITY_WORDS = {"encoders": "encoder", "filters": "filter", "bsfs": "bitstream filter", "demuxers": "demuxer"}
+CAPABILITY_WORDS = {"encoders": "encoder", "filters": "filter", "bsfs": "bitstream filter", "demuxers": "demuxer",
+                    "muxers": "muxer"}
 
 
 def argv_needs(argv):
     """[(listing, name)] an ffmpeg argv asks of the build, each once, in order. Pure.
 
-    'encoders': the codec after -c:v and -c:a... unless it is 'copy';
+    'encoders': the codec after -c:v, -c:a... and -c:s unless it is 'copy';
     'filters': every filter named in a -vf, -filter:v, -af or -filter:a...
     chain; 'bsfs': the bitstream filter of -bsf...; 'demuxers': the input
-    format of an -f that comes before the last -i (dvdvideo). The listing
-    names are those of vidfunnel.ffmpeg.capabilities().
+    format of an -f that comes before the last -i (dvdvideo); 'muxers': the
+    output format of an -f after the last -i (mp4, srt, sup, matroska). The
+    listing names are those of vidfunnel.ffmpeg.capabilities().
     """
     argv = list(argv)
     inputs = [position for position, item in enumerate(argv) if item == "-i"]
@@ -278,7 +281,7 @@ def argv_needs(argv):
     for position, item in enumerate(argv[:-1]):
         value = argv[position + 1]
         found = []
-        if item == "-c:v" or item == "-c:a" or item.startswith("-c:a:"):
+        if item in ("-c:v", "-c:a", "-c:s") or item.startswith("-c:a:"):
             if value != "copy":
                 found.append(("encoders", value))
         elif item in ("-vf", "-filter:v", "-af", "-filter:a") or item.startswith("-filter:a:"):
@@ -287,24 +290,29 @@ def argv_needs(argv):
             found += [("bsfs", part.split("=", 1)[0]) for part in value.split(",")]
         elif item == "-f" and position < last_input:
             found.append(("demuxers", value))
+        elif item == "-f":
+            found.append(("muxers", value))
         for need in found:
             if need not in needs:
                 needs.append(need)
     return needs
 
 
-def capability_problem(tools, argv):
-    """None when this ffmpeg's capability listing has everything argv names, else the reason. Writes no record.
+def capability_problem(tools, argv, sidecar_argvs=()):
+    """None when this ffmpeg's capability listing has everything argv and the sidecar argvs name, else the reason.
 
     The listing is the one 'check' and the dependency check use
     (vidfunnel.ffmpeg.capabilities, cached per binary); the reason names
-    each missing item and the ffmpeg's path.
+    each missing item, once, and the ffmpeg's path. Writes no record.
     """
     try:
         listing = ffmpeg_capabilities(tools)
     except (FfmpegError, ToolNotFound, OSError) as error:
         return "the capabilities of ffmpeg '{}' cannot be listed: {}".format(tools.ffmpeg, error)
-    missing = ["{} '{}'".format(CAPABILITY_WORDS[kind], name) for kind, name in argv_needs(argv)
+    needs = []
+    for each in [argv] + list(sidecar_argvs):
+        needs += [need for need in argv_needs(each) if need not in needs]
+    missing = ["{} '{}'".format(CAPABILITY_WORDS[kind], name) for kind, name in needs
                if name not in (listing.get(kind) or ())]
     if not missing:
         return None
@@ -312,20 +320,20 @@ def capability_problem(tools, argv):
         tools.ffmpeg, " and no ".join(missing))
 
 
-def _render(tools, record, folder):
+def _render(tools, record, folder, sidecars=True):
     """(rendered, None) or (None, reason): the record's commands rendered here, with this ffmpeg's identity.
 
     rendered is plan.render_record's dict plus 'ffmpeg', the identity of
     tools.ffmpeg (one '-version' call per build per process). The values the
-    rendering reads are checked first (plan.record_value_problem). Writes
-    nothing.
+    rendering reads are checked first (plan.record_value_problem). `sidecars`
+    False renders no sidecar commands (refit). Writes nothing.
     """
     problem = record_value_problem(record)
     if problem is not None:
         return None, problem
     try:
-        rendered = render_record(tools, folder, record)
-    except (PlanError, ValueError, TypeError, KeyError, AttributeError) as error:
+        rendered = render_record(tools, folder, record, sidecars=sidecars)
+    except (PlanError, ValueError, TypeError, KeyError, AttributeError, ArithmeticError) as error:
         return None, "the command cannot be rendered from the record: {}".format(error)
     try:
         rendered["ffmpeg"] = current_identity(tools.ffmpeg)
@@ -352,7 +360,7 @@ def _conversion(tools, record, folder):
         return output_path, None, reason
     rendered, reason = _render(tools, record, folder)
     if reason is None:
-        reason = capability_problem(tools, rendered["argv"])
+        reason = capability_problem(tools, rendered["argv"], [entry["argv"] for entry in rendered["sidecars"]])
     return output_path, rendered, reason
 
 
@@ -905,7 +913,7 @@ def refit_plan(tools, record, folder):
     if reason is not None:
         return None, reason
     output_path = output_path_for(record, folder)
-    rendered, problem = _render(tools, record, folder)
+    rendered, problem = _render(tools, record, folder, sidecars=False)
     if problem is not None:
         return None, problem
     base_crf, base_field, problem = refit_base_crf(record)
