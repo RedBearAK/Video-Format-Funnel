@@ -3168,6 +3168,31 @@ class TakeoverTests(unittest.TestCase):
         self.assertEqual(records_seen(), expected)
         lock.release()
 
+    def test_the_sweep_keeps_records_and_files_whose_names_only_begin_like_a_leftover(self):
+        self.apply(another_machine_patches())
+        sources = [write_bytes(self.base / name, b"video") for name in ("lock.new.trailer.mkv", "lock.aside.story.avi")]
+        for source in sources:
+            save_record(source, new_record(source, self.base))
+        ids = [load_record(source)["id"] for source in sources]
+        hexes = uuid.uuid4().hex
+        # uuid4().hex is 32 lowercase hex digits; a name with one uppercase digit is not one the takeover writes.
+        kept_names = ["lock.new.notes", NEW_LOCK_PREFIX + hexes[:31], MARKER_ASIDE_PREFIX + hexes + "0",
+                      NEW_LOCK_PREFIX + "A" + hexes[1:]]
+        for name in kept_names:
+            write_bytes(self.base / RECORD_DIR / name, b"not a leftover")
+        removed_names = [NEW_LOCK_PREFIX + uuid.uuid4().hex, MARKER_ASIDE_PREFIX + uuid.uuid4().hex]
+        for name in removed_names:
+            write_bytes(self.base / RECORD_DIR / name, json.dumps({"host": "goner"}).encode("utf-8"))
+        stamp = time.time_ns() - (TAKEOVER_MARKER_STALE_SECONDS + 120) * 10 ** 9
+        for name in os.listdir(str(self.base / RECORD_DIR)):
+            os.utime(str(self.base / RECORD_DIR / name), ns=(stamp, stamp))
+        self.write_dead_lock()
+        lock = self.take()
+        record_names = ["lock.new.trailer.mkv.json", "lock.aside.story.avi.json"]
+        self.assertEqual(self.names(), sorted([LOCK_NAME] + record_names + kept_names))
+        self.assertEqual([load_record(source)["id"] for source in sources], ids)
+        lock.release()
+
     # ------------------------------------------------------------ a dead taker on this machine
 
     @unittest.skipIf(vidfunnel.record.boot_id() is None, "the rule needs a kernel boot id")

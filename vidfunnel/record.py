@@ -79,13 +79,25 @@ PROBE_PREFIX = "lock.probe."         # probe files that read the share's clock: 
 # time may replace the lock; a marker older than TAKEOVER_MARKER_STALE_SECONDS on the share's clock was left by a
 # run that stopped mid-takeover and is moved aside. A taker writes its lock to 'lock.new.<uuid4 hex>' and renames
 # it over the lock path; a stale marker is moved to 'lock.aside.<uuid4 hex>' and removed. Either can be left
-# behind by a run that died; a later takeover removes those older than TAKEOVER_MARKER_STALE_SECONDS. No name
-# ends in '.json', so none is ever read as a record.
+# behind by a run that died; a later takeover removes those older than TAKEOVER_MARKER_STALE_SECONDS. That sweep
+# takes only names of exactly this form (the prefix and 32 lowercase hex digits, see _is_takeover_leftover), so a
+# record of a source named 'lock.new.trailer.mkv' ('lock.new.trailer.mkv.json') or a user's file is never swept;
+# and no such name ends in '.json', so none is ever read as a record.
 TAKEOVER_MARKER = "lock.taking"
 TAKEOVER_MARKER_STALE_SECONDS = 300
 NEW_LOCK_PREFIX = "lock.new."
 MARKER_ASIDE_PREFIX = "lock.aside."
 TAKEOVER_LEFTOVER_PREFIXES = (NEW_LOCK_PREFIX, MARKER_ASIDE_PREFIX)
+_UUID_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def _is_takeover_leftover(name):
+    """True when name is a takeover's own temporary file: a leftover prefix and a uuid4().hex, nothing more."""
+    for prefix in TAKEOVER_LEFTOVER_PREFIXES:
+        if name.startswith(prefix):
+            rest = name[len(prefix):]
+            return len(rest) == 32 and set(rest) <= _UUID_HEX_DIGITS
+    return False
 
 
 class RecordError(Exception):
@@ -1823,7 +1835,7 @@ class FolderLock:
         """
         directory = record_dir(self.folder)
         try:
-            names = sorted(name for name in os.listdir(str(directory)) if name.startswith(TAKEOVER_LEFTOVER_PREFIXES))
+            names = sorted(name for name in os.listdir(str(directory)) if _is_takeover_leftover(name))
         except OSError:
             return
         if not names:
