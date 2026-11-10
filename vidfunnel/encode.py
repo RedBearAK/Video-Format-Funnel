@@ -19,7 +19,10 @@ The command's last element (the output path) is a hidden
 folder (part_path), so two records can never write the same part file, and
 the token, drawn fresh for each attempt, keeps two attempts on one record
 apart too: an encoder that opens its output after its run lost the folder
-to another host writes a file of its own. Before an attempt starts, the
+to another host writes a file of its own. An output whose part name would
+exceed the folder's file name limit gets the short form
+'.vidfunnel-part-<id8>-<name hash>-<token>.part', and PAR2 likewise
+(name_limit). Before an attempt starts, the
 part files of earlier attempts on the record (is_part_of, the one name
 per record of vidfunnel before 20261110.3 included) are removed under the lock; on the way out the
 attempt removes its own, also after a lost lock. PAR2 is written the same
@@ -99,8 +102,10 @@ whose output still matches its fingerprint (content only, the time is not
 compared) is reported as already converted.
 """
 
-VERSION = "20261110.2"
+VERSION = "20261110.3"
 
+import errno
+import hashlib
 import math
 import os
 import re
@@ -149,6 +154,14 @@ PART_TOKEN_SHOWN = "<token>"         # what --dry-run shows in place of the toke
 _LOWER_HEX = frozenset("0123456789abcdef")
 PAR2_SUFFIX = ".par2"
 _PAR2_VOLUME = re.compile(r"\.vol[0-9]+\+[0-9]+\.par2")
+# Short temporary names, for outputs whose normal temporary names would exceed the folder's file name limit.
+NAME_MAX_FALLBACK = 255              # the limit in bytes when os.pathconf cannot give the folder's
+SHORT_PART_PREFIX = ".vidfunnel-part-"   # '.vidfunnel-part-<id8>-<name hash>-<token>.part'
+SHORT_PAR2_PREFIX = ".vidfunnel-par2-"   # '.vidfunnel-par2-<name hash>-<token>.par2' and its volume file
+NAME_HASH_DIGITS = 16                # the output name's hash in a short name: first 16 lowercase hex of SHA-256
+# The longest volume suffix 'par2 create -n1' gives: start and count padded to the count's digits, and a
+# PAR2 set has at most 65535 recovery blocks.
+PAR2_LONGEST_VOLUME = ".vol00000+65535.par2"
 STDERR_TAIL = 4000
 OUTCOMES = ("converted", "verified", "skipped", "failed")
 ACTION_WORDS = {"remux": "remux", "reencode": "re-encode"}
@@ -194,6 +207,41 @@ def new_token():
     return secrets.token_hex(PART_TOKEN_DIGITS // 2)
 
 
+def name_limit(folder):
+    """The longest file name `folder` takes, in bytes: os.pathconf's PC_NAME_MAX, else NAME_MAX_FALLBACK."""
+    try:
+        limit = os.pathconf(str(folder), "PC_NAME_MAX")
+    except (OSError, ValueError, AttributeError):
+        return NAME_MAX_FALLBACK
+    if not isinstance(limit, int) or limit < 1:
+        return NAME_MAX_FALLBACK
+    return limit
+
+
+def _name_bytes(name):
+    """The length of a file name as the file system counts it: bytes of os.fsencode. Pure."""
+    return len(os.fsencode(name))
+
+
+def _name_hash(output_name):
+    """The first NAME_HASH_DIGITS lowercase hex digits of the SHA-256 of the output name's bytes. Pure."""
+    return hashlib.sha256(os.fsencode(output_name)).hexdigest()[:NAME_HASH_DIGITS]
+
+
+def _part_names(output_name, record_id, token):
+    """(normal, short) part file names of one attempt; ValueError for a record id without 8 hex digits. Pure."""
+    id8 = _id8(record_id)
+    return ("." + output_name + "." + id8 + "." + token + PART_SUFFIX,
+            SHORT_PART_PREFIX + id8 + "-" + _name_hash(output_name) + "-" + token + PART_SUFFIX)
+
+
+def _part_name_for(output_path, record_id, token):
+    """The normal part name when it fits the folder's name limit (name_limit, in bytes), else the short one."""
+    normal, short = _part_names(output_path.name, record_id, token)
+    measured, _short = _part_names(output_path.name, record_id, "0" * PART_TOKEN_DIGITS)
+    return normal if _name_bytes(measured) <= name_limit(output_path.parent) else short
+
+
 def part_path(output_path, record_id, token=None):
     """The temp file one attempt writes to: same directory, '.<name>.<id8>.<token>.part' (hidden from Jellyfin and Finder).
 
@@ -202,37 +250,58 @@ def part_path(output_path, record_id, token=None):
     drawn fresh for each attempt (token None; a given token must have the
     form _is_token checks), so an encoder of an earlier attempt that opens
     its output late (its run frozen or stalled while another host took the
-    folder over) writes a file no other attempt uses.
+    folder over) writes a file no other attempt uses. When that name would
+    be longer than the folder's file name limit (name_limit, in bytes), the
+    short form '.vidfunnel-part-<id8>-<name hash>-<token>.part' is used,
+    <name hash> being _name_hash of the output name, so the outputs of one
+    record (the video and its sidecars) keep apart too.
     """
     if token is None:
         token = new_token()
     elif not _is_token(token):
         raise ValueError("'{}' is not an attempt token ({} lowercase hex digits)".format(token, PART_TOKEN_DIGITS))
     output_path = Path(output_path)
-    return output_path.parent / ("." + output_path.name + "." + _id8(record_id) + "." + token + PART_SUFFIX)
+    return output_path.parent / _part_name_for(output_path, record_id, token)
 
 
 def shown_part_path(output_path, record_id):
-    """The part path as --dry-run shows it: '.<name>.<id8>.<token>.part' with the literal '<token>'. Pure.
+    """The part path as --dry-run shows it: the form part_path chooses, with the literal '<token>'.
 
     The real run draws the token when the attempt starts (part_path), so a
     dry run shows the form, and two dry runs print the same text.
     """
     output_path = Path(output_path)
-    return output_path.parent / ("." + output_path.name + "." + _id8(record_id) + "." + PART_TOKEN_SHOWN + PART_SUFFIX)
+    return output_path.parent / _part_name_for(output_path, record_id, PART_TOKEN_SHOWN)
+
+
+def name_limit_problem(path, what):
+    """None when the name of `path` fits its folder's limit (name_limit, in bytes), else a reason naming it."""
+    path = Path(path)
+    size = _name_bytes(path.name)
+    limit = name_limit(path.parent)
+    if size <= limit:
+        return None
+    return "the {} name '{}' is {} bytes, longer than the {} bytes a file name may have in '{}'".format(
+        what, path.name, size, limit, path.parent)
 
 
 def is_part_of(name, output_name, record_id):
     """True when the file name `name` is a part file of this record for `output_name`. Pure.
 
     Exactly '.<output_name>.<id8>.<token>.part' with a token of
-    PART_TOKEN_DIGITS lowercase hex digits, or '.<output_name>.<id8>.part',
-    the one name per record of vidfunnel before 20261110.3 (the package
-    version). Nothing
-    looser: another record's part (another id), a user's
+    PART_TOKEN_DIGITS lowercase hex digits, its short form
+    '.vidfunnel-part-<id8>-<name hash>-<token>.part' (part_path), or
+    '.<output_name>.<id8>.part', the one name per record of vidfunnel
+    before 20261110.3 (the package version). Nothing
+    looser: another record's part (another id), another output's short
+    part (another name hash), a user's
     '.<output_name>.<id8>.notes.part' or a token of another length or
     alphabet is not ours to remove.
     """
+    short_stem = SHORT_PART_PREFIX + _id8(record_id) + "-" + _name_hash(output_name) + "-"
+    if (name.startswith(short_stem) and name.endswith(PART_SUFFIX)
+            and _is_token(name[len(short_stem):-len(PART_SUFFIX)])):
+        return True
     stem = "." + output_name + "." + _id8(record_id)
     if name == stem + PART_SUFFIX:
         return True
@@ -505,13 +574,16 @@ def _remove_own(path, stream=None):
     Its name carries this attempt's token, so no other run writes it and
     removing it cannot touch the new holder's files. A removal that fails
     (an unreachable share) is printed, not raised; the next attempt on the
-    record removes the file as a leftover.
+    record removes the file as a leftover. A name too long for the folder
+    (ENAMETOOLONG) names no file, so there is nothing to remove or report.
     """
     try:
         os.unlink(str(path))
     except FileNotFoundError:
         pass
     except OSError as error:
+        if error.errno == errno.ENAMETOOLONG:
+            return
         say("  could not remove '{}' ({}); the next attempt on this file removes it".format(
             Path(path).name, error.strerror or error), stream)
 
@@ -570,7 +642,10 @@ def write_par2(output_path, redundancy, progress=None):
     attempts (_par2_attempt_files, one 'removed a stale' line each), are
     removed first; a folder that cannot be listed raises OSError naming it
     and the error, also after par2 has run. par2 writes under names of
-    this attempt, '.<name>.<token>.par2' and its volume file, and they are
+    this attempt, '.<name>.<token>.par2' and its volume file (or the short
+    '.vidfunnel-par2-<name hash>-<token>.par2' and its volume file when a
+    volume name of the normal form could exceed the folder's file name
+    limit, _par2_attempt_stem), and they are
     renamed to '<name>.par2' and '<name>.vol*.par2' only after par2
     succeeded and the folder's lock is still this run's (ensure_lock;
     LockLost otherwise). A par2 started by a run that has lost the lock
@@ -578,7 +653,9 @@ def write_par2(output_path, redundancy, progress=None):
     removed on the way out, as on a failure or an interrupt
     (_remove_par2_attempt). An elapsed-time line runs while par2 works,
     since it reports no measurable progress. par2 inherits the folder
-    locks' descriptors, as vidfunnel.ffmpeg.run's children do.
+    locks' descriptors, as vidfunnel.ffmpeg.run's children do. A final or
+    attempt name longer than the folder's limit raises OSError naming it
+    (before par2 starts, or for a volume name, before anything is renamed).
     """
     stream, quiet, _verbose = _stream_of(progress)
     output_path = Path(output_path)
@@ -592,7 +669,11 @@ def write_par2(output_path, redundancy, progress=None):
             say("  removed a stale '{}' from an earlier run".format(stale.name), stream)
     index_name = output_path.name + PAR2_SUFFIX
     token = new_token()
-    attempt_stem = "." + output_path.name + "." + token
+    attempt_stem = _par2_attempt_stem(output_path, token)
+    problem = (name_limit_problem(output_path.parent / index_name, "PAR2 file")
+               or name_limit_problem(output_path.parent / (attempt_stem + PAR2_LONGEST_VOLUME), "PAR2 attempt file"))
+    if problem is not None:
+        raise OSError(problem)
     argv = [par2, "create", "-r{}".format(int(redundancy)), "-n1", "-q", "--", attempt_stem + PAR2_SUFFIX,
             output_path.name]
     say("writing PAR2 ({} %) for '{}'".format(int(redundancy), output_path.name), stream)
@@ -630,15 +711,19 @@ def write_par2(output_path, redundancy, progress=None):
         written = _par2_attempt_files(output_path, token)
         if not written:
             raise OSError("par2 reported success but wrote no '{}' files".format(index_name))
+        renames = [(path, output_path.parent / (output_path.name + path.name[len(attempt_stem):])) for path in written]
+        for _path, final in renames:
+            problem = name_limit_problem(final, "PAR2 file")
+            if problem is not None:
+                raise OSError(problem)
         ensure_lock(output_path.parent)
         files = []
-        for path in written:
-            final = output_path.parent / (output_path.name + path.name[len(attempt_stem):])
+        for path, final in renames:
             os.replace(str(path), str(final))
             files.append(final)
         return sorted(files)
     finally:
-        _remove_par2_attempt(output_path, token, stream)
+        _remove_par2_attempt(output_path, token, stream, attempt_stem)
 
 
 def _par2_files(output_path):
@@ -655,10 +740,27 @@ def _par2_files(output_path):
     return found
 
 
+def _par2_attempt_stem(output_path, token):
+    """The stem of one write_par2 attempt's file names: '.<name>.<token>', or the short form.
+
+    The short form '.vidfunnel-par2-<name hash>-<token>' (_name_hash of the
+    output name, so it is keyed by the output as the normal form is) is used
+    when a volume file of the normal form, with the longest suffix par2 can
+    give (PAR2_LONGEST_VOLUME), would exceed the folder's name limit.
+    """
+    output_path = Path(output_path)
+    normal = "." + output_path.name + "." + token
+    if _name_bytes(normal + PAR2_LONGEST_VOLUME) <= name_limit(output_path.parent):
+        return normal
+    return SHORT_PAR2_PREFIX + _name_hash(output_path.name) + "-" + token
+
+
 def _par2_attempt_files(output_path, token=None):
     """The PAR2 files a write_par2 attempt writes before its rename, of attempt `token` or of any attempt.
 
     Exactly '.<name>.<token>.par2' and '.<name>.<token>.vol<N>+<M>.par2',
+    or the short forms '.vidfunnel-par2-<name hash>-<token>.par2' and
+    '.vidfunnel-par2-<name hash>-<token>.vol<N>+<M>.par2' (_par2_attempt_stem),
     the token PART_TOKEN_DIGITS lowercase hex digits; nothing looser. A
     folder that cannot be listed raises OSError naming the folder and the
     error, so that a listing that fails is never taken for "no files".
@@ -669,21 +771,23 @@ def _par2_attempt_files(output_path, token=None):
         names = sorted(os.listdir(str(output_path.parent)))
     except OSError as error:
         raise OSError("cannot list '{}' for PAR2 files ({})".format(output_path.parent, error.strerror or error))
-    stem = "." + output_path.name + "."
+    stems = ("." + output_path.name + ".", SHORT_PAR2_PREFIX + _name_hash(output_path.name) + "-")
     for name in names:
-        if not name.startswith(stem):
-            continue
-        rest = name[len(stem):]
-        candidate = rest[:PART_TOKEN_DIGITS]
-        if not _is_token(candidate) or (token is not None and candidate != token):
-            continue
-        suffix = rest[PART_TOKEN_DIGITS:]
-        if suffix == PAR2_SUFFIX or _PAR2_VOLUME.fullmatch(suffix):
-            found.append(output_path.parent / name)
+        for stem in stems:
+            if not name.startswith(stem):
+                continue
+            rest = name[len(stem):]
+            candidate = rest[:PART_TOKEN_DIGITS]
+            if not _is_token(candidate) or (token is not None and candidate != token):
+                continue
+            suffix = rest[PART_TOKEN_DIGITS:]
+            if suffix == PAR2_SUFFIX or _PAR2_VOLUME.fullmatch(suffix):
+                found.append(output_path.parent / name)
+                break
     return found
 
 
-def _remove_par2_attempt(output_path, token, stream):
+def _remove_par2_attempt(output_path, token, stream, attempt_stem):
     """On the way out of write_par2: remove the files of attempt `token` still there. Prints, never raises.
 
     When the folder cannot be listed, the attempt's index file, whose name
@@ -695,7 +799,7 @@ def _remove_par2_attempt(output_path, token, stream):
     try:
         leftovers = _par2_attempt_files(output_path, token)
     except OSError as error:
-        _remove_own(output_path.parent / ("." + output_path.name + "." + token + PAR2_SUFFIX), stream)
+        _remove_own(output_path.parent / (attempt_stem + PAR2_SUFFIX), stream)
         say("  {}; a PAR2 volume file of this attempt may stay hidden until the next PAR2 written for '{}' "
             "removes it".format(error, output_path.name), stream)
         return
@@ -721,10 +825,15 @@ def _write_sidecars(sidecars, record_id, stream, verbose, folder=None):
         if not argv or os.path.abspath(argv[-1]) != os.path.abspath(str(final)):
             errors.append({"path": final.name, "error": "sidecar argv does not end in its path"})
             continue
+        temp = part_path(final, record_id)
+        problem = name_limit_problem(final, "sidecar file") or name_limit_problem(temp, "part file")
+        if problem is not None:
+            errors.append({"path": final.name, "error": problem})
+            say("  sidecar '{}' failed: {}".format(final.name, problem), stream)
+            continue
         if final.exists():
             errors.append({"path": final.name, "error": "'{}' already exists; not overwritten".format(final.name)})
             continue
-        temp = part_path(final, record_id)
         argv[-1] = str(temp)
         say("  writing sidecar '{}' ({})".format(final.name, entry.get("kind")), stream)
         if verbose:
@@ -845,6 +954,15 @@ def _convert_one(tools, key, record, options, progress, stream, quiet, verbose, 
         return {"outcome": "skipped", "skipped": problem}
     for name in removed:
         say("  removed a stale '{}' from an earlier run".format(name), stream)
+    problem = name_limit_problem(temp, "part file")
+    if problem is not None:
+        stage = {"outcome": "failed", "error": problem, "returncode": None, "stderr": None}
+        stage.update(ran)
+        add_stage(record, "convert", stage)
+        set_status(record, "failed")
+        save_record(key, record)
+        say("failed: '{}': {}".format(label, problem), stream)
+        return record["stages"]["convert"]
     started = time.monotonic()
     duration = expected_duration(record)
     try:
@@ -855,8 +973,9 @@ def _convert_one(tools, key, record, options, progress, stream, quiet, verbose, 
         ensure_lock(folder)
         os.replace(str(temp), str(output_path))
     except (FfmpegError, ToolNotFound, OSError) as error:
+        # This attempt's part file is removed in the finally below, which never raises: a removal that fails
+        # here (a name too long for the folder, an unreachable share) must not end the run.
         ensure_lock(folder)
-        _remove(temp)
         stage = {"outcome": "failed", "error": str(error), "returncode": getattr(error, "returncode", None),
                  "stderr": _tail(getattr(error, "stderr", None))}
         stage.update(ran)
@@ -1321,12 +1440,21 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
     stages = record.setdefault("stages", {})
     temp = plan["part"]
     output_path = plan["output_path"]
+    # This attempt's part file is removed in refit_one's finally, which never raises: a removal that fails
+    # (a name too long for the folder, an unreachable share) must not end the run.
+    problem = name_limit_problem(temp, "part file")
+    if problem is not None:
+        ensure_lock(folder)
+        add_stage(record, "refit", dict({"attempt": attempt, "outcome": "failed", "error": problem, "stderr": None},
+                                        **plan["mtime_notes"]))
+        save_record(key, record)
+        say("failed: refit of '{}': {}; the existing output is kept".format(label, problem), stream)
+        return "failed", problem
     try:
         with Progress("refit", total=duration, unit="s", stream=stream, quiet=quiet) as live:
             completed = run_tool(plan["argv"], progress=ffmpeg_progress_callback(live, duration))
     except (FfmpegError, ToolNotFound, OSError) as error:
         ensure_lock(folder)
-        _remove(temp)
         attempt["elapsed_s"] = round(time.monotonic() - started, 3)
         add_stage(record, "refit", dict({"attempt": attempt, "outcome": "failed", "error": str(error),
                                          "stderr": _tail(getattr(error, "stderr", None))}, **plan["mtime_notes"]))
@@ -1359,7 +1487,6 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
                                      "?" if attempt["ratio"] is None else "{:.2f}".format(attempt["ratio"]))
     if problem is not None:
         ensure_lock(folder)
-        _remove(temp)
         add_stage(record, "refit", dict({"attempt": attempt, "outcome": "kept-existing", "reason": problem},
                                         **plan["mtime_notes"]))
         add_flag(record, FIT_CAPPED_FLAG)
@@ -1373,7 +1500,6 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
         os.replace(str(temp), str(output_path))
     except OSError as error:
         ensure_lock(folder)
-        _remove(temp)
         add_stage(record, "refit", dict({"attempt": attempt, "outcome": "failed",
                                          "error": "could not replace '{}': {}".format(output_path.name, error)},
                                         **plan["mtime_notes"]))

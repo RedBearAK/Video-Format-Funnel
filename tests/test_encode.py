@@ -8,7 +8,7 @@ ends at 'converted' or 'verified' depends on whether vidfunnel.verify is
 present, so both are accepted.
 """
 
-VERSION = "20261110.2"
+VERSION = "20261110.3"
 
 import argparse
 import contextlib
@@ -1210,6 +1210,29 @@ REENCODE_SOURCE = "xvid_avi_mp3.avi"
 MP4_SOURCE = "h264_mp4_aac.mp4"
 SUBTITLE_SOURCE = "h264_mkv_srt_subtitles.mkv"
 INTEGRATION_FIXTURES = (REMUX_SOURCE, REENCODE_SOURCE, MP4_SOURCE)
+# Copies under a 234-byte name, so the output name is 234 bytes as well: its normal part name
+# ('.NAME.<id8>.<token>.part', 262 bytes) is longer than the 255 bytes most file systems allow.
+LONG_STEM = ("harbour-evening-at-the-old-pier-" * 8)[:226] + "-end"
+LONG_REMUX_SOURCE = LONG_STEM + ".mkv"
+LONG_REFIT_SOURCE = LONG_STEM + ".avi"
+
+
+def short_part_form(record_id, output_name):
+    """A regular expression for the short part name of any attempt of record_id on output_name."""
+    return (re.escape(encode.SHORT_PART_PREFIX + record_id[:8] + "-" + encode._name_hash(output_name) + "-")
+            + "[0-9a-f]{12}" + re.escape(".part"))
+
+
+def hidden_names(folder):
+    """The hidden names in folder other than the record directory, sorted."""
+    return sorted(name for name in os.listdir(str(folder)) if name.startswith(".") and name != ".vidfunnel")
+
+
+def needs_short_names(test, output):
+    """Skip `test` when the folder takes the normal part name of `output` (a file system allowing longer names)."""
+    if len(os.fsencode(output.name)) + 28 <= encode.name_limit(output.parent):
+        test.skipTest("'{}' takes names longer than 255 bytes; the long-name tests need a limit of 255".format(
+            output.parent))
 
 
 @unittest.skipIf(TOOLS is None, "ffmpeg not found on PATH; convert integration tests skipped")
@@ -1225,9 +1248,12 @@ class ConvertRunTest(unittest.TestCase):
         self.root = Path(self.temporary.name) / "library"
         self.root.mkdir()
 
-    def plan(self, *names):
-        for name in names:
-            shutil.copy2(os.path.join(FIXTURE_DIR, name), str(self.root / name))
+    def plan(self, *names, **copies):
+        """Copy each fixture in names (and each copies[name] fixture under its name), plan, return the records."""
+        copies = dict(copies.pop("copies", {}), **{name: name for name in names})
+        for name, fixture in copies.items():
+            shutil.copy2(os.path.join(FIXTURE_DIR, fixture), str(self.root / name))
+        names = list(copies)
         plan_paths(TOOLS, [str(self.root)], make_options(), progress=quiet())
         records = {}
         for name in names:
@@ -1380,7 +1406,7 @@ class ConvertRunTest(unittest.TestCase):
         self.assertFalse((self.root / "h264_high_mkv_aac.mp4").exists())
         self.assertIn("skipping 'h264_high_mkv_aac.mkv': cannot remove the part file", progress.stream.getvalue())
 
-    def taken_over_after_the_encode(self, fail=False, silent_stat=False):
+    def taken_over_after_the_encode(self, fail=False, silent_stat=False, source=REMUX_SOURCE):
         """run_tool for convert_paths: host B takes the folder over and starts the same record while A encodes.
 
         Without silent_stat, B replaces the lock file as A's encoder starts, clears the record's leftovers (A's
@@ -1401,15 +1427,15 @@ class ConvertRunTest(unittest.TestCase):
                 os.unlink(str(lock_file))
                 lock_file.write_text(json.dumps({"host": "hostb", "pid": 4242, "started": "2026-11-09T12:00:00Z",
                                                  "heartbeat": {"interval": 300}}), encoding="utf-8")
-                output = self.root / "h264_high_mkv_aac.mp4"
-                record_id = load_record(self.root / REMUX_SOURCE)["id"]
+                output = self.root / (Path(source).stem + ".mp4")
+                record_id = load_record(self.root / source)["id"]
                 self.assertEqual(encode._clear_leftovers(output, record_id), ([], None))
                 part = part_path(output, record_id)
                 part.write_bytes(b"PARTIAL OUTPUT OF HOST B, STILL BEING WRITTEN")
                 seen.update(part=part, part_bytes=part.read_bytes())
             completed = ffmpeg_run(argv, *rest, **values)
             seen["own_written"] = own.is_file()
-            seen["record_bytes"] = record_path(self.root / REMUX_SOURCE).read_bytes()
+            seen["record_bytes"] = record_path(self.root / source).read_bytes()
             if fail:
                 raise FfmpegError("ffmpeg failed after the takeover", argv=argv, returncode=1, stderr="simulated")
             return completed
@@ -1425,29 +1451,42 @@ class ConvertRunTest(unittest.TestCase):
         self.addCleanup(patch.stop)
         return lines
 
-    def assert_nothing_written_after_the_takeover(self, seen, summary, text, reason):
-        output = self.root / "h264_high_mkv_aac.mp4"
+    def assert_nothing_written_after_the_takeover(self, seen, summary, text, reason, source=REMUX_SOURCE):
+        output = self.root / (Path(source).stem + ".mp4")
         self.assertFalse(output.exists(), "the old holder put a file in place as the output")
         if "part" in seen:
             self.assertNotEqual(seen["part"], seen["own"])
             self.assertEqual(seen["part"].read_bytes(), seen["part_bytes"], "the new holder's part file was touched")
         self.assertTrue(seen["own_written"], "A's encoder wrote no part file of its own")
         self.assertFalse(seen["own"].exists(), "the old holder's own part file was left behind")
-        self.assertEqual(record_path(self.root / REMUX_SOURCE).read_bytes(), seen["record_bytes"])
+        self.assertEqual(record_path(self.root / source).read_bytes(), seen["record_bytes"])
         self.assertEqual(summary.counts.get("skipped"), 1, text)
-        self.assertIn("skipping 'h264_high_mkv_aac.mkv': the lock of folder '{}' {}".format(self.root, reason), text)
+        self.assertIn("skipping '{}': the lock of folder '{}' {}".format(source, self.root, reason), text)
 
-    def test_a_holder_whose_lock_was_taken_during_the_encode_writes_nothing(self):
-        self.plan(REMUX_SOURCE)
+    def holder_whose_lock_was_taken_during_the_encode(self, source):
+        if source == REMUX_SOURCE:
+            self.plan(REMUX_SOURCE)
+        else:
+            self.plan(copies={source: REMUX_SOURCE})
         lines = self.quiet_lost_lock()
-        patch, seen = self.taken_over_after_the_encode()
+        patch, seen = self.taken_over_after_the_encode(source=source)
         progress = quiet()
         with patch:
             summary = convert_paths(TOOLS, [str(self.root)], convert_options(), progress)
         text = progress.stream.getvalue()
-        self.assert_nothing_written_after_the_takeover(seen, summary, text, "was taken over by another run")
+        self.assert_nothing_written_after_the_takeover(seen, summary, text, "was taken over by another run", source)
         self.assertTrue(vidfunnel.interrupt.draining.is_set())
         self.assertIn("lost the lock of folder '{}'".format(self.root), "".join(lines))
+        return seen
+
+    def test_a_holder_whose_lock_was_taken_during_the_encode_writes_nothing(self):
+        seen = self.holder_whose_lock_was_taken_during_the_encode(REMUX_SOURCE)
+        self.assertFalse(seen["own"].name.startswith(encode.SHORT_PART_PREFIX), seen["own"].name)
+
+    def test_a_holder_of_a_long_named_file_whose_lock_was_taken_removes_its_short_part_too(self):
+        seen = self.holder_whose_lock_was_taken_during_the_encode(LONG_REMUX_SOURCE)
+        self.assertTrue(seen["own"].name.startswith(encode.SHORT_PART_PREFIX), seen["own"].name)
+        self.assertTrue(seen["part"].name.startswith(encode.SHORT_PART_PREFIX), seen["part"].name)
 
     def test_a_failed_encode_after_the_takeover_removes_and_saves_nothing(self):
         self.plan(REMUX_SOURCE)
@@ -1515,9 +1554,21 @@ class ConvertRunTest(unittest.TestCase):
 
     def test_an_encoder_that_opens_its_output_after_a_takeover_writes_only_its_own_part_file(self):
         """A is held between its leftover cleanup and its encoder's open; B takes over, encodes and renames."""
-        record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
+        seen = self.encoder_that_opens_its_output_after_a_takeover(REMUX_SOURCE)
+        self.assertFalse(seen["own"].name.startswith(encode.SHORT_PART_PREFIX), seen["own"].name)
+
+    def test_a_long_named_files_encoder_that_opens_its_output_after_a_takeover_writes_only_its_own_short_part(self):
+        seen = self.encoder_that_opens_its_output_after_a_takeover(LONG_REMUX_SOURCE)
+        self.assertTrue(seen["own"].name.startswith(encode.SHORT_PART_PREFIX), seen["own"].name)
+        self.assertTrue(seen["part"].name.startswith(encode.SHORT_PART_PREFIX), seen["part"].name)
+
+    def encoder_that_opens_its_output_after_a_takeover(self, source):
+        if source == REMUX_SOURCE:
+            record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
+        else:
+            record = self.plan(copies={source: REMUX_SOURCE})[source]
         lines = self.quiet_lost_lock()
-        output = self.root / "h264_high_mkv_aac.mp4"
+        output = self.root / (Path(source).stem + ".mp4")
         marker = b"WRITTEN BY HOST A'S ENCODER, WHICH OPENED ITS OUTPUT AFTER THE TAKEOVER"
         seen = {}
 
@@ -1537,7 +1588,7 @@ class ConvertRunTest(unittest.TestCase):
             seen.update(own_bytes=Path(argv[-1]).read_bytes(), own_inode=os.stat(argv[-1]).st_ino)
             # B renames its finished part into place.
             os.replace(str(part), str(output))
-            seen["record_bytes"] = record_path(self.root / REMUX_SOURCE).read_bytes()
+            seen["record_bytes"] = record_path(self.root / source).read_bytes()
             return completed
 
         progress = quiet()
@@ -1552,11 +1603,12 @@ class ConvertRunTest(unittest.TestCase):
         self.assertFalse(seen["own_existed"])
         self.assertFalse(seen["own"].exists(), "A's own part file was left behind after A lost the lock")
         self.assertEqual(self.leftover_parts(), [])
-        self.assertEqual(record_path(self.root / REMUX_SOURCE).read_bytes(), seen["record_bytes"], "A wrote a record")
+        self.assertEqual(record_path(self.root / source).read_bytes(), seen["record_bytes"], "A wrote a record")
         self.assertEqual(summary.counts.get("skipped"), 1, text)
-        self.assertIn("skipping 'h264_high_mkv_aac.mkv': the lock of folder '{}' was taken over by another "
-                      "run".format(self.root), text)
+        self.assertIn("skipping '{}': the lock of folder '{}' was taken over by another run".format(
+            source, self.root), text)
         self.assertIn("lost the lock of folder '{}'".format(self.root), "".join(lines))
+        return seen
 
     def test_a_sidecar_encoder_that_opens_its_output_after_a_takeover_writes_only_its_own_part_file(self):
         if not os.path.exists(os.path.join(FIXTURE_DIR, SUBTITLE_SOURCE)):
@@ -2121,6 +2173,249 @@ class ConvertRunTest(unittest.TestCase):
         for name in stage["par2_files"]:
             self.assertTrue((self.root / name).is_file(), name)
 
+    # --- names longer than the folder allows in the normal temporary form ---
+
+    def test_a_long_named_source_converts_and_verifies_through_a_short_part_name(self):
+        record = self.plan(copies={LONG_REMUX_SOURCE: REMUX_SOURCE})[LONG_REMUX_SOURCE]
+        output_name = LONG_STEM + ".mp4"
+        self.assertEqual(len(output_name.encode("utf-8")), 234)
+        needs_short_names(self, self.root / output_name)
+        id8 = record["id"][:8]
+        other_id8 = SECOND_RECORD_ID[:8] if id8 != SECOND_RECORD_ID[:8] else FIRST_RECORD_ID[:8]
+        name_hash = encode._name_hash(output_name)
+        other_hash = encode._name_hash(LONG_STEM + ".en.srt")
+        stale = [".vidfunnel-part-{}-{}-0123456789ab.part".format(id8, name_hash),
+                 ".vidfunnel-part-{}-{}-fedcba987654.part".format(id8, name_hash)]
+        kept = [".vidfunnel-part-{}-{}-0123456789ab.part".format(other_id8, name_hash),    # another record
+                ".vidfunnel-part-{}-{}-0123456789ab.part".format(id8, other_hash),         # another output
+                ".vidfunnel-part-{}-{}-0123456789AB.part".format(id8, name_hash),          # upper-case token
+                ".vidfunnel-part-{}-{}-0123456789ab.part".format(id8, name_hash.upper()),  # upper-case hash
+                ".vidfunnel-part-{}-{}-0123456789a.part".format(id8, name_hash),           # token too short
+                ".vidfunnel-part-{}-{}-0123456789ab.part".format(id8, name_hash[:15]),     # hash too short
+                "vidfunnel-part-{}-{}-0123456789ab.part".format(id8, name_hash),           # not hidden
+                ".vidfunnel-part-{}-{}-0123456789ab.part.bak".format(id8, name_hash)]
+        for name in stale + kept:
+            (self.root / name).write_bytes(name.encode("utf-8"))
+        progress = quiet()
+        stage = convert_one(TOOLS, self.root / LONG_REMUX_SOURCE, record, convert_options(), progress=progress)
+        text = progress.stream.getvalue()
+        self.assertEqual(stage["outcome"], "ok", stage)
+        saved = load_record(self.root / LONG_REMUX_SOURCE)
+        self.assertIn(saved["status"], DONE)
+        self.assertEqual(saved["status"], "verified", text)
+        self.assertRegex(saved["stages"]["convert"]["part_path"], short_part_form(record["id"], output_name))
+        self.assertEqual(saved["stages"]["convert"]["argv"][-1], str(self.root / saved["stages"]["convert"]["part_path"]))
+        self.assertTrue((self.root / output_name).is_file())
+        for name in stale:
+            self.assertFalse((self.root / name).exists(), name)
+            self.assertIn("removed a stale '{}' from an earlier run".format(name), text)
+        for name in kept:
+            self.assertEqual((self.root / name).read_bytes(), name.encode("utf-8"), name)
+            self.assertNotIn("'{}'".format(name), text)
+        self.assertEqual(hidden_names(self.root), sorted(name for name in kept if name.startswith(".")))
+
+    @unittest.skipIf(shutil.which("par2") is None, "par2 not on PATH; long-name PAR2 test skipped")
+    def test_a_long_named_source_with_par2_gets_its_final_set_and_leaves_no_hidden_file(self):
+        record = self.plan(copies={LONG_REMUX_SOURCE: REMUX_SOURCE})[LONG_REMUX_SOURCE]
+        output_name = LONG_STEM + ".mp4"
+        needs_short_names(self, self.root / output_name)
+        stems = []
+        real_stem = encode._par2_attempt_stem
+
+        def spy(*arguments):
+            stems.append(real_stem(*arguments))
+            return stems[-1]
+
+        with unittest.mock.patch("vidfunnel.encode._par2_attempt_stem", side_effect=spy):
+            stage = self.convert(LONG_REMUX_SOURCE, record, par2=10)
+        self.assertEqual(stage["outcome"], "ok", stage)
+        self.assertNotIn("par2_error", stage)
+        self.assertEqual(len(stems), 1, stems)
+        self.assertTrue(stems[0].startswith(encode.SHORT_PAR2_PREFIX + encode._name_hash(output_name) + "-"), stems)
+        self.assertIn(output_name + ".par2", stage["par2_files"])
+        self.assertEqual(len(stage["par2_files"]), 2, stage["par2_files"])
+        for name in stage["par2_files"]:
+            self.assertTrue((self.root / name).is_file(), name)
+        check = subprocess.run(["par2", "verify", "-q", output_name + ".par2"], stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, universal_newlines=True, cwd=str(self.root))
+        self.assertEqual(check.returncode, 0, check.stdout)
+        self.assertEqual(hidden_names(self.root), [])
+        self.assertNotIn("par2-failed", load_record(self.root / LONG_REMUX_SOURCE).get("flags") or [])
+
+    def test_a_dry_run_shows_the_short_part_name_with_the_token_placeholder(self):
+        record = self.plan(copies={LONG_REMUX_SOURCE: REMUX_SOURCE})[LONG_REMUX_SOURCE]
+        output_name = LONG_STEM + ".mp4"
+        needs_short_names(self, self.root / output_name)
+        shown = "{}{}-{}-<token>.part".format(encode.SHORT_PART_PREFIX, record["id"][:8], encode._name_hash(output_name))
+        texts = []
+        for _attempt in range(2):
+            progress = quiet()
+            convert_paths(TOOLS, [str(self.root)], convert_options(dry_run=True), progress)
+            texts.append(progress.stream.getvalue())
+        self.assertEqual(texts[0], texts[1])
+        self.assertIn(shlex.quote(str(self.root / shown)), texts[0])
+        self.assertEqual(hidden_names(self.root), [])
+
+    def test_a_part_name_too_long_even_in_short_form_fails_the_item_with_a_reason_before_ffmpeg(self):
+        record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
+        progress = quiet()
+        with unittest.mock.patch("vidfunnel.encode.name_limit", return_value=40), \
+                unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=AssertionError("ffmpeg started")):
+            summary = convert_paths(TOOLS, [str(self.root)], convert_options(), progress)
+        text = progress.stream.getvalue()
+        self.assertEqual(summary.counts.get("failed"), 1, text)
+        saved = load_record(self.root / REMUX_SOURCE)
+        self.assertEqual(saved["status"], "failed")
+        error = saved["stages"]["convert"]["error"]
+        self.assertRegex(error, r"^the part file name '{}' is 59 bytes, longer than the 40 bytes a file name may "
+                                r"have in '{}'$".format(short_part_form(record["id"], "h264_high_mkv_aac.mp4"),
+                                                        re.escape(str(self.root))))
+        self.assertIn("failed: '{}': {}".format(REMUX_SOURCE, error), text)
+        self.assertNotIn("Traceback", text)
+        self.assertEqual(hidden_names(self.root), [])
+
+    def failing_first_encode(self):
+        """(run_tool patch, unlink patch, calls): the first encode fails as ffmpeg does when it cannot create its
+        output (ENAMETOOLONG), and unlinking that output's name fails the same way; later encodes run."""
+        calls = []
+        real_unlink = os.unlink
+
+        def first_cannot_create(argv, *rest, **values):
+            calls.append(argv[-1])
+            if len(calls) == 1:
+                raise FfmpegError("'ffmpeg' exited with status 220:\n  Error opening output files: File name too long",
+                                  argv=argv, returncode=220,
+                                  stderr="Error opening output {}: File name too long".format(argv[-1]))
+            return ffmpeg_run(argv, *rest, **values)
+
+        def too_long(path, *rest, **values):
+            if calls and os.fspath(path) == calls[0]:
+                raise OSError(errno.ENAMETOOLONG, "File name too long", os.fspath(path))
+            return real_unlink(path, *rest, **values)
+
+        return (unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=first_cannot_create),
+                unittest.mock.patch("vidfunnel.encode.os.unlink", side_effect=too_long), calls)
+
+    def test_a_part_file_that_cannot_be_created_or_removed_fails_the_item_and_the_next_one_converts(self):
+        records = self.plan(REMUX_SOURCE, copies={SECOND_NAME: REMUX_SOURCE})
+        run_patch, unlink_patch, calls = self.failing_first_encode()
+        progress = quiet()
+        with run_patch, unlink_patch:
+            summary = convert_paths(TOOLS, [str(self.root)], convert_options(), progress)
+        text = progress.stream.getvalue()
+        self.assertEqual(len(calls), 2, text)
+        first = [name for name, record in records.items()
+                 if is_part_of(Path(calls[0]).name, Path(name).stem + ".mp4", record["id"])]
+        self.assertEqual(len(first), 1, calls)
+        second = [name for name in records if name != first[0]][0]
+        self.assertEqual(summary.counts.get("failed"), 1, text)
+        self.assertEqual(summary.counts.get("converted", 0) + summary.counts.get("verified", 0), 1, text)
+        failed = load_record(self.root / first[0])
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["stages"]["convert"]["outcome"], "failed")
+        self.assertIn("File name too long", failed["stages"]["convert"]["error"])
+        self.assertIn("failed: '{}': 'ffmpeg' exited with status 220".format(first[0]), text)
+        self.assertIn(load_record(self.root / second)["status"], DONE)
+        self.assertTrue((self.root / (Path(second).stem + ".mp4")).is_file())
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("could not remove", text)
+
+    def test_a_sidecar_part_that_cannot_be_created_or_removed_fails_that_sidecar_only(self):
+        if not os.path.exists(os.path.join(FIXTURE_DIR, SUBTITLE_SOURCE)):
+            self.skipTest("fixture '{}' missing; run tests/make_fixtures.sh".format(SUBTITLE_SOURCE))
+        record = self.plan(SUBTITLE_SOURCE)[SUBTITLE_SOURCE]
+        sidecars = [Path(entry["path"]).name for entry in record["stages"]["plan"].get("sidecars") or []]
+        self.assertTrue(sidecars, "the subtitle fixture no longer plans a sidecar; pick another")
+        real_unlink = os.unlink
+        seen = []
+
+        def sidecar_cannot_create(argv, *rest, **values):
+            if not is_part_of(Path(argv[-1]).name, sidecars[0], record["id"]):
+                return ffmpeg_run(argv, *rest, **values)
+            seen.append(argv[-1])
+            raise FfmpegError("'ffmpeg' exited with status 220: File name too long", argv=argv, returncode=220,
+                              stderr="File name too long")
+
+        def too_long(path, *rest, **values):
+            if os.fspath(path) in seen:
+                raise OSError(errno.ENAMETOOLONG, "File name too long", os.fspath(path))
+            return real_unlink(path, *rest, **values)
+
+        progress = quiet()
+        with unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=sidecar_cannot_create), \
+                unittest.mock.patch("vidfunnel.encode.os.unlink", side_effect=too_long):
+            summary = convert_paths(TOOLS, [str(self.root)], convert_options(), progress)
+        text = progress.stream.getvalue()
+        self.assertEqual(len(seen), 1, text)
+        self.assertEqual(summary.counts.get("failed", 0), 0, text)
+        saved = load_record(self.root / SUBTITLE_SOURCE)
+        self.assertIn(saved["status"], DONE)
+        self.assertIn("sidecar-failed", saved["flags"])
+        errors = saved["stages"]["convert"]["sidecar_errors"]
+        self.assertEqual([entry["path"] for entry in errors], [sidecars[0]])
+        self.assertIn("File name too long", errors[0]["error"])
+        self.assertNotIn("Traceback", text)
+
+    def test_a_sidecar_name_too_long_for_the_folder_fails_that_sidecar_with_a_reason(self):
+        if not os.path.exists(os.path.join(FIXTURE_DIR, SUBTITLE_SOURCE)):
+            self.skipTest("fixture '{}' missing; run tests/make_fixtures.sh".format(SUBTITLE_SOURCE))
+        stem = LONG_STEM[:100]
+        source = stem + ".mkv"
+        record = self.plan(copies={source: SUBTITLE_SOURCE})[source]
+        sidecars = [Path(entry["path"]).name for entry in record["stages"]["plan"].get("sidecars") or []]
+        self.assertTrue(sidecars, "the subtitle fixture no longer plans a sidecar; pick another")
+        # A limit one byte short of the sidecar's name, injected: the main part file takes the short form and fits
+        # (the output's own name is checked by the file system at its rename, not against this limit).
+        limit = len(sidecars[0]) - 1
+        self.assertGreaterEqual(limit, 59)
+        progress = quiet()
+        with unittest.mock.patch("vidfunnel.encode.name_limit", return_value=limit):
+            summary = convert_paths(TOOLS, [str(self.root)], convert_options(), progress)
+        text = progress.stream.getvalue()
+        self.assertEqual(summary.counts.get("failed", 0), 0, text)
+        saved = load_record(self.root / source)
+        self.assertRegex(saved["stages"]["convert"]["part_path"], short_part_form(record["id"], stem + ".mp4"))
+        self.assertIn(saved["status"], DONE)
+        errors = saved["stages"]["convert"]["sidecar_errors"]
+        self.assertEqual(errors[0]["path"], sidecars[0])
+        self.assertTrue(errors[0]["error"].startswith(
+            "the sidecar file name '{}' is {} bytes, longer than the {} bytes".format(
+                sidecars[0], len(sidecars[0]), limit)), errors[0]["error"])
+        self.assertFalse((self.root / sidecars[0]).exists())
+        self.assertNotIn("Traceback", text)
+
+    @unittest.skipIf(shutil.which("par2") is None, "par2 not on PATH; PAR2 rename test skipped")
+    def test_par2_files_that_cannot_be_renamed_or_removed_fail_the_par2_step_only(self):
+        record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
+        real_replace = os.replace
+        real_unlink = os.unlink
+        refused = []
+
+        def too_long_replace(source, target, *rest, **values):
+            if os.fspath(target).endswith(".par2"):
+                raise OSError(errno.ENAMETOOLONG, "File name too long", os.fspath(source), None, os.fspath(target))
+            return real_replace(source, target, *rest, **values)
+
+        def too_long_unlink(path, *rest, **values):
+            name = os.path.basename(os.fspath(path))
+            if name.startswith(".h264_high_mkv_aac.mp4.") and name.endswith(".par2"):
+                refused.append(name)
+                raise OSError(errno.ENAMETOOLONG, "File name too long", os.fspath(path))
+            return real_unlink(path, *rest, **values)
+
+        progress = quiet()
+        with unittest.mock.patch("vidfunnel.encode.os.replace", side_effect=too_long_replace), \
+                unittest.mock.patch("vidfunnel.encode.os.unlink", side_effect=too_long_unlink):
+            stage = convert_one(TOOLS, self.root / REMUX_SOURCE, record, convert_options(par2=10), progress=progress)
+        text = progress.stream.getvalue()
+        self.assertEqual(stage["outcome"], "ok", stage)
+        self.assertIn("File name too long", stage["par2_error"])
+        self.assertEqual(stage["par2_files"], [])
+        self.assertTrue(refused, "the attempt's own PAR2 files were not removed on the way out")
+        self.assertIn("par2-failed", load_record(self.root / REMUX_SOURCE)["flags"])
+        self.assertIn("PAR2 failed for 'h264_high_mkv_aac.mp4'", text)
+        self.assertNotIn("Traceback", text)
+
 
 # --- refit: pure --------------------------------------------------------------------------
 
@@ -2281,12 +2576,13 @@ class RefitRunTest(unittest.TestCase):
         self.root.mkdir()
 
     def plan_and_convert(self, *names, **plan_values):
-        for name in names:
-            shutil.copy2(os.path.join(FIXTURE_DIR, name), str(self.root / name))
+        copies = dict(plan_values.pop("copies", {}), **{name: name for name in names})
+        for name, fixture in copies.items():
+            shutil.copy2(os.path.join(FIXTURE_DIR, fixture), str(self.root / name))
         plan_paths(TOOLS, [str(self.root)], make_options(**plan_values), progress=quiet())
         progress = quiet()
         convert_paths(TOOLS, [str(self.root)], convert_options(), progress)
-        return {name: load_record(self.root / name) for name in names}
+        return {name: load_record(self.root / name) for name in copies}
 
     def refit(self, **values):
         progress = quiet()
@@ -2422,6 +2718,77 @@ class RefitRunTest(unittest.TestCase):
         self.assertIn("skipping '{}': the lock of folder '{}' was taken over by another run".format(
             REFIT_SOURCE, self.root), text)
         self.assertEqual(summary.counts["refitted"] + summary.counts["kept"] + summary.counts["failed"], 0, text)
+
+    def test_a_long_named_re_encode_is_refitted_through_a_short_part_name(self):
+        record = self.plan_and_convert(copies={LONG_REFIT_SOURCE: REFIT_SOURCE}, reencode_video=True)[LONG_REFIT_SOURCE]
+        output_name = LONG_STEM + ".mp4"
+        needs_short_names(self, self.root / output_name)
+        self.assertIn("output-larger", record["flags"], "the fixture no longer re-encodes larger; pick another")
+        self.assertRegex(record["stages"]["convert"]["part_path"], short_part_form(record["id"], output_name))
+        stale = ".vidfunnel-part-{}-{}-0123456789ab.part".format(record["id"][:8], encode._name_hash(output_name))
+        (self.root / stale).write_bytes(b"left by an earlier refit")
+        summary, text = self.refit()
+        self.assertEqual(summary.counts["refitted"], 1, text)
+        self.assertIn("removed a stale '{}' from an earlier run".format(stale), text)
+        saved = load_record(self.root / LONG_REFIT_SOURCE)
+        self.assertEqual(saved["stages"]["refit"]["outcome"], "replaced")
+        self.assertRegex(Path(saved["stages"]["refit"]["attempt"]["argv"][-1]).name,
+                         short_part_form(record["id"], output_name))
+        self.assertEqual(saved["status"], "verified", text)
+        self.assertEqual(hidden_names(self.root), [])
+
+    def test_a_refit_part_name_too_long_even_in_short_form_fails_the_refit_with_a_reason(self):
+        record = self.plan_and_convert(REFIT_SOURCE, reencode_video=True)[REFIT_SOURCE]
+        output_bytes = (self.root / REFIT_OUTPUT).read_bytes()
+        with unittest.mock.patch("vidfunnel.encode.name_limit", return_value=40), \
+                unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=AssertionError("ffmpeg started")):
+            summary, text = self.refit()
+        self.assertEqual(summary.counts["failed"], 1, text)
+        stage = load_record(self.root / REFIT_SOURCE)["stages"]["refit"]
+        self.assertEqual(stage["outcome"], "failed")
+        self.assertRegex(stage["error"], r"^the part file name '{}' is 59 bytes, longer than the 40 bytes".format(
+            short_part_form(record["id"], REFIT_OUTPUT)))
+        self.assertEqual((self.root / REFIT_OUTPUT).read_bytes(), output_bytes)
+        self.assertNotIn("Traceback", text)
+        self.assertEqual(hidden_names(self.root), [])
+
+    def test_a_refit_part_file_that_cannot_be_created_or_removed_fails_that_refit_and_the_next_one_runs(self):
+        records = self.plan_and_convert(copies={FIRST_REFIT: REFIT_SOURCE, SECOND_REFIT: REFIT_SOURCE},
+                                        reencode_video=True)
+        for name, record in records.items():
+            self.assertIn("output-larger", record["flags"], name)
+        calls = []
+        real_unlink = os.unlink
+
+        def first_cannot_create(argv, *rest, **values):
+            calls.append(argv[-1])
+            if len(calls) == 1:
+                raise FfmpegError("'ffmpeg' exited with status 220: File name too long", argv=argv, returncode=220,
+                                  stderr="Error opening output {}: File name too long".format(argv[-1]))
+            return ffmpeg_run(argv, *rest, **values)
+
+        def too_long(path, *rest, **values):
+            if calls and os.fspath(path) == calls[0]:
+                raise OSError(errno.ENAMETOOLONG, "File name too long", os.fspath(path))
+            return real_unlink(path, *rest, **values)
+
+        with unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=first_cannot_create), \
+                unittest.mock.patch("vidfunnel.encode.os.unlink", side_effect=too_long):
+            summary, text = self.refit()
+        refit_calls = [path for path in calls if path.endswith(".part")]
+        self.assertEqual(len(refit_calls), 2, text)
+        first = [name for name, record in records.items()
+                 if is_part_of(Path(calls[0]).name, Path(name).stem + ".mp4", record["id"])]
+        self.assertEqual(len(first), 1, calls)
+        second = [name for name in records if name != first[0]][0]
+        self.assertEqual(summary.counts["failed"], 1, text)
+        self.assertEqual(summary.counts["refitted"] + summary.counts["kept"], 1, text)
+        stage = load_record(self.root / first[0])["stages"]["refit"]
+        self.assertEqual(stage["outcome"], "failed")
+        self.assertIn("File name too long", stage["error"])
+        self.assertIn(load_record(self.root / second)["stages"]["refit"]["outcome"], ("replaced", "kept-existing"))
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("could not remove", text)
 
     def test_larger_reencode_is_refitted_replaced_and_verified(self):
         records = self.plan_and_convert(REFIT_SOURCE, REENCODE_SOURCE, reencode_video=True)
@@ -3117,16 +3484,43 @@ class Par2AttemptTest(unittest.TestCase):
         self.folder.mkdir()
         self.output = self.folder / "harbour.mp4"
         self.output.write_bytes(os.urandom(200000))
+        self.limit = encode.name_limit(self.folder)
         self.addCleanup(vidfunnel.interrupt.draining.clear)
         self.addCleanup(vidfunnel.interrupt.drain_tally.reset)
 
     def par2_names(self):
         return sorted(name for name in os.listdir(str(self.folder)) if name.endswith(".par2"))
 
+    def long_output(self, size):
+        """An output named 'harbour-…mp4' of `size` bytes beside self.output, with the same content."""
+        path = self.folder / (("harbour-" * (size // 8 + 1))[:size - 4] + ".mp4")
+        path.write_bytes(self.output.read_bytes())
+        return path
+
+    def stems_seen(self):
+        """(patch, stems): _par2_attempt_stem as it is, each stem it returns appended to stems."""
+        stems = []
+        real_stem = encode._par2_attempt_stem
+
+        def spy(*arguments):
+            stems.append(real_stem(*arguments))
+            return stems[-1]
+
+        return unittest.mock.patch("vidfunnel.encode._par2_attempt_stem", side_effect=spy), stems
+
     def test_a_par2_that_runs_after_a_takeover_writes_only_files_of_its_own(self):
+        stems = self.par2_after_a_takeover(self.output)
+        self.assertTrue(stems[0].startswith(".harbour.mp4."), stems)
+
+    def test_a_long_named_outputs_par2_that_runs_after_a_takeover_writes_only_short_named_files_of_its_own(self):
+        output = self.long_output(self.limit - 21)
+        stems = self.par2_after_a_takeover(output)
+        self.assertTrue(stems[0].startswith(encode.SHORT_PAR2_PREFIX), stems)
+
+    def par2_after_a_takeover(self, output):
         from vidfunnel.record import FolderLock, LockLost
         lock_file = self.folder / ".vidfunnel" / "lock"
-        new_set = {"harbour.mp4.par2": b"HOST B'S PAR2 INDEX", "harbour.mp4.vol000+01.par2": b"HOST B'S PAR2 VOLUME"}
+        new_set = {output.name + ".par2": b"HOST B'S PAR2 INDEX", output.name + ".vol000+01.par2": b"HOST B'S PAR2 VOLUME"}
 
         def held_then_host_b(*arguments, **keywords):
             # A is held just before its par2 starts; B takes the folder over and writes its own set.
@@ -3136,13 +3530,85 @@ class Par2AttemptTest(unittest.TestCase):
             for name, data in new_set.items():
                 (self.folder / name).write_bytes(data)
 
-        with unittest.mock.patch("vidfunnel.record._warn"), FolderLock(self.folder), \
+        patch, stems = self.stems_seen()
+        with unittest.mock.patch("vidfunnel.record._warn"), FolderLock(self.folder), patch, \
                 unittest.mock.patch("vidfunnel.encode.raise_if_stopped_now", side_effect=held_then_host_b):
             with self.assertRaises(LockLost):
-                write_par2(self.output, 5, progress=quiet())
+                write_par2(output, 5, progress=quiet())
         for name, data in new_set.items():
             self.assertEqual((self.folder / name).read_bytes(), data, name)
         self.assertEqual(self.par2_names(), sorted(new_set))
+        self.assertEqual(hidden_names(self.folder), [])
+        self.assertEqual(len(stems), 1, stems)
+        return stems
+
+    def test_a_long_output_name_gets_its_par2_set_through_short_attempt_names(self):
+        output = self.long_output(self.limit - 21)   # normal attempt names could exceed the limit; final ones fit
+        name_hash = encode._name_hash(output.name)
+        other_hash = encode._name_hash(self.output.name)
+        stale = [".vidfunnel-par2-{}-0123456789ab.par2".format(name_hash),
+                 ".vidfunnel-par2-{}-0123456789ab.vol000+01.par2".format(name_hash),
+                 ".vidfunnel-par2-{}-fedcba987654.vol00+10.par2".format(name_hash)]
+        kept = [".vidfunnel-par2-{}-0123456789ab.par2".format(other_hash),            # another output
+                ".vidfunnel-par2-{}-0123456789AB.par2".format(name_hash),             # upper-case token
+                ".vidfunnel-par2-{}-0123456789ab.par2".format(name_hash.upper()),     # upper-case hash
+                ".vidfunnel-par2-{}-0123456789a.par2".format(name_hash),              # token too short
+                ".vidfunnel-par2-{}-0123456789ab.par2".format(name_hash[:15]),        # hash too short
+                ".vidfunnel-par2-{}-0123456789ab.volume.par2".format(name_hash),
+                ".vidfunnel-part-0f2b6c1e-{}-0123456789ab.part".format(name_hash),    # a part file, not PAR2
+                "vidfunnel-par2-{}-0123456789ab.par2".format(name_hash)]              # not hidden
+        for name in stale + kept:
+            (self.folder / name).write_bytes(name.encode("utf-8"))
+        patch, stems = self.stems_seen()
+        progress = quiet()
+        with patch:
+            files = write_par2(output, 5, progress=progress)
+        text = progress.stream.getvalue()
+        self.assertEqual(len(stems), 1, stems)
+        self.assertTrue(stems[0].startswith(encode.SHORT_PAR2_PREFIX + name_hash + "-"), stems)
+        for name in stale:
+            self.assertFalse((self.folder / name).exists(), name)
+            self.assertIn("removed a stale '{}' from an earlier run".format(name), text)
+        for name in kept:
+            self.assertEqual((self.folder / name).read_bytes(), name.encode("utf-8"), name)
+            self.assertNotIn("'{}'".format(name), text)
+        names = [path.name for path in files]
+        self.assertEqual(names[0], output.name + ".par2")
+        self.assertEqual(len(names), 2, names)
+        self.assertTrue(names[1].startswith(output.name + ".vol"), names)
+        self.assertEqual(hidden_names(self.folder), sorted(name for name in kept if name.startswith(".")))
+        check = subprocess.run(["par2", "verify", "-q", output.name + ".par2"], stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, universal_newlines=True, cwd=str(self.folder))
+        self.assertEqual(check.returncode, 0, check.stdout)
+
+    def test_a_par2_volume_name_longer_than_the_folder_allows_fails_naming_it_and_renames_nothing(self):
+        output = self.long_output(self.limit - 5)   # '<name>.par2' fits exactly; no '<name>.vol…par2' can
+        with self.assertRaises(OSError) as caught:
+            write_par2(output, 5, progress=quiet())
+        self.assertRegex(str(caught.exception), r"^the PAR2 file name '{}\.vol[0-9]+\+[0-9]+\.par2' is [0-9]+ bytes, "
+                         r"longer than the {} bytes a file name may have in '{}'$".format(
+                             re.escape(output.name), self.limit, re.escape(str(self.folder))))
+        self.assertEqual(self.par2_names(), [])
+        self.assertEqual(hidden_names(self.folder), [])
+
+    def test_a_par2_index_name_longer_than_the_folder_allows_fails_before_par2_starts(self):
+        output = self.long_output(self.limit - 4)
+        with unittest.mock.patch("vidfunnel.encode.subprocess.Popen", side_effect=AssertionError("par2 started")):
+            with self.assertRaises(OSError) as caught:
+                write_par2(output, 5, progress=quiet())
+        self.assertEqual(str(caught.exception), "the PAR2 file name '{}.par2' is {} bytes, longer than the {} bytes a "
+                         "file name may have in '{}'".format(output.name, self.limit + 1, self.limit, self.folder))
+        self.assertEqual(hidden_names(self.folder), [])
+
+    def test_a_par2_attempt_name_too_long_even_in_short_form_fails_before_par2_starts(self):
+        with unittest.mock.patch("vidfunnel.encode.name_limit", return_value=40), \
+                unittest.mock.patch("vidfunnel.encode.subprocess.Popen", side_effect=AssertionError("par2 started")):
+            with self.assertRaises(OSError) as caught:
+                write_par2(self.output, 5, progress=quiet())
+        self.assertRegex(str(caught.exception), r"^the PAR2 attempt file name '{}[0-9a-f]{{12}}\.vol00000\+65535\.par2' "
+                         r"is 65 bytes, longer than the 40 bytes".format(
+                             re.escape(encode.SHORT_PAR2_PREFIX + encode._name_hash("harbour.mp4") + "-")))
+        self.assertEqual(hidden_names(self.folder), [])
 
     def test_par2_files_of_earlier_attempts_are_removed_and_look_alikes_kept(self):
         stale = [".harbour.mp4.0123456789ab.par2", ".harbour.mp4.0123456789ab.vol000+01.par2",
@@ -3222,6 +3688,149 @@ class LeftoverPartTest(unittest.TestCase):
         self.assertEqual(removed, [])
         self.assertIn("cannot list '{}' for part files left by an earlier run".format(missing), problem)
         self.assertIn("not started", problem)
+
+
+class LongNameTest(unittest.TestCase):
+    """Temporary names when the normal form would exceed the folder's file name limit, measured on a real folder."""
+
+    def setUp(self):
+        holder = tempfile.TemporaryDirectory(prefix="vidfunnel-long-names-")
+        self.addCleanup(holder.cleanup)
+        self.folder = Path(holder.name)
+        self.limit = encode.name_limit(self.folder)
+
+    def output_of(self, size, fill="harbour-"):
+        """An output path in the folder whose name is `size` bytes of ASCII and ends in '.mp4'."""
+        return self.folder / ((fill * (size // len(fill) + 1))[:size - 4] + ".mp4")
+
+    def assert_creatable(self, path):
+        with open(str(path), "xb"):
+            pass
+        os.unlink(str(path))
+
+    def test_the_limit_comes_from_the_folder_with_255_when_it_cannot_be_read(self):
+        self.assertEqual(self.limit, os.pathconf(str(self.folder), "PC_NAME_MAX"))
+        for failure in (OSError(errno.EINVAL, "Invalid argument"), ValueError("unknown name")):
+            with unittest.mock.patch("vidfunnel.encode.os.pathconf", side_effect=failure):
+                self.assertEqual(encode.name_limit(self.folder), 255)
+        with unittest.mock.patch("vidfunnel.encode.os.pathconf", return_value=-1):
+            self.assertEqual(encode.name_limit(self.folder), 255)
+        self.assertEqual(encode.name_limit(self.folder / "missing"), 255)
+
+    def test_a_part_name_at_the_limit_is_normal_and_one_byte_past_it_is_short(self):
+        at_limit = self.output_of(self.limit - 28)
+        part = part_path(at_limit, FIRST_RECORD_ID)
+        self.assertEqual(len(os.fsencode(part.name)), self.limit)
+        self.assertRegex(part.name, r"^{}\.0f2b6c1e\.[0-9a-f]{{12}}\.part$".format(re.escape("." + at_limit.name)))
+        self.assert_creatable(part)
+        past = self.output_of(self.limit - 27)
+        part = part_path(past, FIRST_RECORD_ID)
+        self.assertRegex(part.name, short_part_form(FIRST_RECORD_ID, past.name))
+        self.assertEqual(part.parent, self.folder)
+        self.assertTrue(is_part_of(part.name, past.name, FIRST_RECORD_ID))
+        self.assert_creatable(part)
+
+    def test_the_longest_output_name_the_folder_takes_gets_a_short_part_name(self):
+        longest = self.output_of(self.limit)
+        self.assert_creatable(longest)
+        with self.assertRaises(OSError):
+            self.assert_creatable(self.output_of(self.limit + 1))
+        part = part_path(longest, SECOND_RECORD_ID)
+        self.assertRegex(part.name, short_part_form(SECOND_RECORD_ID, longest.name))
+        self.assert_creatable(part)
+        stem = encode._par2_attempt_stem(longest, "0123456789ab")
+        self.assertTrue(stem.startswith(encode.SHORT_PAR2_PREFIX), stem)
+        self.assert_creatable(self.folder / (stem + encode.PAR2_LONGEST_VOLUME))
+
+    def test_a_name_of_multibyte_characters_is_measured_in_bytes(self):
+        # Two bytes per character: fewer characters than the limit, more bytes.
+        characters = (self.limit - 28 - 4) // 2 + 1
+        output = self.folder / ("\u00e9" * characters + ".mp4")
+        self.assertLessEqual(len("." + output.name + ".0f2b6c1e.0123456789ab.part"), self.limit)
+        self.assertGreater(len(os.fsencode("." + output.name + ".0f2b6c1e.0123456789ab.part")), self.limit)
+        part = part_path(output, FIRST_RECORD_ID)
+        self.assertRegex(part.name, short_part_form(FIRST_RECORD_ID, output.name))
+        self.assert_creatable(part)
+        # At the limit in bytes exactly, the normal form stays.
+        room = self.limit - 28 - 4
+        output = self.folder / ("\u00e9" * (room // 2) + "x" * (room % 2) + ".mp4")
+        part = part_path(output, FIRST_RECORD_ID)
+        self.assertEqual(len(os.fsencode(part.name)), self.limit)
+        self.assertTrue(part.name.startswith("." + output.name + ".0f2b6c1e."), part.name)
+        self.assert_creatable(part)
+
+    def test_par2_attempt_names_at_the_limit_are_normal_and_one_byte_past_it_are_short(self):
+        at_limit = self.output_of(self.limit - 34)
+        stem = encode._par2_attempt_stem(at_limit, "0123456789ab")
+        self.assertEqual(stem, "." + at_limit.name + ".0123456789ab")
+        self.assertEqual(len(os.fsencode(stem + encode.PAR2_LONGEST_VOLUME)), self.limit)
+        self.assert_creatable(self.folder / (stem + encode.PAR2_LONGEST_VOLUME))
+        past = self.output_of(self.limit - 33)
+        stem = encode._par2_attempt_stem(past, "0123456789ab")
+        self.assertEqual(stem, encode.SHORT_PAR2_PREFIX + encode._name_hash(past.name) + "-0123456789ab")
+        self.assert_creatable(self.folder / (stem + encode.PAR2_LONGEST_VOLUME))
+        # Multi-byte: fewer characters than the limit, more bytes.
+        characters = (self.limit - 34 - 4) // 2 + 1
+        wide = self.folder / ("\u00e9" * characters + ".mp4")
+        self.assertTrue(encode._par2_attempt_stem(wide, "0123456789ab").startswith(encode.SHORT_PAR2_PREFIX))
+
+    def test_short_names_are_told_apart_from_the_normal_forms_and_from_each_other(self):
+        output = self.output_of(self.limit)
+        part = part_path(output, FIRST_RECORD_ID, "0123456789ab").name
+        self.assertTrue(is_part_of(part, output.name, FIRST_RECORD_ID))
+        self.assertFalse(is_part_of(part, output.name, SECOND_RECORD_ID))
+        self.assertFalse(is_part_of(part, output.name[:-4] + ".en.srt", FIRST_RECORD_ID))
+        # No other output name, read into the short name as the normal form's '.<output name>.', takes it.
+        for end in range(2, len(part)):
+            self.assertFalse(is_part_of(part, part[1:end], FIRST_RECORD_ID), part[1:end])
+        normal = ".movie.mp4.0f2b6c1e.0123456789ab.part"
+        self.assertFalse(is_part_of(normal, output.name, FIRST_RECORD_ID))
+        par2_index = encode._par2_attempt_stem(output, "0123456789ab") + ".par2"
+        for name in (part, par2_index, normal):
+            (self.folder / name).write_bytes(b"")
+        self.assertEqual([path.name for path in encode._par2_attempt_files(output)], [par2_index])
+        self.assertEqual(encode._par2_attempt_files(self.folder / "movie.mp4"), [])
+        self.assertFalse(is_part_of(par2_index, output.name, FIRST_RECORD_ID))
+
+    def test_a_dry_run_name_shows_the_form_with_the_token_placeholder(self):
+        long_output = self.output_of(self.limit - 27)
+        self.assertEqual(encode.shown_part_path(long_output, FIRST_RECORD_ID),
+                         self.folder / "{}0f2b6c1e-{}-<token>.part".format(encode.SHORT_PART_PREFIX,
+                                                                            encode._name_hash(long_output.name)))
+        short_output = self.output_of(self.limit - 28)
+        self.assertEqual(encode.shown_part_path(short_output, FIRST_RECORD_ID),
+                         self.folder / ".{}.0f2b6c1e.<token>.part".format(short_output.name))
+
+    def test_short_part_leftovers_of_this_record_and_output_are_removed_and_look_alikes_kept(self):
+        output = self.output_of(self.limit)
+        name_hash = encode._name_hash(output.name)
+        sidecar_hash = encode._name_hash(output.name[:-4] + ".en.srt")
+        stale = [".vidfunnel-part-0f2b6c1e-{}-0123456789ab.part".format(name_hash),
+                 ".vidfunnel-part-0f2b6c1e-{}-fedcba987654.part".format(name_hash)]
+        kept = [".vidfunnel-part-a91c44d0-{}-0123456789ab.part".format(name_hash),     # another record
+                ".vidfunnel-part-0f2b6c1e-{}-0123456789ab.part".format(sidecar_hash),  # another output
+                ".vidfunnel-part-0F2B6C1E-{}-0123456789ab.part".format(name_hash),     # upper-case id
+                ".vidfunnel-part-0f2b6c1e-{}-0123456789ab.part".format(name_hash.upper()),
+                ".vidfunnel-part-0f2b6c1e-{}-0123456789AB.part".format(name_hash),
+                ".vidfunnel-part-0f2b6c1e-{}-0123456789abc.part".format(name_hash),    # token too long
+                ".vidfunnel-part-0f2b6c1e-{}0-0123456789ab.part".format(name_hash),    # hash too long
+                ".vidfunnel-part-0f2b6c1e-{}-0123456789ab.par2".format(name_hash),
+                ".vidfunnel-par2-{}-0123456789ab.par2".format(name_hash),
+                "vidfunnel-part-0f2b6c1e-{}-0123456789ab.part".format(name_hash)]       # not hidden
+        for name in stale + kept:
+            (self.folder / name).write_bytes(name.encode("utf-8"))
+        removed, problem = encode._clear_leftovers(output, FIRST_RECORD_ID)
+        self.assertIsNone(problem)
+        self.assertEqual(removed, sorted(stale))
+        self.assertEqual(sorted(os.listdir(str(self.folder))), sorted(kept))
+
+    def test_a_name_over_the_limit_is_a_reason_naming_it(self):
+        fits = self.output_of(self.limit)
+        self.assertIsNone(encode.name_limit_problem(fits, "output file"))
+        too_long = self.output_of(self.limit + 1)
+        self.assertEqual(encode.name_limit_problem(too_long, "output file"),
+                         "the output file name '{}' is {} bytes, longer than the {} bytes a file name may have in "
+                         "'{}'".format(too_long.name, self.limit + 1, self.limit, self.folder))
 
 
 class Par2StandInTest(unittest.TestCase):

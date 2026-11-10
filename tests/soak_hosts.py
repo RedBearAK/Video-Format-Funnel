@@ -89,7 +89,7 @@ the part file (a probe of that window, not part of the default run);
 its own encode of the frozen host's file.
 """
 
-VERSION = "20261110.2"
+VERSION = "20261110.3"
 
 import argparse
 import contextlib
@@ -521,15 +521,17 @@ def folder_of_path(path):
     return parent
 
 
-# A convert part file: '.NAME.<id8>.<token>.part' (one per attempt, vidfunnel 20261110.3 on) or '.NAME.<id8>.part'
-# (before).
-PART_NAME = re.compile(r"(\..+\.[0-9a-f]{8})(?:\.[0-9a-f]{12})?\.part")
+# A convert part file: '.NAME.<id8>.<token>.part' (one per attempt, vidfunnel 20261110.3 on), '.NAME.<id8>.part'
+# (before), or the short form '.vidfunnel-part-<id8>-<name hash>-<token>.part' that an output name too long for the
+# folder gets. The two alternatives cannot both match one name: the short form has '-' before its token, the others '.'.
+PART_NAME = re.compile(r"(\.vidfunnel-part-[0-9a-f]{8}-[0-9a-f]{16})-[0-9a-f]{12}\.part"
+                       r"|(\..+\.[0-9a-f]{8})(?:\.[0-9a-f]{12})?\.part")
 
 
 def record_part_key(path):
     """The part path of `path` without its attempt token: the same for every attempt on one record's output."""
     match = PART_NAME.fullmatch(os.path.basename(path))
-    return os.path.join(os.path.dirname(path), match.group(1)) if match else path
+    return os.path.join(os.path.dirname(path), match.group(1) or match.group(2)) if match else path
 
 
 def is_lock_machinery(path):
