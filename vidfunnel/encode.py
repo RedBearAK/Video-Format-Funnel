@@ -15,8 +15,15 @@ skipped, and left untouched, with a reason that names the field or the
 missing item and the ffmpeg's path.
 
 The command's last element (the output path) is a hidden
-'.NAME.<first 8 hex digits of the record id>.part' file in the same folder,
-so two records can never write the same part file. On success the part file is renamed into place
+'.NAME.<first 8 hex digits of the record id>.<token>.part' file in the same
+folder (part_path), so two records can never write the same part file, and
+the token, drawn fresh for each attempt, keeps two attempts on one record
+apart too: an encoder that opens its output after its run lost the folder
+to another host writes a file of its own. Before an attempt starts, the
+part files of earlier attempts on the record (is_part_of, the form before
+20261110.1 included) are removed under the lock; on the way out the
+attempt removes its own, also after a lost lock. PAR2 is written the same
+way under attempt names and renamed (write_par2). On success the part file is renamed into place
 (the interim '<stem>.vidfunnel.mp4' name when the source is itself an MP4,
 or for any source planned with --mark-outputs, whose sidecars carry interim names too),
 the output gets the source's mtime, the subtitle sidecars are written the
@@ -26,7 +33,7 @@ runs on the result when vidfunnel.verify is present.
 What convert writes into the record:
 
 - stages.convert, on success: outcome 'ok', output_path (file name),
-  part_path (file name), elapsed_s, ffmpeg_stderr (last 4000 characters),
+  part_path (file name, with this attempt's token), elapsed_s, ffmpeg_stderr (last 4000 characters),
   sidecars_written (file names), sidecar_errors (only when one failed),
   par2_files (file names), par2_redundancy (the N used, or None), par2_error
   (only when par2 failed), output_size,
@@ -92,10 +99,12 @@ whose output still matches its fingerprint (content only, the time is not
 compared) is reported as already converted.
 """
 
-VERSION = "20261110"
+VERSION = "20261110.1"
 
 import math
 import os
+import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -128,7 +137,6 @@ from vidfunnel.record import (
     held_lock_fds,
     iter_records,
     load_record,
-    lock_problem,
     mtime_difference,
     record_path,
     save_record,
@@ -136,6 +144,10 @@ from vidfunnel.record import (
 )
 
 PART_SUFFIX = ".part"
+PART_TOKEN_DIGITS = 12               # each attempt's token in its part file names: 12 lowercase hex digits
+_LOWER_HEX = frozenset("0123456789abcdef")
+PAR2_SUFFIX = ".par2"
+_PAR2_VOLUME = re.compile(r"\.vol[0-9]+\+[0-9]+\.par2")
 STDERR_TAIL = 4000
 OUTCOMES = ("converted", "verified", "skipped", "failed")
 ACTION_WORDS = {"remux": "remux", "reencode": "re-encode"}
@@ -163,17 +175,58 @@ VIDEO_FILTER_OPTIONS = ("-vf", "-filter:v")
 # --- names ------------------------------------------------------------------------------
 
 
-def part_path(output_path, record_id):
-    """The temp file convert writes to: same directory, '.<name>.<id8>.part' (hidden from Jellyfin and Finder).
-
-    <id8> is the first 8 hex digits of the record id, so the part names of
-    two records never meet even when their output names do.
-    """
+def _id8(record_id):
+    """The first 8 hex digits of a record id, lower case; ValueError when it has fewer. Pure."""
     digits = "".join(character for character in str(record_id or "") if character in "0123456789abcdefABCDEF")
     if len(digits) < 8:
         raise ValueError("record id '{}' has fewer than 8 hex digits".format(record_id))
+    return digits[:8].lower()
+
+
+def _is_token(text):
+    """True when text is an attempt token: exactly PART_TOKEN_DIGITS lowercase hex digits. Pure."""
+    return len(text) == PART_TOKEN_DIGITS and set(text) <= _LOWER_HEX
+
+
+def new_token():
+    """A fresh attempt token (PART_TOKEN_DIGITS lowercase hex digits, from secrets)."""
+    return secrets.token_hex(PART_TOKEN_DIGITS // 2)
+
+
+def part_path(output_path, record_id, token=None):
+    """The temp file one attempt writes to: same directory, '.<name>.<id8>.<token>.part' (hidden from Jellyfin and Finder).
+
+    <id8> is the first 8 hex digits of the record id, so the part names of
+    two records never meet even when their output names do. <token> is
+    drawn fresh for each attempt (token None; a given token must have the
+    form _is_token checks), so an encoder of an earlier attempt that opens
+    its output late (its run frozen or stalled while another host took the
+    folder over) writes a file no other attempt uses.
+    """
+    if token is None:
+        token = new_token()
+    elif not _is_token(token):
+        raise ValueError("'{}' is not an attempt token ({} lowercase hex digits)".format(token, PART_TOKEN_DIGITS))
     output_path = Path(output_path)
-    return output_path.parent / ("." + output_path.name + "." + digits[:8].lower() + PART_SUFFIX)
+    return output_path.parent / ("." + output_path.name + "." + _id8(record_id) + "." + token + PART_SUFFIX)
+
+
+def is_part_of(name, output_name, record_id):
+    """True when the file name `name` is a part file of this record for `output_name`. Pure.
+
+    Exactly '.<output_name>.<id8>.<token>.part' with a token of
+    PART_TOKEN_DIGITS lowercase hex digits, or '.<output_name>.<id8>.part',
+    the one name per record of the versions before 20261110.1. Nothing
+    looser: another record's part (another id), a user's
+    '.<output_name>.<id8>.notes.part' or a token of another length or
+    alphabet is not ours to remove.
+    """
+    stem = "." + output_name + "." + _id8(record_id)
+    if name == stem + PART_SUFFIX:
+        return True
+    if not (name.startswith(stem + ".") and name.endswith(PART_SUFFIX)):
+        return False
+    return _is_token(name[len(stem) + 1:-len(PART_SUFFIX)])
 
 
 def output_path_for(record, folder):
@@ -434,32 +487,55 @@ def _remove(path):
         return False
 
 
-def _remove_if_ours(path, folder):
-    """_remove(path) unless the folder's lock is found taken (or cannot be checked): the path may be another run's."""
-    if folder is None or lock_problem(folder) is None:
-        _remove(path)
+def _remove_own(path, stream=None):
+    """Unlink this attempt's own temporary file if it is still there, also after the folder's lock was lost.
 
-
-def _clear_leftover(temp):
-    """Unlink a part file left by an earlier run before a new one is written: (removed, None) or (False, reason).
-
-    Unlinked, never truncated: ffmpeg's '-y' would open the existing file
-    with O_TRUNC and keep its inode, and a writer still holding it (an
-    encoder orphaned by a vidfunnel killed outright, whose folder another
-    machine has since taken over) would go on writing into the new
-    encode's file. After the unlink that writer keeps an unnamed file and
-    the new encode gets a new one. When the unlink fails for any reason
-    but a missing file, the reason names the part file and the item is
-    not started.
+    Its name carries this attempt's token, so no other run writes it and
+    removing it cannot touch the new holder's files. A removal that fails
+    (an unreachable share) is printed, not raised; the next attempt on the
+    record removes the file as a leftover.
     """
     try:
-        os.unlink(str(temp))
-        return True, None
+        os.unlink(str(path))
     except FileNotFoundError:
-        return False, None
+        pass
     except OSError as error:
-        return False, "cannot remove the part file '{}' left by an earlier run ({}); not started".format(
-            Path(temp).name, error.strerror or error)
+        say("  could not remove '{}' ({}); the next attempt on this file removes it".format(
+            Path(path).name, error.strerror or error), stream)
+
+
+def _clear_leftovers(output_path, record_id):
+    """Unlink the part files of this record for output_path left by earlier attempts: (names removed, reason or None).
+
+    The part files are the names is_part_of accepts, of any attempt and of
+    the versions before 20261110.1. Unlinked, never truncated: a writer
+    still holding one (an encoder orphaned by a vidfunnel killed outright,
+    whose folder another machine has since taken over) keeps an unnamed
+    file, and the new attempt writes a name of its own. When the folder
+    cannot be listed, or an unlink fails for any reason but a missing file,
+    the reason names the folder or the part file and the item is not
+    started.
+    """
+    output_path = Path(output_path)
+    folder = output_path.parent
+    try:
+        names = sorted(os.listdir(str(folder)))
+    except OSError as error:
+        return [], "cannot list '{}' for part files left by an earlier run ({}); not started".format(
+            folder, error.strerror or error)
+    removed = []
+    for name in names:
+        if not is_part_of(name, output_path.name, record_id):
+            continue
+        try:
+            os.unlink(str(folder / name))
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            return removed, "cannot remove the part file '{}' left by an earlier run ({}); not started".format(
+                name, error.strerror or error)
+        removed.append(name)
+    return removed, None
 
 
 def _stream_of(progress):
@@ -478,56 +554,75 @@ def _tagged_progress(progress, tag):
 def write_par2(output_path, redundancy, progress=None):
     """par2create -r N -n 1 -q next to the output; returns the PAR2 files written. Raises OSError on failure.
 
-    Stale PAR2 files of the same name are removed first. An elapsed-time line
-    runs while par2 works, since it reports no measurable progress. par2
-    inherits the folder locks' descriptors, as vidfunnel.ffmpeg.run's children do.
+    Stale PAR2 files of the same name, and the PAR2 files of earlier
+    attempts (_par2_attempt_files), are removed first. par2 writes under
+    names of this attempt, '.<name>.<token>.par2' and its volume file, and
+    they are renamed to '<name>.par2' and '<name>.vol*.par2' only after
+    par2 succeeded and the folder's lock is still this run's (ensure_lock;
+    LockLost otherwise). A par2 started by a run that has lost the lock
+    meanwhile therefore writes files no other run uses, and they are
+    removed on the way out, as on a failure or an interrupt. An
+    elapsed-time line runs while par2 works, since it reports no
+    measurable progress. par2 inherits the folder locks' descriptors, as
+    vidfunnel.ffmpeg.run's children do.
     """
     stream, quiet, _verbose = _stream_of(progress)
     output_path = Path(output_path)
     par2 = shutil.which("par2")
     if par2 is None:
         raise OSError("'par2' is not on PATH")
-    for stale in _par2_files(output_path):
+    for stale in _par2_files(output_path) + _par2_attempt_files(output_path):
         _remove(stale)
-    index_name = output_path.name + ".par2"
-    argv = [par2, "create", "-r{}".format(int(redundancy)), "-n1", "-q", "--", index_name, output_path.name]
+    index_name = output_path.name + PAR2_SUFFIX
+    token = new_token()
+    attempt_stem = "." + output_path.name + "." + token
+    argv = [par2, "create", "-r{}".format(int(redundancy)), "-n1", "-q", "--", attempt_stem + PAR2_SUFFIX,
+            output_path.name]
     say("writing PAR2 ({} %) for '{}'".format(int(redundancy), output_path.name), stream)
     check_interrupted()
     raise_if_stopped_now("par2")
-    with held_lock_fds() as lock_fds:
-        process = subprocess.Popen(argv, cwd=str(output_path.parent), stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
-                                   encoding="utf-8", errors="replace", pass_fds=lock_fds)
-    register_child(process)
-    collected = []
-    reader = threading.Thread(target=lambda: collected.append(process.stdout.read()), daemon=True)
-    reader.start()
-    with Progress("par2", total=None, unit=None, stream=stream, quiet=quiet) as live:
-        try:
-            while True:
-                try:
-                    process.wait(timeout=0.5)
-                    break
-                except subprocess.TimeoutExpired:
-                    live.update()
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
-            forget_child(process)
-            reader.join()
-            process.stdout.close()
-    if process.returncode != 0:
-        for partial in _par2_files(output_path):
-            _remove(partial)
-        if child_interrupted(process.returncode):
-            raise Interrupted("par2 was stopped by the interrupt (status {})".format(process.returncode))
-        raise OSError("par2 exited with status {} for '{}': {}".format(
-            process.returncode, output_path.name, "".join(collected).strip()[-STDERR_TAIL:]))
-    files = _par2_files(output_path)
-    if not files:
-        raise OSError("par2 reported success but wrote no '{}' files".format(index_name))
-    return files
+    try:
+        with held_lock_fds() as lock_fds:
+            process = subprocess.Popen(argv, cwd=str(output_path.parent), stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+                                       encoding="utf-8", errors="replace", pass_fds=lock_fds)
+        register_child(process)
+        collected = []
+        reader = threading.Thread(target=lambda: collected.append(process.stdout.read()), daemon=True)
+        reader.start()
+        with Progress("par2", total=None, unit=None, stream=stream, quiet=quiet) as live:
+            try:
+                while True:
+                    try:
+                        process.wait(timeout=0.5)
+                        break
+                    except subprocess.TimeoutExpired:
+                        live.update()
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                forget_child(process)
+                reader.join()
+                process.stdout.close()
+        if process.returncode != 0:
+            if child_interrupted(process.returncode):
+                raise Interrupted("par2 was stopped by the interrupt (status {})".format(process.returncode))
+            raise OSError("par2 exited with status {} for '{}': {}".format(
+                process.returncode, output_path.name, "".join(collected).strip()[-STDERR_TAIL:]))
+        written = _par2_attempt_files(output_path, token)
+        if not written:
+            raise OSError("par2 reported success but wrote no '{}' files".format(index_name))
+        ensure_lock(output_path.parent)
+        files = []
+        for path in written:
+            final = output_path.parent / (output_path.name + path.name[len(attempt_stem):])
+            os.replace(str(path), str(final))
+            files.append(final)
+        return sorted(files)
+    finally:
+        for path in _par2_attempt_files(output_path, token):
+            _remove_own(path, stream)
 
 
 def _par2_files(output_path):
@@ -544,11 +639,39 @@ def _par2_files(output_path):
     return found
 
 
+def _par2_attempt_files(output_path, token=None):
+    """The PAR2 files a write_par2 attempt writes before its rename, of attempt `token` or of any attempt.
+
+    Exactly '.<name>.<token>.par2' and '.<name>.<token>.vol<N>+<M>.par2',
+    the token PART_TOKEN_DIGITS lowercase hex digits; nothing looser.
+    """
+    output_path = Path(output_path)
+    found = []
+    try:
+        names = sorted(os.listdir(str(output_path.parent)))
+    except OSError:
+        return found
+    stem = "." + output_path.name + "."
+    for name in names:
+        if not name.startswith(stem):
+            continue
+        rest = name[len(stem):]
+        candidate = rest[:PART_TOKEN_DIGITS]
+        if not _is_token(candidate) or (token is not None and candidate != token):
+            continue
+        suffix = rest[PART_TOKEN_DIGITS:]
+        if suffix == PAR2_SUFFIX or _PAR2_VOLUME.fullmatch(suffix):
+            found.append(output_path.parent / name)
+    return found
+
+
 def _write_sidecars(sidecars, record_id, stream, verbose, folder=None):
     """Run each rendered sidecar argv to its own part file and rename; (names written, [error dicts], argvs run).
 
-    With `folder`, LockLost before each part file is cleared and each rename,
-    and no part file is removed once the folder's lock is found taken.
+    With `folder`, LockLost before the part files left by earlier attempts
+    are cleared and before each rename. Each sidecar writes a part name of
+    its own attempt (part_path), which is removed on the way out whatever
+    happened, also once the folder's lock is found taken.
     """
     written = []
     errors = []
@@ -569,7 +692,7 @@ def _write_sidecars(sidecars, record_id, stream, verbose, folder=None):
             say("  " + shlex.join(argv), stream)
         if folder is not None:
             ensure_lock(folder)
-        _removed, problem = _clear_leftover(temp)
+        _removed, problem = _clear_leftovers(final, record_id)
         if problem is not None:
             errors.append({"path": final.name, "error": problem})
             say("  sidecar '{}' failed: {}".format(final.name, problem), stream)
@@ -586,7 +709,7 @@ def _write_sidecars(sidecars, record_id, stream, verbose, folder=None):
                            "stderr": _tail(getattr(error, "stderr", None))})
             say("  sidecar '{}' failed: {}".format(final.name, error), stream)
         finally:
-            _remove_if_ours(temp, folder)
+            _remove_own(temp, stream)
     return written, errors, started
 
 
@@ -675,19 +798,19 @@ def _convert_one(tools, key, record, options, progress, stream, quiet, verbose, 
         say(shlex.join(argv), stream)
 
     ensure_lock(folder)  # a run whose lock was taken must not unlink the new holder's part file
-    removed, problem = _clear_leftover(temp)
+    removed, problem = _clear_leftovers(output_path, record.get("id"))
     if problem is not None:
         say("skipping '{}': {}".format(label, problem), stream)
         return {"outcome": "skipped", "skipped": problem}
-    if removed:
-        say("  removed a stale '{}' from an earlier run".format(temp.name), stream)
+    for name in removed:
+        say("  removed a stale '{}' from an earlier run".format(name), stream)
     started = time.monotonic()
     duration = expected_duration(record)
     try:
         with Progress(action_word, total=duration, unit="s", stream=stream, quiet=quiet) as live:
             completed = run_tool(argv, progress=ffmpeg_progress_callback(live, duration))
-        # A host that took the folder over meanwhile may have started this record into this part path:
-        # nothing is renamed, removed or saved unless the lock is still ours.
+        # A host that took the folder over meanwhile may be converting this record into a part file of its
+        # own: nothing is renamed or saved unless the lock is still ours (this attempt's part is removed below).
         ensure_lock(folder)
         os.replace(str(temp), str(output_path))
     except (FfmpegError, ToolNotFound, OSError) as error:
@@ -702,7 +825,7 @@ def _convert_one(tools, key, record, options, progress, stream, quiet, verbose, 
         say("failed: '{}': {}".format(label, error), stream)
         return record["stages"]["convert"]
     finally:
-        _remove_if_ours(temp, folder)
+        _remove_own(temp, stream)  # this attempt's own name: removed also after the lock was lost
     elapsed = time.monotonic() - started
     # The encode is done: a 'now' stop file no longer cuts this item at its sidecar or PAR2
     # child starts, which would throw the finished encode away; it applies again at verify.
@@ -1119,12 +1242,13 @@ def refit_one(tools, source, record, options, progress=None, position=None, tota
     except LockLost as lost:
         say("skipping '{}': {}".format(label, lost), stream)
         return "skipped", str(lost)
-    removed, problem = _clear_leftover(temp)  # before the record is touched: a skip leaves it as it was
+    # Before the record is touched: a skip leaves it as it was.
+    removed, problem = _clear_leftovers(output_path, record.get("id"))
     if problem is not None:
         say("skipping '{}': {}".format(label, problem), stream)
         return "skipped", problem
-    if removed:
-        say("  removed a stale '{}' from an earlier run".format(temp.name), stream)
+    for name in removed:
+        say("  removed a stale '{}' from an earlier run".format(name), stream)
 
     stages = record.setdefault("stages", {})
     if "refit" in stages:
@@ -1144,8 +1268,9 @@ def refit_one(tools, source, record, options, progress=None, position=None, tota
         say("skipping '{}': {}".format(label, lost), stream)
         return "skipped", str(lost)
     finally:
-        # Gone after a replace or a removal; this catches an exception between the encode and either.
-        _remove_if_ours(temp, folder)
+        # Gone after a replace or a removal; this catches an exception between the encode and either, and
+        # LockLost: the name is this attempt's own, so it is removed also after the lock was lost.
+        _remove_own(temp, stream)
 
 
 def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, started, duration):
@@ -1167,7 +1292,7 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
         save_record(key, record)
         say("failed: refit of '{}': {}; the existing output is kept".format(label, error), stream)
         return "failed", str(error)
-    # A host that took the folder over meanwhile may have started this record into this part path:
+    # A host that took the folder over meanwhile may be refitting this record into a part file of its own:
     # nothing is done with the result unless the lock is still ours.
     ensure_lock(folder)
     attempt["elapsed_s"] = round(time.monotonic() - started, 3)

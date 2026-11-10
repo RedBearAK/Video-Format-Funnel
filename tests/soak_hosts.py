@@ -42,12 +42,14 @@ Scenarios (each with N hosts, N from --hosts):
   freeze     one host's process group gets SIGSTOP while it encodes in a
              folder it holds and stays stopped until another host has taken
              the folder over; then SIGCONT. It must lose the lock and write
-             nothing more in that folder; its encode's result is discarded.
+             nothing more in that folder but the removal of its own attempt's
+             part file; its encode's result is discarded.
   staggered  hosts start --stagger s apart; the first one to finish is run
              again while the others still work.
 
 Checks after each scenario: one host per folder at a time (lock holds and
-encodes), every write inside a lock its host held, one accepted encode per
+encodes), every write inside a lock its host held, no two encodes holding one
+file (by name or by inode) at the same time, one accepted encode per
 file (the final output's inode is the one that encode wrote, the record names
 the same host), everything converted and verified, a final 'vidfunnel
 verify' that passes, no part, lock or takeover leftovers, no traceback, the
@@ -66,12 +68,13 @@ the part file (a probe of that window, not part of the default run);
 its own encode of the frozen host's file.
 """
 
-VERSION = "20261110"
+VERSION = "20261110.1"
 
 import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -434,6 +437,16 @@ def folder_of_path(path):
     if os.path.basename(parent) == RECORD_DIR:
         return os.path.dirname(parent)
     return parent
+
+
+# A convert part file: '.NAME.<id8>.<token>.part' (one per attempt, 20261110.1 on) or '.NAME.<id8>.part' (before).
+PART_NAME = re.compile(r"(\..+\.[0-9a-f]{8})(?:\.[0-9a-f]{12})?\.part")
+
+
+def record_part_key(path):
+    """The part path of `path` without its attempt token: the same for every attempt on one record's output."""
+    match = PART_NAME.fullmatch(os.path.basename(path))
+    return os.path.join(os.path.dirname(path), match.group(1)) if match else path
 
 
 def is_lock_machinery(path):
@@ -823,7 +836,8 @@ class Soak(object):
             part = event["output"]
 
             def restarted():
-                return any(item.get("kind") == "ffmpeg-start" and item.get("output") == part
+                return any(item.get("kind") == "ffmpeg-start"
+                           and record_part_key(item.get("output") or "") == record_part_key(part)
                            and item.get("ppid") != victim.pid for item in scene.events_now())
             self.wait_until(restarted, "another host to start its own encode of '{}'".format(short(part, scene.library)))
         say("    '{}' taken over by {}; SIGCONT to {}".format(short(folder, scene.library), holder.get("host"),
@@ -1061,9 +1075,15 @@ class Scene(object):
                         stamp(earlier["start"]), stamp(earlier["end"]), stamp(later["start"]), stamp(later["end"])))
 
         # Every write inside a lock its host held (lock files themselves excepted); the victim writes nothing
-        # in its folder after it was stopped.
+        # in its folder after it was stopped, except the removal of the part file of its own attempt (a name
+        # no other run uses), which it removes once it finds the lock lost.
         writes = [event for event in events if event.get("kind") == "fs"]
+        victim_part = None
+        if victim is not None:
+            victim_part = next((event["output"] for event in events if event.get("kind") == "ffmpeg-start"
+                                and event["pid"] == self.victim_encode), None)
         outside = []
+        own_removals = 0
         for event in writes:
             for path in event["paths"]:
                 if is_lock_machinery(path):
@@ -1073,6 +1093,9 @@ class Scene(object):
                              and hold["start"] <= event["t"] <= hold["end"] for hold in holds)
                 late = (victim is not None and event["pid"] == victim.pid and folder == self.victim_folder
                         and event["t"] > cut)
+                if late and inside and event["op"] == "os.remove" and path == victim_part:
+                    own_removals += 1
+                    continue
                 if not inside or late:
                     outside.append("{} {} '{}' at {}{}".format(
                         label(event["pid"]), event["op"], short(path, library), stamp(event["t"]),
@@ -1081,6 +1104,9 @@ class Scene(object):
             self.fail("exclusion: {} write(s) outside a lock the writer held:\n      {}".format(
                 len(outside), "\n      ".join(outside[:20])))
         self.counts["writes"] = len(writes)
+        if own_removals:
+            self.notes.append("the stopped {} removed the part file of its own attempt '{}' after the SIGCONT".format(
+                victim.label, short(victim_part, library)))
 
         # Encodes: [start, exit] per wrapper pid.
         encodes = {}
@@ -1130,6 +1156,22 @@ class Scene(object):
                 "again, and both encoders then write the one file)".format(_encodes_text(running, label, stamp))
                 if running else "; no other logged encode of it was running"))
         self.counts["interrupted encodes"] = interrupted
+        # Two writers of one file under any names: each wrapper holds its part file open from its open to its
+        # exit, so two encodes whose held inodes are equal while both are held wrote the same file.
+        held = {}
+        for event in events:
+            if event.get("kind") in ("ffmpeg-start", "ffmpeg-open") and event.get("inode") is not None:
+                held[event["pid"]] = (event["inode"], event["t"])
+        for index, first in enumerate(intervals):
+            for second in intervals[index + 1:]:
+                if first["pid"] not in held or second["pid"] not in held:
+                    continue
+                (first_inode, first_from), (second_inode, second_from) = held[first["pid"]], held[second["pid"]]
+                if first_inode == second_inode and first_from < second["end"] and second_from < first["end"]:
+                    self.fail("two writers: {}'s encode into '{}' and {}'s into '{}' held one file (inode {}) at "
+                              "the same time".format(label(first["run"]), short(first["output"], library),
+                                                     label(second["run"]), short(second["output"], library),
+                                                     first_inode))
 
         def victim_encode(interval):
             return victim is not None and interval["pid"] == self.victim_encode
@@ -1185,7 +1227,7 @@ class Scene(object):
                 continue
             part_name = convert.get("part_path") or ".{}.{}.part".format(output_name, (after.get("id") or "")[:8])
             part = os.path.join(os.path.dirname(source), part_name)
-            ours = [interval for interval in intervals if interval["output"] == part]
+            ours = [interval for interval in intervals if record_part_key(interval["output"]) == record_part_key(part)]
             status = os.stat(output)
             digest = sha256_of(output)
             recorded = (after.get("output") or {}).get("sha256")
