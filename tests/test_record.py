@@ -1,8 +1,9 @@
 """Tests for vidfunnel.record: paths, atomic saves, fingerprints, hashes, stages, lock."""
 
-VERSION = "20261109.3"
+VERSION = "20261109.4"
 
 import datetime
+import errno
 import hashlib
 import json
 import multiprocessing
@@ -11,16 +12,24 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import types
 import unittest
 import uuid
 from unittest import mock
 from pathlib import Path
 
+import vidfunnel.interrupt
+import vidfunnel.record
 from vidfunnel.record import (
     machine_id,
     machine_identity,
     FOLDER_FILE,
+    HEARTBEAT_SECONDS,
+    HEARTBEAT_STALE_SECONDS,
+    PROBE_PREFIX,
+    held_lock_fds,
     LOCK_NAME,
     RECORD_DIR,
     FolderLock,
@@ -425,8 +434,9 @@ class FolderLockTests(TempDirCase):
             content = json.loads(self.lock_file().read_text(encoding="utf-8"))
             self.assertEqual(content["pid"], os.getpid())
             self.assertEqual(sorted(content),
-                             ["boot", "container", "device", "flock", "host", "machine", "machine_source", "pid",
-                              "started"])
+                             ["boot", "container", "device", "flock", "heartbeat", "host", "machine",
+                              "machine_source", "pid", "started"])
+            self.assertEqual(content["heartbeat"], {"interval": HEARTBEAT_SECONDS})
             self.assertEqual((content["machine"], content["machine_source"]), machine_identity())
             with self.assertRaises(LockHeld) as caught:
                 with FolderLock(self.base):
@@ -1128,6 +1138,27 @@ class FlockHolderTests(TempDirCase):
         self.assertEqual(len(warnings), 1, warnings)
         self.assertIn("pid {}, has exited".format(holder.pid), warnings[0])
 
+    def test_a_held_flock_wins_over_a_silent_beat(self):
+        """Same machine: a busy flock means alive, however long ago the lock last beat."""
+        holder = self.start_holder("plain")
+        self.assertIn("heartbeat", json.loads(self.lock_file().read_text(encoding="utf-8")))
+        silent = time.time_ns() - 2 * 3600 * 10 ** 9
+        os.utime(str(self.lock_file()), ns=(silent, silent))
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            with self.assertRaises(LockHeld) as caught:
+                with FolderLock(self.base, warn=self.fail):
+                    pass
+        self.assertEqual(caught.exception.pid, holder.pid)
+        self.assertIn("still holds the lock file's flock", str(caught.exception))
+
+    def test_a_free_flock_wins_over_a_fresh_beat(self):
+        """Same machine: a free flock means every holder has exited, though the lock beat a moment ago."""
+        self.write_flock_lock(1, 0.1, True, heartbeat={"interval": HEARTBEAT_SECONDS})
+        warnings = []
+        self.judge(warnings)
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("pid 1, has exited", warnings[0])
+
 
 @unittest.skipIf(machine_identity()[1] != "machine-id" or not Path("/proc/sys/kernel/random/boot_id").exists(),
                  "the reboot rule needs /etc/machine-id and a kernel boot id")
@@ -1235,6 +1266,408 @@ class RebootRuleTests(TempDirCase):
 
     def test_a_lock_without_a_boot_id_is_not_a_reboot(self):
         self.assert_not_the_reboot_rule(boot=None)
+
+
+def heartbeat_threads():
+    return [thread for thread in threading.enumerate() if thread.name == "vidfunnel-heartbeat" and thread.is_alive()]
+
+
+class ShiftedClock:
+    """This process's wall clock moved by `shift_seconds`, for vidfunnel.record's 'time' and 'datetime' names."""
+
+    def __init__(self, shift_seconds):
+        shift = shift_seconds
+
+        class ShiftedDateTime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime.datetime.now(tz) + datetime.timedelta(seconds=shift)
+
+        self.time = types.SimpleNamespace(time=lambda: time.time() + shift,
+                                          time_ns=lambda: time.time_ns() + int(shift * 10 ** 9),
+                                          monotonic=time.monotonic, sleep=time.sleep)
+        self.datetime = types.SimpleNamespace(datetime=ShiftedDateTime, timezone=datetime.timezone,
+                                              timedelta=datetime.timedelta)
+
+    def patches(self):
+        return (mock.patch.object(vidfunnel.record, "time", self.time),
+                mock.patch.object(vidfunnel.record, "datetime", self.datetime))
+
+
+class HeartbeatTests(TempDirCase):
+    """The holder's beat, the judge's 60-minute rule on the share's clock, and a holder that loses its lock."""
+
+    def setUp(self):
+        # The folder goes last, after the cleanups that release locks in it (tearDown runs before them).
+        self.holder = tempfile.TemporaryDirectory(prefix="vidfunnel-record-test-")
+        self.base = Path(self.holder.name)
+        self.addCleanup(self.holder.cleanup)
+        self.addCleanup(vidfunnel.interrupt.draining.clear)
+        self.addCleanup(vidfunnel.interrupt.drain_tally.reset)
+
+    def tearDown(self):
+        pass
+
+    def lock_file(self):
+        return self.base / RECORD_DIR / LOCK_NAME
+
+    def fast_beats(self, interval=0.02):
+        """Beat every `interval` seconds for the rest of this test (locks taken from now on)."""
+        for name, value in (("HEARTBEAT_SECONDS", interval), ("HEARTBEAT_POLL_SECONDS", min(interval, 0.01))):
+            patch = mock.patch.object(vidfunnel.record, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def wait_until(self, predicate, seconds, message):
+        deadline = time.monotonic() + seconds
+        while not predicate():
+            self.assertLess(time.monotonic(), deadline, message)
+            time.sleep(0.005)
+
+    def write_other_lock(self, beat_seconds_ago, started_hours_ago=1.0, heartbeat=True):
+        """A lock written on another machine, its file's mtime (its last beat) `beat_seconds_ago`."""
+        started = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=started_hours_ago)
+        content = {"host": "otherhost", "pid": 4242, "started": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   "container": False, "machine": "another-machine", "machine_source": "machine-id",
+                   "boot": "another-boot", "flock": True, "device": 1}
+        if heartbeat:
+            content["heartbeat"] = {"interval": HEARTBEAT_SECONDS}
+        write_bytes(self.lock_file(), json.dumps(content).encode("utf-8"))
+        beat = time.time_ns() - int(beat_seconds_ago * 10 ** 9)
+        os.utime(str(self.lock_file()), ns=(beat, beat))
+        return content
+
+    def judge(self, warnings=None):
+        """Take the lock (returned, released at cleanup) or raise LockHeld."""
+        with mock.patch("vidfunnel.record.in_container", return_value=False):
+            lock = FolderLock(self.base, warn=(warnings.append if warnings is not None else self.fail)).acquire()
+        self.addCleanup(lock.release)
+        return lock
+
+    def assert_held(self, content):
+        with self.assertRaises(LockHeld) as caught:
+            self.judge()
+        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), content)
+        return str(caught.exception)
+
+    def assert_taken(self):
+        warnings = []
+        lock = self.judge(warnings)
+        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8"))["pid"], os.getpid())
+        self.assertEqual(len(warnings), 1, warnings)
+        lock.release()
+        return warnings[0]
+
+    def probes_left(self):
+        return [name for name in os.listdir(str(self.base / RECORD_DIR)) if name.startswith(PROBE_PREFIX)]
+
+    def test_a_lock_without_the_heartbeat_field_keeps_the_24_hour_rule(self):
+        """A lock from an older vidfunnel: neither a silent mtime nor the 60-minute rule takes it."""
+        held = self.write_other_lock(2 * 3600, started_hours_ago=2, heartbeat=False)
+        message = self.assert_held(held)
+        self.assertIn("taken over once 24 h old", message)
+        self.assertNotIn("beat", message)
+        held = self.write_other_lock(23.5 * 3600, started_hours_ago=23.5, heartbeat=False)
+        self.assert_held(held)
+        self.write_other_lock(24.5 * 3600, started_hours_ago=24.5, heartbeat=False)
+        self.assertIn("stale lock", self.assert_taken())
+        self.assertEqual(self.probes_left(), [])
+
+    def test_the_beat_advances_the_mtime_and_keeps_the_inode_and_content(self):
+        self.fast_beats()
+        lock = self.judge()
+        original = self.lock_file().read_bytes()
+        before = os.stat(str(self.lock_file()))
+        os.utime(str(self.lock_file()), ns=(10 ** 9, 10 ** 9))
+        self.wait_until(lambda: os.stat(str(self.lock_file())).st_mtime_ns > 10 ** 9, 5,
+                        "no beat advanced the lock file's mtime")
+        first = lock.beat.count
+        self.wait_until(lambda: lock.beat.count >= first + 20, 10, "the holder stopped beating")
+        after = os.stat(str(self.lock_file()))
+        self.assertEqual((after.st_dev, after.st_ino, after.st_size), (before.st_dev, before.st_ino, before.st_size))
+        self.assertEqual(self.lock_file().read_bytes(), original)
+        self.assertEqual(json.loads(original.decode("utf-8")), lock.content)
+
+    def test_a_reader_never_sees_partial_json_while_the_holder_beats(self):
+        self.fast_beats(0.001)
+        lock = self.judge()
+        reads = 0
+        deadline = time.monotonic() + 60
+        while lock.beat.count < 300:
+            self.assertLess(time.monotonic(), deadline, "fewer than 300 beats in 60 s")
+            self.assertEqual(json.loads(self.lock_file().read_bytes().decode("utf-8")), lock.content)
+            reads += 1
+        self.assertGreater(reads, 0)
+
+    def test_another_machines_recent_beat_is_held_and_its_age_named(self):
+        held = self.write_other_lock(600)
+        message = self.assert_held(held)
+        self.assertRegex(message, r"its holder last beat 60[0-9] s ago on the share's clock")
+        self.assertIn("taken over once it has been silent for 3600 s", message)
+        self.assertEqual(self.probes_left(), [])
+
+    def test_another_machines_silent_lock_is_taken_over(self):
+        self.write_other_lock(2 * 3600, started_hours_ago=3)
+        warning = self.assert_taken()
+        self.assertIn("taking over lock '{}'".format(self.lock_file()), warning)
+        self.assertIn("host 'otherhost' pid 4242", warning)
+        self.assertRegex(warning, r"its holder last beat 720[0-9] s ago on the share's clock, more than 3600 s")
+        self.assertEqual(self.probes_left(), [])
+
+    def test_a_beat_exactly_at_the_threshold_is_held_and_just_past_it_is_taken(self):
+        for past_ns, held in ((0, True), (10 ** 6, False)):
+            with self.subTest(past_ns=past_ns):
+                content = self.write_other_lock(10)
+                beat = os.stat(str(self.lock_file())).st_mtime_ns
+                share_now = beat + HEARTBEAT_STALE_SECONDS * 10 ** 9 + past_ns
+                with mock.patch("vidfunnel.record._share_clock_ns", return_value=share_now):
+                    if held:
+                        self.assertIn("last beat 3600 s ago", self.assert_held(content))
+                    else:
+                        self.assertIn("more than 3600 s", self.assert_taken())
+
+    def test_the_share_clock_decides_whatever_this_machines_clock_says(self):
+        for shift_hours in (5, -5):
+            with self.subTest(shift_hours=shift_hours):
+                clock = ShiftedClock(shift_hours * 3600)
+                fresh = self.write_other_lock(60)
+                with clock.patches()[0], clock.patches()[1]:
+                    self.assertIn("last beat 6", self.assert_held(fresh))
+                self.write_other_lock(2 * 3600)
+                with clock.patches()[0], clock.patches()[1]:
+                    self.assertIn("more than 3600 s", self.assert_taken())
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root creates files in a read-only folder")
+    def test_without_a_probe_file_the_24_hour_rule_applies_to_the_last_beat_and_says_so(self):
+        held = self.write_other_lock(2 * 3600, started_hours_ago=30)
+        records = self.base / RECORD_DIR
+        os.chmod(str(records), 0o555)
+        self.addCleanup(os.chmod, str(records), 0o755)
+        message = self.assert_held(held)
+        self.assertIn("no probe file can be created in '{}'".format(records), message)
+        self.assertIn("the 24 h rule applies to its last beat", message)
+        self.assertEqual(self.probes_left(), [])
+        os.chmod(str(records), 0o755)
+        self.write_other_lock(25 * 3600, started_hours_ago=30)
+        with mock.patch("vidfunnel.record._share_clock_ns", side_effect=PermissionError(13, "Permission denied")):
+            self.assertIn("stale lock", self.assert_taken())
+
+    def test_the_probe_file_is_removed_when_the_judgement_raises(self):
+        held = self.write_other_lock(600)
+        with mock.patch("vidfunnel.record.os.fstat", side_effect=RuntimeError("simulated failure")):
+            with self.assertRaises(RuntimeError):
+                self.judge()
+        self.assertEqual(self.probes_left(), [])
+        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), held)
+
+    def test_a_live_pid_here_keeps_a_silent_lock_until_the_24_hour_rule(self):
+        """Same machine, flock not testable: a running pid holds a silent lock, as before the heartbeat."""
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        for hours, held in ((2, True), (25, False)):
+            with self.subTest(hours=hours):
+                started = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
+                content = {"host": socket.gethostname(), "pid": child.pid, "container": False,
+                           "started": started.strftime("%Y-%m-%dT%H:%M:%SZ"), "machine": machine_id(),
+                           "flock": False, "heartbeat": {"interval": HEARTBEAT_SECONDS}}
+                write_bytes(self.lock_file(), json.dumps(content).encode("utf-8"))
+                silent = time.time_ns() - hours * 3600 * 10 ** 9
+                os.utime(str(self.lock_file()), ns=(silent, silent))
+                if held:
+                    message = self.assert_held(content)
+                    self.assertIn("its pid {} is running here, although its holder last beat".format(child.pid),
+                                  message)
+                else:
+                    warning = self.assert_taken()
+                    self.assertIn("more than 3600 s; its pid is running here, taken for a reused one", warning)
+
+    def test_a_holder_running_past_24_hours_with_a_recent_beat_is_held(self):
+        held = self.write_other_lock(300, started_hours_ago=30)
+        message = self.assert_held(held)
+        self.assertIn("last beat 30", message)
+
+    def test_a_beat_between_the_judgement_and_the_takeover_refuses_the_takeover(self):
+        held = self.write_other_lock(2 * 3600)
+        identity = os.stat(str(self.lock_file()))
+        real_clock = vidfunnel.record._share_clock_ns
+
+        def clock_then_beat(directory):
+            share_now = real_clock(directory)
+            handle = os.open(str(self.lock_file()), os.O_RDWR)
+            try:
+                os.pwrite(handle, self.lock_file().read_bytes()[:1], 0)
+                os.fsync(handle)
+            finally:
+                os.close(handle)
+            return share_now
+
+        with mock.patch("vidfunnel.record._share_clock_ns", side_effect=clock_then_beat):
+            message = self.assert_held(held)
+        self.assertIn("its holder beat while the lock was being judged; not taken over", message)
+        after = os.stat(str(self.lock_file()))
+        self.assertEqual((after.st_dev, after.st_ino), (identity.st_dev, identity.st_ino))
+        self.assertGreater(after.st_mtime_ns, identity.st_mtime_ns)
+
+    def test_a_holder_whose_lock_is_taken_drains_says_so_and_leaves_the_new_lock(self):
+        self.fast_beats()
+        lines = []
+        with mock.patch("vidfunnel.record._warn", side_effect=lines.append):
+            lock = self.judge()
+            self.wait_until(lambda: lock.beat.count >= 2, 5, "the holder never beat")
+            os.unlink(str(self.lock_file()))
+            winner = {"host": "winnerhost", "pid": 999, "started": "2026-11-09T12:00:00Z",
+                      "heartbeat": {"interval": 300}}
+            write_bytes(self.lock_file(), json.dumps(winner).encode("utf-8"))
+            taken = self.lock_file().read_bytes()
+            self.wait_until(vidfunnel.interrupt.draining.is_set, 5, "the holder did not drain")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("lost the lock of folder '{}'".format(self.base), lines[0])
+        self.assertIn("host 'winnerhost' holds it now", lines[0])
+        self.assertEqual(vidfunnel.interrupt.drain_tally.lost_locks, [str(self.base)])
+        beats = lock.beat.count
+        with vidfunnel.record._held_locks_guard:
+            self.assertNotIn(lock.beat, vidfunnel.record._beats)
+        time.sleep(0.2)  # ten intervals: no further beat
+        self.assertEqual(lock.beat.count, beats)
+        warnings = []
+        lock.warn = warnings.append
+        lock.release()
+        self.assertEqual(self.lock_file().read_bytes(), taken)
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("was taken over by another run; left in place", warnings[0])
+
+    def stepping_clock(self):
+        """vidfunnel.record's 'time' with wall and monotonic offsets the test steps, for the rest of this test.
+
+        Beats are made rare (an hour apart) and polls fast, so only the wake check can explain an early beat.
+        """
+        clock = types.SimpleNamespace(wall_offset=0.0, mono_offset=0.0)
+        clock.time = lambda: time.time() + clock.wall_offset
+        clock.time_ns = lambda: time.time_ns() + int(clock.wall_offset * 10 ** 9)
+        clock.monotonic = lambda: time.monotonic() + clock.mono_offset
+        clock.sleep = time.sleep
+        for name, value in (("time", clock), ("HEARTBEAT_SECONDS", 3600), ("HEARTBEAT_POLL_SECONDS", 0.01)):
+            patch = mock.patch.object(vidfunnel.record, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        return clock
+
+    def replace_lock(self):
+        os.unlink(str(self.lock_file()))
+        winner = {"host": "winnerhost", "pid": 999, "started": "2026-11-09T12:00:00Z",
+                  "heartbeat": {"interval": 300}}
+        write_bytes(self.lock_file(), json.dumps(winner).encode("utf-8"))
+        return self.lock_file().read_bytes()
+
+    def test_after_a_suspend_a_taken_lock_is_found_at_the_next_poll(self):
+        clock = self.stepping_clock()
+        lines = []
+        with mock.patch("vidfunnel.record._warn", side_effect=lines.append):
+            lock = self.judge()
+            taken = self.replace_lock()
+            time.sleep(0.2)  # twenty polls without a wake: the hour-long interval keeps the lock unchecked
+            self.assertFalse(vidfunnel.interrupt.draining.is_set())
+            self.assertEqual(lines, [])
+            clock.wall_offset += 3600  # the wall clock counted an hour of sleep, the monotonic clock did not
+            self.wait_until(vidfunnel.interrupt.draining.is_set, 2, "the wake did not check the lock")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("lost the lock of folder '{}'".format(self.base), lines[0])
+        self.assertIn("host 'winnerhost' holds it now", lines[0])
+        lock.warn = lambda line: None
+        lock.release()
+        self.assertEqual(self.lock_file().read_bytes(), taken)
+
+    def test_after_a_suspend_an_intact_lock_beats_once_at_once(self):
+        clock = self.stepping_clock()
+        lines = []
+        with mock.patch("vidfunnel.record._warn", side_effect=lines.append):
+            lock = self.judge()
+            os.utime(str(self.lock_file()), ns=(10 ** 9, 10 ** 9))
+            clock.wall_offset += 3600
+            self.wait_until(lambda: os.stat(str(self.lock_file())).st_mtime_ns > 10 ** 9, 2,
+                            "the wake did not beat the lock")
+            time.sleep(0.2)
+        self.assertEqual(lock.beat.count, 1)
+        self.assertEqual(lines, [])
+        self.assertFalse(vidfunnel.interrupt.draining.is_set())
+
+    def test_a_small_forward_step_or_a_backward_step_of_the_wall_clock_beats_nothing(self):
+        clock = self.stepping_clock()
+        lock = self.judge()
+        os.utime(str(self.lock_file()), ns=(10 ** 9, 10 ** 9))
+        for step in (vidfunnel.record.HEARTBEAT_WAKE_GAP_SECONDS - 5, -3600):
+            with self.subTest(step=step):
+                clock.wall_offset += step
+                time.sleep(0.2)  # twenty polls
+                self.assertEqual(os.stat(str(self.lock_file())).st_mtime_ns, 10 ** 9)
+                self.assertEqual(lock.beat.count, 0)
+
+    def test_a_thread_stopped_long_enough_for_a_takeover_checks_its_lock_at_once(self):
+        """SIGSTOP: both clocks count the stop, so the hour-long interval itself makes the lock due."""
+        clock = self.stepping_clock()
+        lines = []
+        with mock.patch("vidfunnel.record._warn", side_effect=lines.append):
+            lock = self.judge()
+            lock.warn = lambda line: None
+            self.replace_lock()
+            clock.mono_offset += HEARTBEAT_STALE_SECONDS + 60
+            clock.wall_offset += HEARTBEAT_STALE_SECONDS + 60
+            self.wait_until(vidfunnel.interrupt.draining.is_set, 2, "the late poll did not check the lock")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("lost the lock of folder '{}'".format(self.base), lines[0])
+
+    def test_one_thread_beats_every_lock_and_ends_after_the_last_release(self):
+        self.wait_until(lambda: not heartbeat_threads(), 5, "a heartbeat thread outlived an earlier test")
+        first = FolderLock(self.base / "first", warn=self.fail).acquire()
+        self.addCleanup(first.release)
+        self.assertEqual(len(heartbeat_threads()), 1)
+        second = FolderLock(self.base / "second", warn=self.fail).acquire()
+        self.addCleanup(second.release)
+        self.assertEqual(len(heartbeat_threads()), 1)
+        self.assertTrue(heartbeat_threads()[0].daemon)
+        started = time.monotonic()
+        first.release()
+        second.release()
+        self.assertLess(time.monotonic() - started, 0.5, "release waited for the heartbeat")
+        self.wait_until(lambda: not heartbeat_threads(), 5, "the heartbeat thread outlived the last lock")
+
+    def test_a_failed_beat_is_reported_once_and_the_thread_carries_on(self):
+        self.fast_beats()
+        lines = []
+        with mock.patch("vidfunnel.record._warn", side_effect=lines.append):
+            failing = mock.patch("vidfunnel.record.os.pwrite", side_effect=OSError(errno.EIO, "Input/output error"))
+            refused = failing.start()
+            lock = self.judge()
+            self.wait_until(lambda: refused.call_count >= 5, 5, "the beat was not retried")
+            failing.stop()
+            self.wait_until(lambda: lock.beat.count >= 2, 5, "the thread did not beat again after the failures")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("lock '{}': cannot write the heartbeat".format(self.lock_file()), lines[0])
+        self.assertIn("Input/output error", lines[0])
+        self.assertFalse(vidfunnel.interrupt.draining.is_set())
+
+    @unittest.skipIf(sys.platform == "win32", "flock is POSIX")
+    def test_the_descriptor_children_inherit_is_unchanged_by_the_beats(self):
+        from vidfunnel.ffmpeg import run
+        self.fast_beats()
+        lock = self.judge()
+        inode = os.fstat(lock.handle).st_ino
+        self.wait_until(lambda: lock.beat.count >= 5, 5, "the holder never beat")
+        with held_lock_fds() as descriptors:
+            self.assertIn(lock.handle, descriptors)
+        child = ("import fcntl, os, sys\n"
+                 "print(os.fstat(int(sys.argv[1])).st_ino)\n"
+                 "test = os.open(sys.argv[2], os.O_RDONLY)\n"
+                 "try:\n"
+                 "    fcntl.flock(test, fcntl.LOCK_SH | fcntl.LOCK_NB)\n"
+                 "    print('free')\n"
+                 "except BlockingIOError:\n"
+                 "    print('held')\n")
+        completed = run([sys.executable, "-c", child, str(lock.handle), str(self.lock_file())], check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.split(), [str(inode), "held"])
+        self.assertEqual(os.stat(str(self.lock_file())).st_ino, inode)
 
 
 class BandTests(unittest.TestCase):

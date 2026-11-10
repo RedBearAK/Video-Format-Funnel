@@ -37,7 +37,9 @@ drain_before_next() before each next item; the tasks in progress run to their en
 children and `interrupted` stays clear, so their results are applied as
 usual. The main thread counts, in `drain_tally`, the tasks that were still
 running when the drain began and the items never started, for the line
-vidfunnel.cli.main prints at the end.
+vidfunnel.cli.main prints at the end. The heartbeat of vidfunnel.record
+starts the same drain when another run has taken over one of this run's
+folder locks (drain_for_lost_lock), and the last line names the folder.
 
 A 'now' stop file (vidfunnel.stopfile.check_item) stops the run as Ctrl+C
 does, with one exception: a thread whose item has finished its encode is
@@ -55,7 +57,7 @@ and the stop signals call stop_workers() without from_stopfile, which sets
 terminated, finishing or not.
 """
 
-VERSION = "20261109"
+VERSION = "20261109.4"
 
 import queue
 import threading
@@ -150,9 +152,20 @@ class DrainTally:
         self.seen = False
         self.finished = 0
         self.left = 0
+        self.lost_locks = []  # folders whose lock another run took over (drain_for_lost_lock)
 
 
 drain_tally = DrainTally()
+
+
+def drain_for_lost_lock(folder):
+    """Another run took over this run's lock of `folder` (vidfunnel.record's heartbeat): drain the run.
+
+    Called on the heartbeat thread; like the SIGUSR1 handler it only
+    appends and sets a flag. The folder is kept for the run's last line.
+    """
+    drain_tally.lost_locks.append(folder)
+    draining.set()
 
 
 def drain_before_next(left, folder=None):

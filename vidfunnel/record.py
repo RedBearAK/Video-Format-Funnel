@@ -6,10 +6,11 @@ per source file, named after the full source file name including its extension
 Records are the authority; every write is atomic (temp file, then os.replace).
 """
 
-VERSION = "20261109.3"
+VERSION = "20261109.4"
 
 import contextlib
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -28,6 +29,7 @@ except ImportError:  # not on Windows, which vidfunnel does not support; takeove
 
 import vidfunnel
 from vidfunnel.interrupt import check as check_interrupted
+from vidfunnel.interrupt import drain_for_lost_lock
 
 RECORD_DIR = ".vidfunnel"
 LOCK_NAME = "lock"
@@ -57,13 +59,24 @@ HASH_BLOCK = MIB                     # read size for full hashes
 PROGRESS_EVERY = 8 * MIB             # sha256_file reports this often
 LOCK_STALE_SECONDS = 24 * 60 * 60
 
+# The lock heartbeat (see FolderLock): a holder advances its lock file's mtime this often, and a lock
+# whose last beat is older than HEARTBEAT_STALE_SECONDS on the share's clock is taken for dead.
+HEARTBEAT_SECONDS = 300
+HEARTBEAT_STALE_SECONDS = 3600
+HEARTBEAT_POLL_SECONDS = 1.0         # the heartbeat thread looks for released locks and wake-ups this often
+# A poll whose wall clock moved this much more than its monotonic clock follows a suspend: beat every lock now.
+# Well above the poll interval and scheduling delays, well below HEARTBEAT_STALE_SECONDS.
+HEARTBEAT_WAKE_GAP_SECONDS = 30
+HEARTBEAT_FIELD = "heartbeat"        # the lock JSON field that says its holder beats
+PROBE_PREFIX = "lock.probe."         # probe files that read the share's clock: 'lock.probe.<uuid4 hex>'
+
 
 class RecordError(Exception):
     """A record or folder file exists but cannot be read or parsed."""
 
 
 class LockHeld(Exception):
-    """Another run holds the folder lock and it is younger than 24 hours."""
+    """Another run holds the folder lock and it is not taken for dead (see FolderLock)."""
 
     def __init__(self, message, host=None, pid=None, age_seconds=None):
         Exception.__init__(self, message)
@@ -493,6 +506,197 @@ def _held_here(device, inode):
         return (device, inode) in _held_locks.values()
 
 
+class _Beat:
+    """One held lock in the heartbeat registry; its state fields change only under _held_locks_guard."""
+
+    def __init__(self, handle, path, folder, status, first_byte):
+        self.handle = handle
+        self.path = str(path)
+        self.folder = folder
+        self.identity = (status.st_dev, status.st_ino)
+        self.first_byte = first_byte          # the byte the holder wrote at offset 0, rewritten by each beat
+        self.due = time.monotonic() + HEARTBEAT_SECONDS
+        self.beating = False                  # the heartbeat thread is using the descriptor outside the guard
+        self.released = False                 # release() has begun: no further beat, no lost-lock verdict
+        self.handover = False                 # release() left the descriptor open for the beating thread to close
+        self.lost = False                     # the lock path names another file: another run took the folder
+        self.failure_reported = False
+        self.count = 0                        # beats written
+
+
+_beats = []          # the _Beat of every lock this process holds and still beats; under _held_locks_guard
+_beat_thread = None  # the heartbeat thread while one runs; under _held_locks_guard
+
+
+def _start_beating(beat):
+    """Add a lock to the heartbeat registry and start the thread if none runs; the caller holds the guard."""
+    global _beat_thread
+    _beats.append(beat)
+    if _beat_thread is None:
+        thread = threading.Thread(target=_heartbeat_loop, name="vidfunnel-heartbeat", daemon=True)
+        thread.start()
+        _beat_thread = thread
+
+
+def _heartbeat_loop():
+    """Beat every registered lock when it is due, and all of them after a suspend; end once none is left.
+
+    The guard is held only to read and update the registry, never while the
+    share is touched, so a stalled share cannot hold up release() or the
+    start of a child (held_lock_fds). A descriptor in use by a beat is not
+    closed by release(); the beat closes it afterwards.
+    """
+    global _beat_thread
+    last_wall = time.time()
+    last_mono = time.monotonic()
+    while True:
+        wall = time.time()
+        now = time.monotonic()
+        # Woken from a suspend: the wall clock counted the sleep and the monotonic clock did not (Linux and
+        # macOS), so every lock is checked and beaten now rather than at its next interval, when another host
+        # may have taken it over long ago. A wall clock stepped forward for another reason (NTP, a manual
+        # change) only causes one early beat, which is harmless; one stepped backwards changes nothing. A
+        # thread that was not scheduled (SIGSTOP, a debugger) needs no such check: the monotonic clock counts
+        # that time, so a stop long enough for a takeover (HEARTBEAT_STALE_SECONDS) makes every lock due anyway.
+        woke = (wall - last_wall) - (now - last_mono) > HEARTBEAT_WAKE_GAP_SECONDS
+        last_wall, last_mono = wall, now
+        with _held_locks_guard:
+            if not _beats:
+                _beat_thread = None
+                return
+            due = [beat for beat in _beats if woke or beat.due <= now]
+            for beat in due:
+                beat.beating = True
+                beat.due = now + HEARTBEAT_SECONDS
+            pause = min(beat.due for beat in _beats) - now
+        for beat in due:
+            try:
+                _beat_once(beat)
+            finally:
+                with _held_locks_guard:
+                    beat.beating = False
+                    if beat.handover:
+                        os.close(beat.handle)
+        if not due:
+            time.sleep(max(0.0, min(pause, HEARTBEAT_POLL_SECONDS)))
+
+
+def _beat_once(beat):
+    """Check that the lock path still names our file, then rewrite its first byte in place and fsync.
+
+    The same byte at the same offset: the content stays valid, complete
+    JSON for any reader at any instant, the inode stays (the flock, the
+    children's descriptors and the takeover's identity check depend on
+    it), and the write makes the file server stamp the modification time
+    with its own clock (os.utime with an explicit time would stamp ours).
+    A failed check or write is reported once per lock and tried again at
+    the next interval; nothing here raises.
+    """
+    if beat.released or beat.lost:
+        return
+    state = _lock_state(beat)
+    if state is not None:
+        if state[0] == "lost":
+            _lose_lock(beat, state[1])
+        else:
+            _beat_failed(beat, state[1])
+        return
+    try:
+        os.pwrite(beat.handle, beat.first_byte, 0)
+        os.fsync(beat.handle)
+    except OSError as error:
+        _beat_failed(beat, "cannot write the heartbeat: {}".format(error))
+        return
+    beat.count += 1
+
+
+def _lock_state(beat):
+    """None when the lock path names the file we hold; ('lost', words) or ('failed', words) otherwise.
+
+    Lost: the path is missing while '.vidfunnel/' is there, it names
+    another inode, or our descriptor's file is stale (NFS: it was removed on
+    the server). An error that may be the share's (the directory is not
+    there either, EIO) is a failure, retried at the next interval.
+    """
+    try:
+        there = os.stat(beat.path)
+    except FileNotFoundError:
+        if os.path.isdir(os.path.dirname(beat.path)):
+            return "lost", "its lock file is gone"
+        return "failed", "cannot reach '{}'".format(os.path.dirname(beat.path))
+    except OSError as error:
+        return "failed", "cannot check the lock file: {}".format(error)
+    try:
+        ours = os.fstat(beat.handle)
+    except OSError as error:
+        if error.errno == errno.ESTALE:
+            return "lost", "its lock file was removed on the server"
+        return "failed", "cannot check the lock file: {}".format(error)
+    if (there.st_dev, there.st_ino) != beat.identity or (ours.st_dev, ours.st_ino) != beat.identity:
+        return "lost", "its lock file is another run's now"
+    return None
+
+
+def _beat_failed(beat, words):
+    if beat.failure_reported:
+        return
+    beat.failure_reported = True
+    _warn("warning: lock '{}': {}; trying again every {} s".format(beat.path, words, HEARTBEAT_SECONDS))
+
+
+def _lose_lock(beat, words):
+    """Stop beating a lock another run has taken, say so once and drain the run (nothing further starts).
+
+    Nothing is done when release() has begun meanwhile: it unlinks our own
+    file before it closes the descriptor, and a beat that saw the path
+    missing in that moment has not lost the lock.
+    """
+    with _held_locks_guard:
+        if beat.released:
+            return
+        beat.lost = True
+        if beat in _beats:
+            _beats.remove(beat)
+    host = None
+    try:
+        holder = _read_json(beat.path)
+    except RecordError:
+        holder = None
+    if isinstance(holder, dict) and isinstance(holder.get("host"), str):
+        host = holder["host"]
+    holder_words = "; host '{}' holds it now".format(host) if host is not None else ""
+    _warn("vidfunnel: lost the lock of folder '{}': {}{}; finishing the items in progress, starting no "
+          "more".format(beat.folder, words, holder_words))
+    drain_for_lost_lock(str(beat.folder))
+
+
+def _share_clock_ns(directory):
+    """The share's current time in ns: st_mtime_ns of a new, empty probe file in `directory`, removed again.
+
+    The file server stamps both this file and the lock file, so the two
+    times compare on one clock whatever this machine's clock says. The name
+    'lock.probe.<uuid4 hex>' cannot be a lock, a record ('.json') or
+    another run's probe. OSError when the probe cannot be created or read.
+    """
+    name = os.path.join(str(directory), PROBE_PREFIX + uuid.uuid4().hex)
+    handle = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        return os.fstat(handle).st_mtime_ns
+    finally:
+        try:
+            os.close(handle)
+        finally:
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
+
+
+def _claims_heartbeat(holder):
+    """True when the lock says its holder beats (written by a vidfunnel with the heartbeat)."""
+    return isinstance(holder.get(HEARTBEAT_FIELD), dict)
+
+
 FLOCK_RETRY_SECONDS = 1.0
 
 
@@ -638,6 +842,28 @@ class FolderLock:
     a lock with the same host name written by a run inside a container, and
     a lock written on the host when this run is inside a container.
 
+    Heartbeat. A lock written by this version carries "heartbeat":
+    {"interval": HEARTBEAT_SECONDS}, and while it is held one daemon thread
+    per process (started with the first lock, ended after the last release)
+    rewrites the first byte of each held lock file in place through the
+    held descriptor and fsyncs it every HEARTBEAT_SECONDS, and at the first
+    poll after a suspend (the wall clock moved HEARTBEAT_WAKE_GAP_SECONDS more
+    than the monotonic clock), so the file server advances the file's
+    mtime. Before each beat it checks that the
+    lock path still names the file it holds; when it does not, another run
+    has taken the folder over: the thread stops beating that lock, says so
+    on stderr and drains the run (vidfunnel.interrupt.drain_for_lost_lock),
+    and release() leaves the file at the path alone. A heartbeat lock that
+    the flock, reboot and pid rules above leave undecided is judged by its
+    last beat instead of the 24 h rule: the judge creates a probe file
+    beside it and compares the probe's mtime with the lock's, both stamped
+    by the file server, and takes the lock for dead once that is more than
+    HEARTBEAT_STALE_SECONDS; younger, it raises LockHeld whatever the lock's
+    age. A pid running here keeps a lock with a silent beat until the 24 h
+    rule. Where no probe file can be created, the 24 h rule applies to the
+    younger of the lock's start and its last beat on this machine's clock.
+    A lock without the field (an older vidfunnel) is judged as before.
+
     The lock file is only ever created with O_CREAT | O_EXCL, so of several
     runs that find no lock, one creates it and the others raise LockHeld
     naming it. Takeovers are serialised by flock() on the regular file
@@ -665,6 +891,7 @@ class FolderLock:
         self.stale_seconds = stale_seconds
         self.content = None
         self.handle = None  # the descriptor of our lock file while we hold it
+        self.beat = None    # its entry in the heartbeat registry while we hold it
 
     def _holder(self):
         """(content dict, age in seconds) of the current lock file, or (None, None) if absent."""
@@ -738,23 +965,31 @@ class FolderLock:
         before its descriptor is closed.
         """
         handle = os.open(str(self.path), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+        beat = None
         try:
             content["flock"] = _take_flock(handle)
             status = os.fstat(handle)
             content["device"] = status.st_dev
             data = _dump_json(content).encode("utf-8")
+            beat = _Beat(handle, self.path, self.folder, status, data[:1])
             while data:
                 data = data[os.write(handle, data):]
+            with _held_locks_guard:
+                _held_locks[handle] = (status.st_dev, status.st_ino)
+                _start_beating(beat)
         except BaseException:
+            with _held_locks_guard:
+                _held_locks.pop(handle, None)
+                if beat in _beats:
+                    _beats.remove(beat)
             try:
                 os.unlink(str(self.path))
             except OSError:
                 pass
             os.close(handle)
             raise
-        with _held_locks_guard:
-            _held_locks[handle] = (status.st_dev, status.st_ino)
         self.handle = handle
+        self.beat = beat
         self.content = content
 
     def _held(self, holder, age, why):
@@ -777,7 +1012,7 @@ class FolderLock:
         machine, machine_source = machine_identity()
         content = {"host": socket.gethostname(), "pid": os.getpid(), "started": now_iso(),
                    "container": in_container(), "machine": machine, "machine_source": machine_source,
-                   "boot": boot_id()}
+                   "boot": boot_id(), HEARTBEAT_FIELD: {"interval": HEARTBEAT_SECONDS}}
         try:
             self._create(content)
         except FileExistsError:
@@ -816,6 +1051,16 @@ class FolderLock:
             if (judgement is None and not rebooted and host == content["host"] and same_machine
                     and holder_in_container == content["container"] and pid != content["pid"]):
                 liveness = pid_alive(pid)
+            beat_age = None    # seconds since the holder's last beat, on the share's clock
+            clock_error = None
+            rule_age = age     # what the 24 h rule compares
+            if judgement is None and not rebooted and liveness is not False and _claims_heartbeat(holder):
+                try:
+                    beat_age = (_share_clock_ns(record_dir(self.folder)) - judged[2]) / 1e9
+                except OSError as error:
+                    clock_error = error
+                    # The lock's last beat on our clock: a beating holder is never older than its beat.
+                    rule_age = min(age, time.time() - judged[2] / 1e9)
             if judgement == "free":
                 warning = ("warning: taking over lock '{}': its holder, {} '{}' pid {}, has exited (nothing "
                            "holds the lock file's flock; lock written {} s ago)".format(
@@ -827,7 +1072,21 @@ class FolderLock:
             elif liveness is False:
                 warning = ("warning: taking over lock '{}': its holder, host '{}' pid {}, no longer runs "
                            "(lock written {} s ago)".format(self.path, host, pid, _whole_seconds(age)))
-            elif age < self.stale_seconds:
+            elif beat_age is not None and beat_age <= HEARTBEAT_STALE_SECONDS:
+                raise self._held(holder, age, "{}its holder last beat {:.0f} s ago on the share's clock; taken over "
+                                 "once it has been silent for {:.0f} s".format(
+                                     "its pid {} is running here and ".format(pid) if liveness is True else "",
+                                     beat_age, HEARTBEAT_STALE_SECONDS))
+            elif beat_age is not None and liveness is True and age < self.stale_seconds:
+                raise self._held(holder, age, "its pid {} is running here, although its holder last beat {:.0f} s "
+                                 "ago on the share's clock; taken over once 24 h old".format(pid, beat_age))
+            elif beat_age is not None:
+                warning = ("warning: taking over lock '{}' held by {} '{}' pid {} since {}: its holder last beat "
+                           "{:.0f} s ago on the share's clock, more than {:.0f} s{}".format(
+                               self.path, holder_words, host, pid, holder.get("started"), beat_age,
+                               HEARTBEAT_STALE_SECONDS,
+                               "; its pid is running here, taken for a reused one" if liveness is True else ""))
+            elif rule_age < self.stale_seconds:
                 if liveness is True:
                     why = "its pid {} is running here; taken over once 24 h old".format(pid)
                 elif host == content["host"] and not same_machine:
@@ -835,12 +1094,19 @@ class FolderLock:
                            "recorded), whose pid cannot be checked from here; taken over once 24 h old")
                 else:
                     why = _unjudged_reason(host, holder_in_container, content, pid)
+                if clock_error is not None:
+                    why += ("; its heartbeat cannot be judged, since no probe file can be created in '{}' to read "
+                            "the share's clock ({}), so the 24 h rule applies to its last beat".format(
+                                record_dir(self.folder), clock_error))
                 raise self._held(holder, age, why)
             else:
                 warning = "warning: taking over stale lock '{}' held by {} '{}' pid {} since {} ({:.1f} h ago{})".format(
                     self.path, holder_words, host, pid, holder.get("started"), age / 3600.0,
                     "; its pid is running here, taken for a reused one" if liveness is True else "")
-            if self._identity() != judged or self._holder()[0] != holder:
+            current = self._identity()
+            if current != judged or self._holder()[0] != holder:
+                if current is not None and current[:2] == judged[:2] and _claims_heartbeat(holder):
+                    raise self._held(holder, age, "its holder beat while the lock was being judged; not taken over")
                 raise self._lost_race()
             try:
                 os.unlink(str(self.path))
@@ -913,12 +1179,30 @@ class FolderLock:
             return False
 
     def release(self):
-        """Unlink the lock file if it is still ours, then close its descriptor (which frees our flock)."""
+        """Unlink the lock file if it is still ours, then close its descriptor (which frees our flock).
+
+        The heartbeat stops first. A lock the heartbeat found taken by
+        another run is left alone without a look at its path; any other is
+        unlinked only when the path still names our file with our entry
+        (_still_ours). A descriptor a beat is using at that moment is closed
+        by the heartbeat thread once the beat ends, so release never waits
+        for the share.
+        """
         if self.content is None:
             return
         handle = self.handle
+        beat = self.beat
+        lost = False
+        if beat is not None:
+            with _held_locks_guard:
+                beat.released = True
+                if beat in _beats:
+                    _beats.remove(beat)
+                lost = beat.lost
         try:
-            if handle is not None and self._still_ours():
+            if lost:
+                self.warn("warning: lock '{}' was taken over by another run; left in place".format(self.path))
+            elif handle is not None and self._still_ours():
                 try:
                     os.unlink(str(self.path))
                 except FileNotFoundError:
@@ -928,10 +1212,14 @@ class FolderLock:
         finally:
             self.content = None
             self.handle = None
+            self.beat = None
             if handle is not None:
                 with _held_locks_guard:
                     _held_locks.pop(handle, None)
-                    os.close(handle)
+                    if beat is not None and beat.beating:
+                        beat.handover = True
+                    else:
+                        os.close(handle)
 
     def __enter__(self):
         return self.acquire()

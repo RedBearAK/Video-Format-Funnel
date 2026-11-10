@@ -1,6 +1,6 @@
 """Tests for the command-line entry points: --version, dispatch, the launcher."""
 
-VERSION = "20261109.3"
+VERSION = "20261109.4"
 
 import contextlib
 import errno
@@ -392,6 +392,19 @@ class SigtermTests(unittest.TestCase):
             return holder.read().decode("utf-8")
 
         return read
+
+    def test_a_drain_for_a_lost_lock_names_the_folder_in_the_last_line(self):
+        def dispatch(args):
+            vidfunnel.interrupt.drain_for_lost_lock("/share/films/Some Film")
+            self.assertTrue(vidfunnel.interrupt.drain_before_next(2))
+            return 0
+
+        with unittest.mock.patch.object(cli, "dispatch", side_effect=dispatch):
+            code, _out, err = run_main(["convert"])
+        self.assertEqual(code, 0)
+        self.assertIn("vidfunnel: drained: finished 0 in progress, started no more (2 left planned); another run "
+                      "took over the lock of '/share/films/Some Film'", err)
+        self.assertEqual(vidfunnel.interrupt.drain_tally.lost_locks, [], "the lost lock outlived the command")
 
     def test_sigusr1_starts_a_drain_and_says_so_once(self):
         read = self.capture_fd2()

@@ -30,7 +30,7 @@ have no items and say that they ran to their end. A second SIGUSR1 does nothing;
 SIGQUIT or Ctrl+C during a drain stop the run as they always do.
 """
 
-VERSION = "20261109"
+VERSION = "20261109.4"
 
 import argparse
 import importlib
@@ -371,17 +371,21 @@ def _report_drain(args):
     from vidfunnel.interrupt import drain_tally, draining
     if not draining.is_set():
         return
+    lost = ""
+    if drain_tally.lost_locks:
+        lost = "; another run took over the lock of {}".format(
+            ", ".join("'{}'".format(folder) for folder in drain_tally.lost_locks))
     if not drain_tally.seen:
         if args.command in STOPPABLE:
             words = "no item was left to start when the drain began; it ran to its end"
         else:
             words = "it has no items to stop between; it ran to its end"
-        _print_error("vidfunnel: drained: '{}': {}".format(args.command, words))
+        _print_error("vidfunnel: drained: '{}': {}{}".format(args.command, words, lost))
         return
     left_words = "left planned" if args.command == "convert" and not getattr(args, "refit", False) \
         else "not started"
-    _print_error("vidfunnel: drained: finished {} in progress, started no more ({} {})".format(
-        drain_tally.finished, drain_tally.left, left_words))
+    _print_error("vidfunnel: drained: finished {} in progress, started no more ({} {}){}".format(
+        drain_tally.finished, drain_tally.left, left_words, lost))
 
 
 def _reset_after_sigterm():
