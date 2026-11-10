@@ -10,7 +10,7 @@ The design document is `HANDOFF.md`; it is the full specification and the place 
 - **Re-encodes** everything else with libx264 at a transparent quality target (CRF 18 to 20 by height, `-preset slower`), deinterlacing or removing telecine where needed. Audio that is already AAC-LC or MP3 is copied; anything else becomes AAC-LC.
 - **Writes fragmented MP4** with closed keyframe groups of at most two seconds on re-encodes, so damage to a file stays local and everything before it keeps playing. `--plain-mp4` writes a conventional `+faststart` MP4 instead.
 - **Never touches originals** outside `retire`. `plan` writes no media at all, `convert` writes new files next to the sources, and `retire` refuses anything that has not been verified.
-- **Records every decision with its reason**: one JSON record per source, holding the probe, the analysis, the sample positions, the exact ffmpeg command, the hashes, the verify results and the score.
+- **Records every decision with its reason**: one JSON record per source, holding the probe, the analysis, the sample positions, the ffmpeg command convert ran, the hashes, the verify results and the score.
 - **Redacts reports by default**, so a report can be posted when asking for help without giving away file names or folder structure.
 
 It does not scale video (except an integer upscale of tiny palette animations), does not crop letterbox bars, does not write interlaced output, and does not produce HEVC, AV1 or MKV.

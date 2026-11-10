@@ -359,6 +359,8 @@ REJECTED_SHAPES = [
     ("file", ["stages", "probe", "video", "fps"], 1000000.5),
     ("file", ["stages", "probe", "video", "avg_fps"], 1000001.0),
     ("file", ["stages", "probe", "video", "avg_fps"], 1.7e308),
+    ("file", ["stages", "probe", "video", "fps"], 10 ** 400),
+    ("file", ["stages", "probe", "video", "avg_fps"], 10 ** 400),
     ("file", ["stages", "probe", "streams"], "video,audio"),
     ("file", ["stages", "probe", "streams"], ["video"]),
     ("file", CADENCE + ["filter"], "movie=/etc/passwd"),
@@ -379,6 +381,7 @@ REJECTED_SHAPES = [
     ("file", CADENCE + ["fps_multiplier"], "2.0"),
     ("file", CADENCE + ["fps_multiplier"], 3.0),
     ("file", CADENCE + ["fps_multiplier"], True),
+    ("file", CADENCE + ["fps_multiplier"], 10 ** 400),
     ("file", PIXELART + ["filter"], "scale=iw*4:ih*4:flags=neighbor"),
     ("file", PIXELART + ["filter"], "scale=iw*2:ih*2:flags=neighbor,movie=/etc/passwd"),
     ("file", PIXELART + ["filter"], "scale=iw*2:ih*3:flags=neighbor"),
@@ -412,6 +415,7 @@ REJECTED_SHAPES = [
     ("file", FIRST_SYNC + ["index"], "1"),
     ("file", FIRST_SYNC + ["offset"], "0.3"),
     ("file", FIRST_SYNC + ["offset"], [0.3]),
+    ("file", FIRST_SYNC + ["offset"], 10 ** 400),
     ("file", FIRST_SYNC + ["measured_offset"], "early"),
     ("file", ["stages", "analyze", "subtitles", "result"], "mov_text"),
     ("file", ["stages", "analyze", "subtitles", "result"], ["mov_text"]),
@@ -620,8 +624,9 @@ class RenderedRecordTest(unittest.TestCase):
                                  change=ShapeSetter(["stages", "plan", "sidecars_skipped"],
                                                     ["h264_mkv_srt_subtitles.srt"]))
         record = load_record(key)
-        record["output"]["sidecars"] = []
+        del record["output"]["sidecars"]
         save_record(key, record)
+        self.assertIsNone(record_value_problem(record))
         self.assertFalse((folder / "h264_mkv_srt_subtitles.srt").exists())
         self.assertEqual(render_record(self.tools, folder, record)["sidecars"], [])
         record["stages"]["plan"]["sidecars_skipped"] = []
@@ -773,6 +778,43 @@ class RenderedRecordTest(unittest.TestCase):
                         self.assertEqual(summary.counts["failed"], 1, text)
                         self.assertIn("made-up stand-in failure", text)
                         self.assertEqual(load_record(good_key)["status"], "failed")
+
+    def test_an_integer_too_large_for_a_float_skips_the_record_and_the_run_goes_on(self):
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                folder = self.folder()
+                key, record = captured_record(folder, "xvid_avi_mp3.avi", "reencode", stand_in=self.stored)
+                record["stages"]["probe"]["video"]["fps"] = 10 ** 400
+                save_record(key, record)
+                good_key, good = captured_record(folder, "h264_avi_mp3.avi", "reencode", stand_in=self.stored)
+                good["id"] = SECOND_RECORD_ID
+                save_record(good_key, good)
+                record_bytes = record_path(key).read_bytes()
+                summary, text = self.convert(folder, dry_run=dry_run)
+                self.assertIn("{} 'xvid_avi_mp3.avi': stages.probe.video.fps is 1000".format(
+                    "would skip" if dry_run else "skipping"), text)
+                self.assertIn("... (type int), not a finite positive number", text)
+                self.assertNotIn("0" * 100, text)
+                self.assertEqual(record_path(key).read_bytes(), record_bytes)
+                if dry_run:
+                    self.assertIn("would re-encode 'h264_avi_mp3.avi'", text)
+                else:
+                    self.assertEqual(summary.counts["skipped"], 1, text)
+                    self.assertEqual(summary.counts["failed"], 1, text)
+                    self.assertIn("made-up stand-in failure", text)
+                    self.assertEqual(load_record(good_key)["status"], "failed")
+
+    def test_an_arithmetic_error_while_checking_values_skips_the_record(self):
+        folder, key = self.saved("xvid_avi_mp3.avi", "reencode")
+        record_bytes = record_path(key).read_bytes()
+        with unittest.mock.patch("vidfunnel.encode.record_value_problem",
+                                 side_effect=OverflowError("int too large to convert to float")):
+            summary, text = self.convert(folder)
+        self.assertEqual(summary.counts["skipped"], 1, text)
+        self.assertIn("skipping 'xvid_avi_mp3.avi': the record's values cannot be checked: int too large to "
+                      "convert to float", text)
+        self.assertEqual(record_path(key).read_bytes(), record_bytes)
+        self.assertEqual(self.calls_made(), [], text)
 
     def test_missing_mov_text_encoder_skips_the_record(self):
         folder, key = self.saved("h264_mkv_srt_subtitles.mkv", "remux")

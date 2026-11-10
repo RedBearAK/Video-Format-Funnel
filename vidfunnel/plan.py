@@ -672,7 +672,10 @@ def _audio_shifts(analysis):
 
 def build_argv(tools, source_inputs, output_path, probe, analysis, action, options, record_id, source_sha256,
                dvd_title=None):
-    """The ffmpeg argv convert runs (HANDOFF 2 and 4). See the module docstring for its shape."""
+    """The ffmpeg argv rendered for a record (HANDOFF 2 and 4); plan's preview and convert's command come from it.
+
+    See the module docstring for its shape.
+    """
     if action not in ("remux", "reencode"):
         raise ValueError("no ffmpeg command for action '{}'".format(action))
     if not source_sha256:
@@ -1370,7 +1373,10 @@ class _ValueProblem(Exception):
 def _shown(value):
     if isinstance(value, str):
         return "'{}'".format(value if len(value) <= 80 else value[:77] + "...")
-    text = repr(value)
+    try:
+        text = repr(value)
+    except ValueError:
+        text = "(too long to show)"
     return "{} (type {})".format(text if len(text) <= 80 else text[:77] + "...", type(value).__name__)
 
 
@@ -1433,8 +1439,12 @@ def _whole(field, value, lowest, highest=None, optional=False):
 def _finite(field, value, positive=False, optional=True, highest=None):
     if value is None and optional:
         return
-    if (not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value)
-            or (positive and value <= 0) or (highest is not None and value > highest)):
+    try:
+        wrong = (not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value)
+                 or (positive and value <= 0) or (highest is not None and value > highest))
+    except OverflowError:
+        wrong = True
+    if wrong:
         _fail(field, value, "a finite {}number{}".format("positive " if positive else "",
                                                           "" if highest is None else " up to {}".format(highest)))
 

@@ -328,7 +328,10 @@ def _render(tools, record, folder, sidecars=True):
     rendering reads are checked first (plan.record_value_problem). `sidecars`
     False renders no sidecar commands (refit). Writes nothing.
     """
-    problem = record_value_problem(record)
+    try:
+        problem = record_value_problem(record)
+    except (ValueError, TypeError, KeyError, AttributeError, ArithmeticError) as error:
+        return None, "the record's values cannot be checked: {}".format(error)
     if problem is not None:
         return None, problem
     try:

@@ -59,7 +59,7 @@ SUBCOMMANDS = (
     ("plan", "vidfunnel.plan", "add_arguments", "run",
      "probe and analyse sources, write records with the decisions; writes no media"),
     ("convert", "vidfunnel.encode", "add_arguments", "run",
-     "run the planned ffmpeg commands and verify the results"),
+     "convert the planned files and verify the results"),
     ("verify", "vidfunnel.verify", "add_arguments", "run",
      "re-check converted outputs and update their scores"),
     ("report", "vidfunnel.report", "add_arguments", "run",
