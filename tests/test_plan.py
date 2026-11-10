@@ -1055,6 +1055,70 @@ class PlanRunTest(unittest.TestCase):
         self.assertEqual((summary.counts["skipped"], summary.counts["failed"]), (1, 3), text)
         self.assertFalse(lock_of("first").exists() or lock_of("third").exists())
 
+    def test_jobs_a_drain_before_a_folder_is_entered_leaves_its_groups_unplanned_and_counted_left(self):
+        from unittest import mock
+        import vidfunnel.interrupt
+        import vidfunnel.plan
+        import vidfunnel.turns
+        self.addCleanup(vidfunnel.interrupt.drain_tally.reset)
+        self.addCleanup(vidfunnel.interrupt.draining.clear)
+        real_enter = vidfunnel.turns.FolderTurns.enter
+        real_lock = vidfunnel.turns.FolderLock
+        acquired = []
+
+        class LoggedLock(real_lock):
+            def acquire(self):
+                acquired.append(Path(self.folder).name)
+                return super().acquire()
+
+        def enter(turns, folder):
+            # The group was handed out before the drain; the drain begins before its folder is entered.
+            if Path(folder).name == "second":
+                vidfunnel.interrupt.draining.set()
+            return real_enter(turns, folder)
+
+        planned = []
+
+        def fake_entry(tools, work, found, options, folder_sources, capabilities, progress, stream, position, total,
+                       record_lock=None):
+            planned.append(work.source.name)
+            return "failed", None
+
+        for jobs in (2, 3):
+            with self.subTest(jobs=jobs):
+                self.root = Path(self.temporary.name) / "drained_jobs_{}".format(jobs)
+                self.root.mkdir()
+                for folder in ("first", "second"):
+                    (self.root / folder).mkdir()
+                self.copy_fixture("xvid_avi_mp3.avi", "first/harbour.avi")
+                self.copy_fixture("xvid_avi_mp3.avi", "first/jetty.avi")
+                # The second folder holds two groups: meadow alone, and the movie pair sharing one output name.
+                self.copy_fixture("xvid_avi_mp3.avi", "second/meadow.avi")
+                self.copy_fixture(os.path.join("collision_pair", "movie.avi"), "second/movie.avi")
+                self.copy_fixture(os.path.join("collision_pair", "movie.mkv"), "second/movie.mkv")
+                vidfunnel.interrupt.draining.clear()
+                vidfunnel.interrupt.drain_tally.reset()
+                acquired.clear()
+                planned.clear()
+                progress = quiet()
+                with mock.patch("vidfunnel.plan._plan_entry", side_effect=fake_entry), \
+                        mock.patch.object(vidfunnel.turns.FolderTurns, "enter", enter), \
+                        mock.patch("vidfunnel.turns.FolderLock", LoggedLock):
+                    summary = plan_paths(TOOLS, [str(self.root)], make_options(jobs=jobs), progress=progress)
+                text = progress.stream.getvalue()
+                tally = vidfunnel.interrupt.drain_tally
+                self.assertTrue(vidfunnel.interrupt.draining.is_set())
+                self.assertEqual(sorted(planned), ["harbour.avi", "jetty.avi"], text)
+                self.assertEqual(acquired, ["first"], text)
+                self.assertEqual((summary.counts["failed"], summary.counts["skipped"]), (2, 0), text)
+                self.assertTrue(tally.seen)
+                self.assertEqual(tally.left, 3, "the second folder's three files are left: {}".format(text))
+                self.assertFalse((self.root / "second" / ".vidfunnel" / "lock").exists())
+                self.assertFalse((self.root / "second" / ".vidfunnel" / "folder.json").exists())
+                for name in ("meadow.avi", "movie.avi", "movie.mkv"):
+                    self.assertFalse(record_path(self.root / "second" / name).exists(), name)
+                self.assertNotIn("skipping folder", text)
+
     def test_read_only_folder_is_skipped_without_a_traceback(self):
         if hasattr(os, "geteuid") and os.geteuid() == 0:
             self.skipTest("running as root; a read-only folder is still writable")

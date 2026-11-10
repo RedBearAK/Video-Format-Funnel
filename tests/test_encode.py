@@ -3510,15 +3510,25 @@ class OnDemandConvertTest(OnDemandLockCase):
                     self.assertNotIn("refusing", text)
 
     def test_two_planned_records_with_one_output_name_are_refused_under_the_lock(self):
+        real_shared = encode._shared_outputs
+        judged = []
+
+        def shared(runnable, stream):
+            judged.append([(Path(folder).name, self.held_here(folder)) for _key, folder in runnable])
+            return real_shared(runnable, stream)
+
         for jobs in (1, 2):
             with self.subTest(jobs=jobs):
                 shutil.rmtree(str(self.root / "second"), ignore_errors=True)
+                judged.clear()
                 self.started_items.clear()
                 sources = {"dawn": self.write_record("second", "dawn", output_name="evening.mp4"),
                            "dusk": self.write_record("second", "dusk", output_name="evening.mp4")}
                 before = self.record_bytes(sources)
-                summary, text = self.run_convert(jobs=jobs)
+                with unittest.mock.patch("vidfunnel.encode._shared_outputs", side_effect=shared):
+                    summary, text = self.run_convert(jobs=jobs)
                 self.assertEqual(summary.counts.get("collision"), 2, text)
+                self.assertEqual(judged, [[("second", True), ("second", True)]], "not judged under the lock")
                 self.assertEqual(self.started_items, [])
                 self.assertEqual(self.record_bytes(sources), before)
 

@@ -4,8 +4,8 @@ HANDOFF.md sections 6.2, 6.3 and 6.7. Several machines share a library
 folder by folder: a run holds '.vidfunnel/lock' (vidfunnel.record.FolderLock)
 only in the folders it is working in at that moment, so another host can
 work in the others meanwhile. convert (and --refit) and plan --jobs build one
-FolderTurns from the run's {folder: number of items} and wrap each item's
-work in enter() and leave():
+FolderTurns from the run's {folder: number of items (or, for plan, groups)}
+and wrap each item's work in enter() and leave():
 
 - enter(folder) takes the folder's lock the first time it is called for that
   folder and remembers the answer: HELD, SKIPPED (another run holds it:

@@ -75,11 +75,13 @@ A folder's lock is taken when its first item that needs one starts and
 released when its last item has ended (vidfunnel.turns); with --jobs N at
 most N folders are held at once. A record that is already converted, its
 output unchanged, is reported without a lock, so a finished folder is
-never locked. When a folder is entered, under its lock and on the records
-as they are on disk then, planned records whose output names meet in it
-(output.name or output.interim_name, compared case-insensitively) are all
-refused: both source names are printed, neither record is touched, and
-they are counted as 'collision' in the summary. A folder whose lock is
+never locked. When a folder is entered, under its lock, the folder's
+records collected at the scan are read as they are on disk at that moment
+(a record another run writes after the scan is not part of the check), and
+planned records whose output names meet in it (output.name or
+output.interim_name, compared case-insensitively) are all refused: both
+source names are printed, neither record is touched, and they are counted
+as 'collision' in the summary. A folder whose lock is
 held, or cannot be created (a read-only folder), is skipped for the run;
 the second kind and any collision make run() exit with EXIT_ERROR.
 
