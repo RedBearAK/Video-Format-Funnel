@@ -56,7 +56,10 @@ as convert checks it, before anything the record names is read: `run`
 leaves a record whose names are not plain names in its folder out when it
 collects the records, so it is never keyed, loaded or saved, and counts it
 'skipped'; verify_record raises RecordRefused (a ValueError) for one before
-it touches a file or the record.
+it touches a file or the record. With --ssim-check, for a re-encode, the
+values that go into the comparison's filter graph are checked as convert
+checks them (plan.record_value_problem), in verify_record before any file
+is read, and a record that fails is refused the same way.
 """
 
 VERSION = "20261109.2"
@@ -73,7 +76,7 @@ from vidfunnel.analyze import DEFAULT_SAMPLES, WINDOW_SECONDS, decide_decode, sa
 from vidfunnel.ffmpeg import FfmpegError, null_decode
 from vidfunnel.ffmpeg import run as run_tool
 from vidfunnel.interrupt import drain_after_item, drain_before_next
-from vidfunnel.plan import HASH_PROGRESS_BYTES, IDENTITY_KEY, record_name_problem, video_filters
+from vidfunnel.plan import HASH_PROGRESS_BYTES, IDENTITY_KEY, record_name_problem, record_value_problem, video_filters
 from vidfunnel.probe import count_frames, probe_file
 from vidfunnel.progress import Progress, StageSummary, ffmpeg_progress_callback, format_bytes, item_tag, say, tagged
 from vidfunnel.record import (
@@ -558,8 +561,11 @@ def verify_record(tools, source, record, options, progress=None):
     and samples. `progress` is None or an object with 'stream' and 'quiet'
     (the CLI args). Raises ValueError for a record whose status is not
     'converted' or 'verified', and RecordRefused (a ValueError) for one whose
-    names are not plain names in its folder (plan.record_name_problem); both
-    before any file is read and with the record unchanged.
+    names are not plain names in its folder (plan.record_name_problem) or,
+    when the SSIM pass will build a filter graph from the analysis (ssim_check
+    on a re-encode), whose values are not of the forms analyze writes
+    (plan.record_value_problem); all before any file is read and with the
+    record unchanged.
     """
     stream, quiet = _progress_options(progress)
     key = Path(os.path.abspath(os.fspath(source)))
@@ -570,6 +576,14 @@ def verify_record(tools, source, record, options, progress=None):
     problem = record_name_problem(record)
     if problem is not None:
         raise RecordRefused("record of '{}' is refused: {}".format(key.name, problem))
+    if _option(options, "ssim_check", False) and record.get("action") == "reencode":
+        # Only then do record values (video_filters) reach an ffmpeg argv; checked as convert checks them.
+        try:
+            problem = record_value_problem(record)
+        except (ValueError, TypeError, KeyError, AttributeError, ArithmeticError) as error:
+            problem = "the record's values cannot be checked: {}".format(error)
+        if problem is not None:
+            raise RecordRefused("record of '{}' is refused for --ssim-check: {}".format(key.name, problem))
     _archive_previous(record)
     output_path = output_path_of(folder, record)
     stage = {"output_name": output_path.name if output_path is not None else None}
@@ -745,7 +759,8 @@ def _records_under(path, stream):
     for record_folder, record in iter_records(folder, on_error=lambda entry, error: None):
         if record_folder != folder:
             continue
-        # A list, not a set: an edited record may hold unhashable values; run() refuses those records.
+        # A list, not a set: an edited record's names may be unhashable; run() refuses a record whose names are
+        # not plain names.
         source, output = record.get("source"), record.get("output")
         names = [source.get("name")] if isinstance(source, dict) else []
         if isinstance(output, dict):
@@ -777,7 +792,8 @@ def run(args):
     seen = set()
     for path in args.paths:
         for folder, record in _records_under(path, stream):
-            identity = (str(folder), record.get("id"))
+            # repr: an edited record's id may be unhashable; such a record is verified and its identity check fails.
+            identity = (str(folder), repr(record.get("id")))
             if identity in seen:
                 continue
             seen.add(identity)

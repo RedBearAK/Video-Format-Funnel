@@ -650,6 +650,9 @@ REFUSED_NAMES = [
     ("output.sidecars", [(["output", "sidecars"], ["../elsewhere/secret.srt"])]),
     ("output", [(["output"], "meadow.mp4")]),
     ("stages", [(["stages"], "probe")]),
+    ("output.interim_sidecars", [(["output", "interim_sidecars"], ["../elsewhere/secret.srt"])]),
+    ("source.fingerprint_of", [(["source", "kind"], "dvd-title"), (["source", "dvd_title"], 1),
+                               (["source", "fingerprint_of"], "../elsewhere/secret.avi")]),
 ]
 
 
@@ -742,9 +745,10 @@ class VerifyRefusesNamesTest(unittest.TestCase):
                 unittest.mock.patch.object(verify_module, "run_tool", ffmpeg):
             yield calls
 
-    def run_verify(self):
+    def run_verify(self, ssim_check=True):
         args = argparse.Namespace(paths=[str(self.folder)], ffmpeg=None, quiet=True, verbose=False, log=None,
-                                  yes=False, ssim_check=True, ssim_threshold=0.97, samples=1, stream=io.StringIO())
+                                  yes=False, ssim_check=ssim_check, ssim_threshold=0.97, samples=1,
+                                  stream=io.StringIO())
         tools = types.SimpleNamespace(ffmpeg="ffmpeg-stand-in", ffprobe="ffprobe-stand-in")
         with unittest.mock.patch("vidfunnel.deps.require", return_value=tools), self.recorders():
             run(args)
@@ -829,6 +833,59 @@ class VerifyRefusesNamesTest(unittest.TestCase):
         text = args.stream.getvalue()
         self.assertEqual(self.file_bytes()["meadow"], before["meadow"])
         self.assert_only_the_good_record_was_read(text)
+
+    def edit_reencode(self, path, value):
+        """The edited record made a re-encode whose values pass convert's check, then one value set to `value`."""
+        from vidfunnel.plan import record_value_problem
+        record = load_record(self.edited_key)
+        record["action"] = "reencode"
+        record["stages"]["plan"] = {"plain_mp4": False}
+        record["stages"]["analyze"] = {"cadence": {"result": {"filter": "bwdif=mode=1:parity=0"}},
+                                       "aspect": {"result": {"sar": "8:9", "dar": "4:3"}}}
+        self.assertIsNone(record_value_problem(record))
+        save_record(self.edited_key, record)
+        return self.edit([(path, value)])
+
+    HOSTILE_FILTER = "null[pre];movie=/abs/elsewhere/secret.avi,nullsink;[pre]null"
+
+    def test_ssim_check_refuses_a_filter_value_convert_would_refuse(self):
+        self.edit_reencode(["stages", "analyze", "cadence", "result", "filter"], self.HOSTILE_FILTER)
+        before = self.file_bytes()
+        text = self.run_verify(ssim_check=True)
+        self.assertIn("skipping 'meadow.avi': record of 'meadow.avi' is refused for --ssim-check: "
+                      "stages.analyze.cadence.result.filter is '", text)
+        self.assertIn("1 skipped", text)
+        self.assertEqual(self.file_bytes()["meadow"], before["meadow"])
+        self.assertNotIn("movie=", " ".join(target for _what, target in self.calls))
+        self.assert_only_the_good_record_was_read(text)
+        self.assertTrue(any(what == "ffmpeg" and str(self.folder / "harbour.mp4") in target
+                            for what, target in self.calls), self.calls)
+
+    def test_ssim_check_refuses_a_sar_with_a_filter_appended(self):
+        self.edit_reencode(["stages", "analyze", "aspect", "result", "sar"], "8:9,movie=/abs/elsewhere/secret.avi")
+        before = self.file_bytes()
+        text = self.run_verify(ssim_check=True)
+        self.assertIn("is refused for --ssim-check: stages.analyze.aspect.result.sar is '", text)
+        self.assertEqual(self.file_bytes()["meadow"], before["meadow"])
+        self.assert_only_the_good_record_was_read(text)
+
+    def test_without_ssim_check_the_values_are_not_checked(self):
+        # A plain verify builds no filter graph from the analysis, so it does not refuse a record over those values.
+        self.edit_reencode(["stages", "analyze", "cadence", "result", "filter"], self.HOSTILE_FILTER)
+        text = self.run_verify(ssim_check=False)
+        self.assertNotIn("skipping", text)
+        self.assertNotIn("ffmpeg", [what for what, _target in self.calls])
+        self.assertIn(("decode", str(self.folder / "meadow.mp4")), self.calls)
+        self.assertEqual(load_record(self.edited_key)["status"], "verified", text)
+        self.assertEqual(load_record(self.good_key)["status"], "verified", text)
+
+    def test_a_record_whose_id_is_a_list_does_not_stop_the_run(self):
+        self.edit([(["id"], ["edited"])])
+        text = self.run_verify()
+        self.assertEqual(load_record(self.good_key)["status"], "verified", text)
+        edited = load_record(self.edited_key)
+        self.assertEqual(edited["status"], "verified", text)
+        self.assertFalse(edited["stages"]["verify"]["identity"]["ok"])
 
     def test_members_of_a_record_that_is_not_a_vob_group_are_not_read(self):
         # Only a VOB group's members are checked by name, so only a VOB group's members are inputs.
