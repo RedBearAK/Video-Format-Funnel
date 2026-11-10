@@ -1,8 +1,19 @@
-"""convert: run the planned ffmpeg commands to a hidden temp file, rename into place, write PAR2, verify.
+"""convert: render the ffmpeg commands of planned records, run them to a hidden temp file, rename, PAR2, verify.
 
 HANDOFF.md sections 2.4, 2.5, 5 (the size rule), 6.3, 6.7 and 6.10.
-`convert` runs exactly the argv that `plan` stored under stages.plan.argv,
-with its last element (the output path) replaced by a hidden
+`convert` renders each command at convert time (vidfunnel.plan.render_record)
+from the record, the folder the record sits in and this machine's ffmpeg
+(tools.ffmpeg: --ffmpeg, VIDFUNNEL_FFMPEG or PATH). It never runs or trusts
+the command plan stored under stages.plan.argv, which is a preview, also in
+records written before this rule. Before rendering, the values the rendering
+reads are checked for the forms analyze writes (plan.record_value_problem),
+and before running, this ffmpeg's capability listing is checked for every
+encoder, filter, bitstream filter and input format the command names
+(capability_problem); a record that fails either is skipped, counted as
+skipped, and left untouched, with a reason that names the field or the
+missing item and the ffmpeg's path.
+
+The command's last element (the output path) is a hidden
 '.NAME.<first 8 hex digits of the record id>.part' file in the same folder,
 so two records can never write the same part file. On success the part file is renamed into place
 (the interim '<stem>.vidfunnel.mp4' name when the source is itself an MP4,
@@ -18,9 +29,14 @@ What convert writes into the record:
   sidecars_written (file names), sidecar_errors (only when one failed),
   par2_files (file names), par2_redundancy (the N used, or None), par2_error
   (only when par2 failed), output_size,
-  source_size, size_ratio (None when the source size is unknown);
+  source_size, size_ratio (None when the source size is unknown), and what
+  ran: argv (the command, ending in the part file), sidecar_argvs (each
+  sidecar command started, ending in its part file), ffmpeg ({'path',
+  'version', 'configuration_sha256'}, vidfunnel.ffmpeg.current_identity) and
+  version (the vidfunnel version that rendered the commands);
 - stages.convert on an ffmpeg failure: outcome 'failed', error,
-  returncode, stderr (last 4000 characters), argv; status 'failed';
+  returncode, stderr (last 4000 characters), argv, sidecar_argvs (empty),
+  ffmpeg, version; status 'failed';
 - a re-encode that came out larger than its source is kept like any
   other output (outcome 'ok', output_size and source_size as above) and
   gets the flag 'output-larger'; retire refuses it without --allow-larger.
@@ -39,7 +55,9 @@ With --refit, convert revisits converted or verified re-encodes flagged
 capped at 23 up to 576 lines and 24 above, with hqdn3d first when the source
 is heavily compressed and blocky; the existing output is replaced only by a
 smaller one that passes the identity, stream and duration checks, and is
-otherwise kept, with the flag 'fit-capped'.
+otherwise kept, with the flag 'fit-capped'. The refit command is rendered
+like convert's, with the same checks; the CRF it raises is the one the
+existing output was made with (refit_base_crf).
 
 Before anything runs, planned records whose output names meet in one
 folder (output.name or output.interim_name, compared case-insensitively)
@@ -54,7 +72,7 @@ refused without being touched, except that a converted or verified record
 whose output still matches its fingerprint is reported as already converted.
 """
 
-VERSION = "20261109"
+VERSION = "20261109.1"
 
 import math
 import os
@@ -67,8 +85,11 @@ import time
 import types
 from pathlib import Path
 
+import vidfunnel
 from vidfunnel.ffmpeg import FfmpegError, ToolNotFound, current_identity, forget_child, register_child
+from vidfunnel.ffmpeg import capabilities as ffmpeg_capabilities
 from vidfunnel.ffmpeg import run as run_tool
+from vidfunnel.plan import PlanError, record_key_problem, record_name_problem, record_value_problem, render_record
 from vidfunnel.interrupt import Interrupted, child_interrupted, drain_after_item, drain_before_next, run_pool
 from vidfunnel.interrupt import check as check_interrupted
 from vidfunnel.progress import Progress, StageSummary, ffmpeg_progress_callback, item_tag, say, tagged
@@ -222,59 +243,117 @@ def skip_reason(record, output_path):
     return None
 
 
-def plan_ffmpeg_problem(record):
-    """Why the ffmpeg at stages.plan.argv[0] is not the build the plan was made with, or None.
-
-    Compares its version and configuration hash now (one '-version' call
-    per ffmpeg build per process, vidfunnel.ffmpeg.current_identity) with
-    stages.plan.ffmpeg. A record planned before plan wrote that field gives
-    None and runs as before. Call it once argv[0] is known to be an
-    executable file.
-    """
-    plan = (record.get("stages") or {}).get("plan") or {}
-    if "ffmpeg" not in plan:
-        return None
-    recorded = plan["ffmpeg"]
-    path = plan["argv"][0]
-    if not isinstance(recorded, dict):
-        return "stages.plan.ffmpeg is not understood; plan again with --replan on this machine"
-    try:
-        current = current_identity(path)
-    except (FfmpegError, ToolNotFound) as error:
-        return "ffmpeg '{}' named in the plan does not run here ({}); plan again with --replan on this machine".format(
-            path, error)
-    if (current["version"] == recorded.get("version")
-            and current["configuration_sha256"] == recorded.get("configuration_sha256")):
-        return None
-    return ("the plan was made with ffmpeg {} at '{}' (configuration {}), but '{}' here is ffmpeg {} "
-            "(configuration {}); plan again with --replan on this machine".format(
-                recorded.get("version") or "of unknown version", recorded.get("path"),
-                str(recorded.get("configuration_sha256") or "unknown")[:12], current["path"],
-                current["version"] or "of unknown version", current["configuration_sha256"][:12]))
-
-
 def _refusal(record, folder, output_path):
-    """Why a record cannot be converted as it stands, or None. Writes nothing; may run 'ffmpeg -version' once."""
+    """Why a record cannot be converted as it stands, or None. Writes nothing; runs nothing."""
     status = record.get("status")
     if status != "planned":
         if status in DONE_STATUSES:
             return ("status is '{}' but the output '{}' is missing or changed since; "
                     "plan again with --replan to convert again".format(status, output_path.name))
         return "status is '{}', not 'planned'".format(status)
-    if record.get("action") not in ACTION_WORDS:
-        return "action is '{}', not remux or reencode".format(record.get("action"))
-    plan = (record.get("stages") or {}).get("plan") or {}
+    action = record.get("action")
+    if not isinstance(action, str) or action not in ACTION_WORDS:
+        return "action is '{}', not remux or reencode".format(action)
     if "convert" in (record.get("stages") or {}):
         return "the record already has a convert stage; plan again with --replan"
-    argv = plan.get("argv")
-    if not isinstance(argv, list) or len(argv) < 4 or argv[-3:-1] != ["-f", "mp4"]:
-        return "stages.plan.argv does not end in '-f mp4 <output>'"
-    if os.path.abspath(argv[-1]) != os.path.abspath(str(output_path)):
-        return ("the planned command writes '{}', not '{}'; the folder may have moved since plan: "
-                "plan again with --replan".format(argv[-1], output_path))
-    if not (os.path.isfile(argv[0]) and os.access(argv[0], os.X_OK)):
-        return "ffmpeg '{}' named in the plan does not exist here; plan again on this machine".format(argv[0])
-    return plan_ffmpeg_problem(record)
+    return None
+
+
+CAPABILITY_WORDS = {"encoders": "encoder", "filters": "filter", "bsfs": "bitstream filter", "demuxers": "demuxer"}
+
+
+def argv_needs(argv):
+    """[(listing, name)] an ffmpeg argv asks of the build, each once, in order. Pure.
+
+    'encoders': the codec after -c:v and -c:a... unless it is 'copy';
+    'filters': every filter named in a -vf, -filter:v, -af or -filter:a...
+    chain; 'bsfs': the bitstream filter of -bsf...; 'demuxers': the input
+    format of an -f that comes before the last -i (dvdvideo). The listing
+    names are those of vidfunnel.ffmpeg.capabilities().
+    """
+    argv = list(argv)
+    inputs = [position for position, item in enumerate(argv) if item == "-i"]
+    last_input = inputs[-1] if inputs else -1
+    needs = []
+    for position, item in enumerate(argv[:-1]):
+        value = argv[position + 1]
+        found = []
+        if item == "-c:v" or item == "-c:a" or item.startswith("-c:a:"):
+            if value != "copy":
+                found.append(("encoders", value))
+        elif item in ("-vf", "-filter:v", "-af", "-filter:a") or item.startswith("-filter:a:"):
+            found += [("filters", part.split("=", 1)[0]) for part in value.split(",")]
+        elif item == "-bsf:v" or item == "-bsf":
+            found += [("bsfs", part.split("=", 1)[0]) for part in value.split(",")]
+        elif item == "-f" and position < last_input:
+            found.append(("demuxers", value))
+        for need in found:
+            if need not in needs:
+                needs.append(need)
+    return needs
+
+
+def capability_problem(tools, argv):
+    """None when this ffmpeg's capability listing has everything argv names, else the reason. Writes no record.
+
+    The listing is the one 'check' and the dependency check use
+    (vidfunnel.ffmpeg.capabilities, cached per binary); the reason names
+    each missing item and the ffmpeg's path.
+    """
+    try:
+        listing = ffmpeg_capabilities(tools)
+    except (FfmpegError, ToolNotFound, OSError) as error:
+        return "the capabilities of ffmpeg '{}' cannot be listed: {}".format(tools.ffmpeg, error)
+    missing = ["{} '{}'".format(CAPABILITY_WORDS[kind], name) for kind, name in argv_needs(argv)
+               if name not in (listing.get(kind) or ())]
+    if not missing:
+        return None
+    return "ffmpeg '{}' has no {}, which this record needs (see 'vidfunnel check')".format(
+        tools.ffmpeg, " and no ".join(missing))
+
+
+def _render(tools, record, folder):
+    """(rendered, None) or (None, reason): the record's commands rendered here, with this ffmpeg's identity.
+
+    rendered is plan.render_record's dict plus 'ffmpeg', the identity of
+    tools.ffmpeg (one '-version' call per build per process). The values the
+    rendering reads are checked first (plan.record_value_problem). Writes
+    nothing.
+    """
+    problem = record_value_problem(record)
+    if problem is not None:
+        return None, problem
+    try:
+        rendered = render_record(tools, folder, record)
+    except (PlanError, ValueError, TypeError, KeyError, AttributeError) as error:
+        return None, "the command cannot be rendered from the record: {}".format(error)
+    try:
+        rendered["ffmpeg"] = current_identity(tools.ffmpeg)
+    except (FfmpegError, ToolNotFound, OSError) as error:
+        return None, "ffmpeg '{}' does not run here: {}".format(tools.ffmpeg, error)
+    return rendered, None
+
+
+def _conversion(tools, record, folder):
+    """(output_path, rendered, reason): what convert_one and --dry-run would do with a record. Writes nothing.
+
+    reason is None when the record is to be converted: its names are plain
+    names in its folder, it is not already converted, it is 'planned' with
+    a remux or reencode action and no convert stage, its values have the
+    forms analyze writes, and this ffmpeg has what the rendered command
+    names. output_path is None when a name is refused.
+    """
+    reason = record_name_problem(record)
+    if reason is not None:
+        return None, None, reason
+    output_path = output_path_for(record, folder)
+    reason = skip_reason(record, output_path) or _refusal(record, folder, output_path)
+    if reason is not None:
+        return output_path, None, reason
+    rendered, reason = _render(tools, record, folder)
+    if reason is None:
+        reason = capability_problem(tools, rendered["argv"])
+    return output_path, rendered, reason
 
 
 def _ours(tools, path, record):
@@ -378,11 +457,12 @@ def _par2_files(output_path):
     return found
 
 
-def _write_sidecars(plan, record_id, stream, verbose):
-    """Run each sidecar argv to its own part file and rename; (names written, [error dicts])."""
+def _write_sidecars(sidecars, record_id, stream, verbose):
+    """Run each rendered sidecar argv to its own part file and rename; (names written, [error dicts], argvs run)."""
     written = []
     errors = []
-    for entry in plan.get("sidecars") or []:
+    started = []
+    for entry in sidecars:
         final = Path(entry.get("path") or "")
         argv = list(entry.get("argv") or [])
         if not argv or os.path.abspath(argv[-1]) != os.path.abspath(str(final)):
@@ -397,6 +477,7 @@ def _write_sidecars(plan, record_id, stream, verbose):
         if verbose:
             say("  " + shlex.join(argv), stream)
         _remove(temp)
+        started.append(argv)
         try:
             run_tool(argv)
             os.replace(str(temp), str(final))
@@ -407,7 +488,7 @@ def _write_sidecars(plan, record_id, stream, verbose):
             say("  sidecar '{}' failed: {}".format(final.name, error), stream)
         finally:
             _remove(temp)
-    return written, errors
+    return written, errors, started
 
 
 def _verify(tools, key, record, options, progress, stream):
@@ -448,12 +529,9 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
     verbose = verbose or bool(getattr(options, "verbose", False))
     key = Path(os.path.abspath(os.fspath(source)))
     folder = key.parent
-    output_path = output_path_for(record, folder)
     label = _label(record)
 
-    reason = skip_reason(record, output_path)
-    if reason is None:
-        reason = _refusal(record, folder, output_path)
+    output_path, rendered, reason = _conversion(tools, record, folder)
     if reason is not None:
         say("skipping '{}': {}".format(label, reason), stream)
         return {"outcome": "skipped", "skipped": reason}
@@ -481,8 +559,9 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
     plan = record["stages"]["plan"]
     action_word = ACTION_WORDS[record["action"]]
     temp = part_path(output_path, record.get("id"))
-    argv = list(plan["argv"])
+    argv = list(rendered["argv"])
     argv[-1] = str(temp)
+    ran = {"argv": argv, "sidecar_argvs": [], "ffmpeg": rendered["ffmpeg"], "version": vidfunnel.VERSION}
     say("{} '{}' -> '{}'".format(action_word, label, output_path.name), stream)
     if verbose:
         say(shlex.join(argv), stream)
@@ -498,7 +577,8 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
     except (FfmpegError, ToolNotFound, OSError) as error:
         _remove(temp)
         stage = {"outcome": "failed", "error": str(error), "returncode": getattr(error, "returncode", None),
-                 "stderr": _tail(getattr(error, "stderr", None)), "argv": argv}
+                 "stderr": _tail(getattr(error, "stderr", None))}
+        stage.update(ran)
         add_stage(record, "convert", stage)
         set_status(record, "failed")
         save_record(key, record)
@@ -539,7 +619,8 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
     else:
         say("  source size unknown; the size rule could not be applied to '{}'".format(output_path.name), stream)
 
-    sidecars_written, sidecar_errors = _write_sidecars(plan, record.get("id"), stream, verbose)
+    sidecars_written, sidecar_errors, ran["sidecar_argvs"] = _write_sidecars(rendered["sidecars"], record.get("id"),
+                                                                             stream, verbose)
     if sidecar_errors:
         add_flag(record, "sidecar-failed")
 
@@ -566,6 +647,7 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
              "sidecars_written": sidecars_written, "par2_files": par2_files,
              "par2_redundancy": int(redundancy) if redundancy else None, "output_size": output_size,
              "source_size": source_size, "size_ratio": ratio}
+    stage.update(ran)
     if sidecar_errors:
         stage["sidecar_errors"] = sidecar_errors
     if par2_error is not None:
@@ -678,7 +760,7 @@ def refit_filter_chain(chain, denoise, cadence_filter=None):
 
 
 def refit_argv(argv, crf, denoise, output, cadence_filter=None):
-    """(argv, filter chain or None): the planned argv with -crf, the video filter chain and the output replaced. Pure.
+    """(argv, filter chain or None): the rendered argv with -crf, the video filter chain and the output replaced. Pure.
 
     Everything else (inputs, maps, identity tag, movflags) is kept. With
     denoise and no '-vf'/'-filter:v' in the argv, '-vf hqdn3d=...' goes in
@@ -689,9 +771,9 @@ def refit_argv(argv, crf, denoise, output, cadence_filter=None):
     try:
         position = argv.index("-crf")
     except ValueError:
-        raise ValueError("the planned command has no -crf")
+        raise ValueError("the rendered command has no -crf")
     if position + 1 >= len(argv) - 1:
-        raise ValueError("the planned command has no value after -crf")
+        raise ValueError("the rendered command has no value after -crf")
     argv[position + 1] = str(int(crf))
     chain = None
     filter_at = None
@@ -705,7 +787,7 @@ def refit_argv(argv, crf, denoise, output, cadence_filter=None):
         argv[filter_at] = new_chain
     elif new_chain:
         if "-c:v" not in argv:
-            raise ValueError("the planned command has no -c:v to put the video filter chain before")
+            raise ValueError("the rendered command has no -c:v to put the video filter chain before")
         at = argv.index("-c:v")
         argv[at:at] = ["-vf", new_chain]
     argv[-1] = os.fspath(output)
@@ -736,18 +818,31 @@ def _refit_disk_problem(folder, record, output_path):
     return None, size, source_size
 
 
-def _refit_plan_problem(record, output_path):
-    """Why the planned argv cannot be the base of a refit, or None."""
-    argv = ((record.get("stages") or {}).get("plan") or {}).get("argv")
-    if not isinstance(argv, list) or len(argv) < 4 or argv[-3:-1] != ["-f", "mp4"]:
-        return "stages.plan.argv does not end in '-f mp4 <output>'"
-    if os.path.abspath(argv[-1]) != os.path.abspath(str(output_path)):
-        return "the planned command writes '{}', not '{}'".format(argv[-1], output_path)
-    if not (os.path.isfile(argv[0]) and os.access(argv[0], os.X_OK)):
-        return "ffmpeg '{}' named in the plan does not exist here".format(argv[0])
-    if parse_crf(argv) is None:
-        return "the planned command has no -crf"
-    return plan_ffmpeg_problem(record)
+REFIT_CRF_HIGHEST = 51
+
+
+def refit_base_crf(record):
+    """(crf, field, None) or (None, field, reason): the CRF the existing output was made with. Pure.
+
+    Read from stages.convert.argv, the command convert ran, when the convert
+    stage holds one; else from stages.plan.argv, the command a record
+    converted before convert recorded its own was run with. Only that number
+    is read; neither command is run.
+    """
+    stages = record.get("stages") or {}
+    convert = stages.get("convert")
+    if isinstance(convert, dict) and "argv" in convert:
+        field, argv = "stages.convert.argv", convert["argv"]
+    else:
+        plan = stages.get("plan")
+        field, argv = "stages.plan.argv", plan.get("argv") if isinstance(plan, dict) else None
+    if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
+        return None, field, "{} is not a list of strings, so the CRF of the existing output is not known".format(field)
+    crf = parse_crf(argv)
+    if crf is None or not 0 <= crf <= REFIT_CRF_HIGHEST:
+        return None, field, "{} has no '-crf' with a whole number from 0 to {}, so the CRF of the existing output " \
+                            "is not known".format(field, REFIT_CRF_HIGHEST)
+    return crf, field, None
 
 
 def refit_checks(tools, record, path):
@@ -793,18 +888,27 @@ def refit_checks(tools, record, path):
     return None
 
 
-def refit_plan(record, folder):
+def refit_plan(tools, record, folder):
     """(plan dict or None, skip reason or None) for one record; reads the files, writes nothing.
 
-    The plan dict: output_path, part, argv, base_crf, crf, cap, steps,
-    denoise, denoise_reason, filters, ratio, output_size, source_size,
-    height.
+    The command is rendered here (as convert renders it, with the same value
+    checks) and its CRF and video filter chain are replaced (refit_argv);
+    this ffmpeg's capability listing is checked against the result.
+    The plan dict: output_path, part, argv, base_crf, base_crf_from, crf,
+    cap, steps, denoise, denoise_reason, filters, ratio, output_size,
+    source_size, height, ffmpeg.
     """
     reason = refit_selection(record)
     if reason is not None:
         return None, reason
+    reason = record_name_problem(record)
+    if reason is not None:
+        return None, reason
     output_path = output_path_for(record, folder)
-    problem = _refit_plan_problem(record, output_path)
+    rendered, problem = _render(tools, record, folder)
+    if problem is not None:
+        return None, problem
+    base_crf, base_field, problem = refit_base_crf(record)
     if problem is not None:
         return None, problem
     problem, output_size, source_size = _refit_disk_problem(folder, record, output_path)
@@ -813,8 +917,7 @@ def refit_plan(record, folder):
     ratio = float(output_size) / source_size
     if ratio <= 1.0:
         return None, "not larger (output {} bytes, source {} bytes on disk)".format(output_size, source_size)
-    argv = record["stages"]["plan"]["argv"]
-    base_crf = parse_crf(argv)
+    argv = rendered["argv"]
     height = (((record.get("stages") or {}).get("probe") or {}).get("video") or {}).get("height")
     crf, cap, steps = refit_crf(base_crf, ratio, height)
     if crf <= base_crf:
@@ -827,9 +930,13 @@ def refit_plan(record, folder):
         new_argv, chain = refit_argv(argv, crf, denoise, part, cadence_filter)
     except ValueError as error:
         return None, str(error)
-    return {"output_path": output_path, "part": part, "argv": new_argv, "base_crf": base_crf, "crf": crf,
-            "cap": cap, "steps": steps, "denoise": denoise, "denoise_reason": denoise_reason, "filters": chain,
-            "ratio": ratio, "output_size": output_size, "source_size": source_size, "height": height}, None
+    problem = capability_problem(tools, new_argv)
+    if problem is not None:
+        return None, problem
+    return {"output_path": output_path, "part": part, "argv": new_argv, "base_crf": base_crf,
+            "base_crf_from": base_field, "crf": crf, "cap": cap, "steps": steps, "denoise": denoise,
+            "denoise_reason": denoise_reason, "filters": chain, "ratio": ratio, "output_size": output_size,
+            "source_size": source_size, "height": height, "ffmpeg": rendered["ffmpeg"]}, None
 
 
 def _refit_words(plan):
@@ -864,7 +971,7 @@ def refit_one(tools, source, record, options, progress=None, position=None, tota
     key = Path(os.path.abspath(os.fspath(source)))
     folder = key.parent
     label = _label(record)
-    plan, reason = refit_plan(record, folder)
+    plan, reason = refit_plan(tools, record, folder)
     if plan is None:
         say("skipping '{}': {}".format(label, reason), stream)
         return "skipped", reason
@@ -876,11 +983,12 @@ def refit_one(tools, source, record, options, progress=None, position=None, tota
     stages = record.setdefault("stages", {})
     if "refit" in stages:
         stages.setdefault("refit_history", []).append(stages.pop("refit"))
-    attempt = {"crf": plan["crf"], "base_crf": plan["base_crf"], "cap": plan["cap"], "steps": plan["steps"],
+    attempt = {"crf": plan["crf"], "base_crf": plan["base_crf"], "base_crf_from": plan["base_crf_from"],
+               "cap": plan["cap"], "steps": plan["steps"],
                "denoise": plan["denoise"], "denoise_reason": plan["denoise_reason"], "filters": plan["filters"],
                "previous_output_size": plan["output_size"], "previous_ratio": round(plan["ratio"], 4),
                "source_size": plan["source_size"], "output_size": None, "ratio": None, "elapsed_s": None,
-               "argv": plan["argv"]}
+               "argv": plan["argv"], "ffmpeg": plan["ffmpeg"], "version": vidfunnel.VERSION}
     temp = plan["part"]
     output_path = plan["output_path"]
     if _remove(temp):
@@ -1015,11 +1123,11 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
     return "refitted", None
 
 
-def _refit_dry_run(entries, stream):
+def _refit_dry_run(tools, entries, stream):
     total = len(entries)
     shown = 0
     for position, (key, folder, record) in enumerate(entries, 1):
-        plan, reason = refit_plan(record, folder)
+        plan, reason = refit_plan(tools, record, folder)
         if plan is None:
             say("[refit {}/{}] would skip '{}': {}".format(position, total, _label(record), reason), stream)
             continue
@@ -1052,11 +1160,12 @@ def refit_paths(tools, paths, options, progress=None):
     summary.lock_errors = []
     summary.skip_reasons = {}
     problems = []
+    refused = []
     say("scanning {} path(s) for records to refit".format(len(paths)), out)
-    entries = _collect(paths, out, problems)
+    entries = _collect(paths, out, problems, refused)
     summary.add("failed", len(problems))
     if getattr(options, "dry_run", False):
-        shown = _refit_dry_run(entries, out)
+        shown = _refit_dry_run(tools, entries, out)
         say("convert --refit: dry run, {} record(s) would be refitted; nothing written".format(shown), out)
         return summary
 
@@ -1066,6 +1175,8 @@ def refit_paths(tools, paths, options, progress=None):
                                      "not larger", "folder locked") else "other (reason printed above)"
         summary.skip_reasons[short] = summary.skip_reasons.get(short, 0) + 1
 
+    for reason in refused:
+        skipped(reason)
     selected = []
     for key, folder, record in entries:
         reason = refit_selection(record)
@@ -1173,8 +1284,13 @@ class _LineStream(object):
         return self.target.fileno()
 
 
-def _collect(paths, stream, problems):
-    """[(key, folder, record)] for every record under the PATHs, each once."""
+def _collect(paths, stream, problems, refused):
+    """[(key, folder, record)] for every record under the PATHs, each once.
+
+    A record whose source section cannot key it (plan.record_key_problem: a
+    source name with a directory part would name another folder's record)
+    is left out, its reason printed and appended to `refused`.
+    """
     found = []
     seen = set()
 
@@ -1198,6 +1314,11 @@ def _collect(paths, stream, problems):
                 continue
             entries = [(root.parent, record)]
         for folder, record in entries:
+            problem = record_key_problem(record)
+            if problem is not None:
+                say("skipping a record in '{}': {}".format(folder, problem), stream)
+                refused.append(problem)
+                continue
             key = record_key(folder, record)
             if str(key) in seen:
                 continue
@@ -1206,23 +1327,23 @@ def _collect(paths, stream, problems):
     return found
 
 
-def _dry_run(entries, options, stream):
+def _dry_run(tools, entries, options, stream):
+    """Print the commands convert would run, rendered here, and each skip reason; writes nothing."""
     total = len(entries)
     for position, (key, folder, record) in enumerate(entries, 1):
-        output_path = output_path_for(record, folder)
-        reason = skip_reason(record, output_path) or _refusal(record, folder, output_path)
+        output_path, rendered, reason = _conversion(tools, record, folder)
         if reason is not None:
             say("[convert {}/{}] would skip '{}': {}".format(position, total, _label(record), reason), stream)
             continue
         plan = record["stages"]["plan"]
-        argv = list(plan["argv"])
+        argv = list(rendered["argv"])
         argv[-1] = str(part_path(output_path, record.get("id")))
         say("[convert {}/{}] would {} '{}' -> '{}'".format(position, total, ACTION_WORDS[record["action"]],
                                                           _label(record), output_path.name), stream)
         say(shlex.join(argv), stream)
         say("  then rename to '{}'".format(output_path), stream)
-        for entry in plan.get("sidecars") or []:
-            say(shlex.join(entry.get("argv") or []), stream)
+        for entry in rendered["sidecars"]:
+            say(shlex.join(entry["argv"]), stream)
         redundancy = getattr(options, "par2", None)
         if redundancy is None:
             redundancy = plan.get("par2")
@@ -1292,9 +1413,11 @@ def convert_paths(tools, paths, options, progress=None):
     summary = StageSummary("convert", OUTCOMES)
     summary.lock_errors = []
     problems = []
+    refused = []
     say("scanning {} path(s) for records".format(len(paths)), out)
-    entries = _collect(paths, out, problems)
+    entries = _collect(paths, out, problems, refused)
     summary.add("failed", len(problems))
+    summary.add("skipped", len(refused))
     wanted = []
     left_alone = {}
     for entry in entries:
@@ -1309,7 +1432,7 @@ def convert_paths(tools, paths, options, progress=None):
                                                 for status, count in sorted(left_alone.items(),
                                                                             key=lambda item: str(item[0])))), out)
     if getattr(options, "dry_run", False):
-        _dry_run(wanted, options, out)
+        _dry_run(tools, wanted, options, out)
         say("convert: dry run, {} record(s) shown; nothing written".format(len(wanted)), out)
         return summary
 

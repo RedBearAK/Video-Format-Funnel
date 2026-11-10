@@ -3,6 +3,6 @@
 The design document is HANDOFF.md at the repository root.
 """
 
-VERSION = "20261109"
+VERSION = "20261109.1"
 
 # End of File #

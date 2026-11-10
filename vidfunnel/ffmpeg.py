@@ -7,7 +7,7 @@ same name pattern, so a pair of distrobox wrappers in a directory of their own
 works without shadowing the host's tools.
 """
 
-VERSION = "20261109"
+VERSION = "20261109.1"
 
 import hashlib
 import json
@@ -368,8 +368,9 @@ def configuration_sha256(configuration):
 def plan_identity(path, caps):
     """{'path', 'version', 'configuration_sha256'} of the ffmpeg at `path`, from its capabilities(). Pure.
 
-    What plan records under stages.plan.ffmpeg, so convert can tell whether
-    the ffmpeg named in the argv is still the build the plan was made with.
+    What plan records under stages.plan.ffmpeg (which ffmpeg made the
+    measurements; information only), and the shape of what current_identity
+    gives convert for stages.convert.ffmpeg.
     """
     return {"path": str(path), "version": (caps or {}).get("version") or "",
             "configuration_sha256": configuration_sha256((caps or {}).get("configuration"))}

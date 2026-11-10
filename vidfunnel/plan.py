@@ -1,9 +1,12 @@
-"""plan: probe and analyse each source, decide remux, re-encode or quarantine, build the exact ffmpeg argv.
+"""plan: probe and analyse each source, decide remux, re-encode or quarantine, preview the ffmpeg argv.
 
-HANDOFF.md sections 2, 3, 4.6 to 4.8, 5, 6.2, 6.7 and 6.10. `plan` writes the
+HANDOFF.md sections 2, 3, 4.6 to 4.8, 5, 6.2, 6.3, 6.7 and 6.10. `plan` writes the
 per-file record (one JSON file per source under the folder's '.vidfunnel/')
-holding the probe, the analysis, the decision with its reason and the argv
-that `convert` will run; it never writes media.
+holding the probe, the analysis and the decision with its reason; it never
+writes media. The ffmpeg commands are rendered from a record by
+render_record(), which convert calls at convert time with its own folder and
+ffmpeg (after record_value_problem() has checked the values it reads), and
+which plan calls for the preview it stores.
 
 What the record carries for the later stages:
 
@@ -15,14 +18,18 @@ What the record carries for the later stages:
   the members concatenated in order; for a DVD title read through the
   dvdvideo demuxer, of the disc's VIDEO_TS.IFO), whose first 16 hex digits
   are the identity tag's 'src';
-- stages.plan.argv: ffmpeg argv, argv[0] the ffmpeg path, every path
-  absolute, ending in the output path ('-f mp4' is explicit, so convert may
-  substitute its '.part' name for the last element);
+- stages.plan.argv: the ffmpeg argv as rendered on the planning machine,
+  argv[0] the ffmpeg path, every path absolute, ending in the output path;
+  a preview for report and for reading the record, which convert neither
+  runs nor reads (it renders its own, HANDOFF 6.3);
 - stages.plan.ffmpeg: {'path', 'version', 'configuration_sha256'} of the
-  ffmpeg the plan was made with (vidfunnel.ffmpeg.plan_identity), so convert
-  refuses to run the argv with a different build found at the same path;
-- stages.plan.sidecars: [{'path', 'argv', 'kind'}], one argv per subtitle
-  sidecar, each ending in its own output path;
+  ffmpeg the plan was made with (vidfunnel.ffmpeg.plan_identity), information
+  about the analysis that convert does not compare with its own ffmpeg;
+- stages.plan.sidecars: [{'path', 'argv', 'kind'}], one previewed argv per
+  subtitle sidecar, each ending in its own output path;
+- stages.plan.sidecars_skipped: names of text sidecars not written because a
+  file of that name that is not ours was there at plan time; convert leaves
+  them out too;
 - stages.plan.size_class ({'class', 'bits_per_pixel'}) and
   stages.plan.blockiness ({'score'}), an informational copy of the
   analysis values (convert --refit reads stages.analyze, not these);
@@ -49,10 +56,11 @@ analyze_input(), which runs the same passes with an input-argument list and
 returns the same dict shape, built from analyze's own pure rules.
 """
 
-VERSION = "20261109"
+VERSION = "20261109.1"
 
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -1224,10 +1232,10 @@ def _plan_one_locked(tools, work, options, folder_sources, capabilities, progres
                     _quarantine_claim(key, other, work.key.name, names["name"], stream)
             return outcome
 
-        output_path = work.folder / (names["interim_name"] or names["name"])
-        plan["argv"] = build_argv(tools, work.inputs, output_path, probe, analysis, action, options, record["id"],
-                                  record["source"]["sha256"], work.dvd_title)
-        plan["sidecars"] = sidecars
+        # The preview, rendered from the record as convert renders its commands (HANDOFF 6.2, 6.3).
+        rendered = render_record(tools, work.folder, dict(record, action=action), plan)
+        plan["argv"] = rendered["argv"]
+        plan["sidecars"] = rendered["sidecars"]
         plan.update(action=action, reason=reason, collision=None,
                     predicted_score=predicted_score(record["penalties"]))
         record["action"] = action
@@ -1313,6 +1321,329 @@ def _drop_foreign_text_sidecars(sidecars, ours):
         else:
             kept.append(entry)
     return kept, skipped
+
+
+# --- the commands from a record (plan's preview, convert's commands) -------------------
+#
+# convert renders its ffmpeg commands at convert time from the record, the folder the
+# record sits in and this machine's ffmpeg (HANDOFF 6.3); plan renders its preview the
+# same way, so the two cannot drift. Records travel on shares and may have been edited,
+# so before rendering convert checks that every value the rendering reads has the form
+# analyze and plan write (record_value_problem); a value of another form or type is a
+# reason to skip the record, never a traceback and never a part of a command.
+
+SOURCE_KINDS = ("file", "vob-group", "dvd-title")
+RECORD_ID_FORM = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+SHA256_FORM = re.compile(r"[0-9a-f]{64}")
+# analyze.decide_cadence: inverse telecine, or bwdif at the field or the frame rate.
+CADENCE_FILTER_FORM = re.compile(r"fieldmatch,decimate|bwdif=mode=[01]:parity=(?:-1|0|1)")
+# probe._fraction_text (ffprobe's r_frame_rate) and analyze._double_rate: 'N/D'.
+FRAME_RATE_FORM = re.compile(r"[1-9][0-9]{0,9}/[1-9][0-9]{0,9}")
+FPS_MULTIPLIERS = (0.8, 1.0, 2.0)
+# analyze.decide_pixelart: a 2x or 3x nearest-neighbour upscale.
+PIXELART_FILTER_FORM = re.compile(r"scale=iw\*([23]):ih\*\1:flags=neighbor")
+PIXELART_TUNES = ("animation",)
+# probe.parse_ratio and analyze._ratio_text: 'W:H', both parts positive.
+RATIO_FORM = re.compile(r"[1-9][0-9]{0,9}:[1-9][0-9]{0,9}")
+COLOUR_RANGES = ("tv",)
+# ffprobe's colour names, copied by analyze.decide_colour ('bt709', 'smpte170m', 'iec61966-2-1').
+COLOUR_NAME_FORM = re.compile(r"[a-z][a-z0-9-]{0,31}")
+AUDIO_ACTIONS = ("copy", "aac")
+# analyze.aac_bitrate ('192k', at most '448k') and analyze.decide_audio's chain.
+AUDIO_BITRATE_FORM = re.compile(r"[1-9][0-9]{0,3}k")
+AUDIO_FILTER_FORM = re.compile(r"aresample=async=1(?:,atempo=[0-9]{1,2}(?:\.[0-9]{1,6})?)?")
+OUTPUT_SUFFIX = ".mp4"
+
+
+class _ValueProblem(Exception):
+    """A record value that is not of the form the rendering takes; the message names the field."""
+
+
+def _shown(value):
+    if isinstance(value, str):
+        return "'{}'".format(value if len(value) <= 80 else value[:77] + "...")
+    text = repr(value)
+    return "{} (type {})".format(text if len(text) <= 80 else text[:77] + "...", type(value).__name__)
+
+
+def _fail(field, value, expected):
+    raise _ValueProblem("{} is {}, not {}".format(field, _shown(value), expected))
+
+
+def _plain_name(field, value):
+    separators = {"/", os.sep} | ({os.altsep} if os.altsep else set())
+    if (not isinstance(value, str) or value in ("", ".", "..") or "\0" in value
+            or any(separator in value for separator in separators)):
+        _fail(field, value, "a plain file name (no directory part, not empty, '.' or '..')")
+
+
+def _output_name(field, value):
+    _plain_name(field, value)
+    if not value.endswith(OUTPUT_SUFFIX) or value == OUTPUT_SUFFIX:
+        _fail(field, value, "a file name ending in '{}'".format(OUTPUT_SUFFIX))
+
+
+def _mapping(field, value, optional=True):
+    if value is None and optional:
+        return {}
+    if not isinstance(value, dict):
+        _fail(field, value, "an object")
+    return value
+
+
+def _sequence(field, value, optional=True):
+    if value is None and optional:
+        return []
+    if not isinstance(value, list):
+        _fail(field, value, "a list")
+    return value
+
+
+def _form(field, value, pattern, expected, optional=True):
+    if value is None and optional:
+        return
+    if not isinstance(value, str) or pattern.fullmatch(value) is None:
+        _fail(field, value, expected)
+
+
+def _choice(field, value, choices, optional=True):
+    if value is None and optional:
+        return
+    if not isinstance(value, str) or value not in choices:
+        _fail(field, value, "one of {}".format(", ".join("'{}'".format(choice) for choice in choices)))
+
+
+def _whole(field, value, lowest, highest=None, optional=False):
+    if value is None and optional:
+        return
+    if (not isinstance(value, int) or isinstance(value, bool) or value < lowest
+            or (highest is not None and value > highest)):
+        _fail(field, value, "a whole number from {}{}".format(
+            lowest, "" if highest is None else " to {}".format(highest)))
+
+
+def _finite(field, value, positive=False, optional=True):
+    if value is None and optional:
+        return
+    if (not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value)
+            or (positive and value <= 0)):
+        _fail(field, value, "a finite {}number".format("positive " if positive else ""))
+
+
+def _flag(field, value, optional=True):
+    if value is None and optional:
+        return
+    if not isinstance(value, bool):
+        _fail(field, value, "true or false")
+
+
+def _source_kind(source):
+    """source.kind, a missing one read as 'file' (as encode.record_key and verify read it)."""
+    return source.get("kind") or "file"
+
+
+def _check_key(record):
+    source = _mapping("source", record.get("source"), optional=False)
+    _choice("source.kind", source.get("kind"), SOURCE_KINDS)
+    _plain_name("source.name", source.get("name"))
+    if _source_kind(source) == "dvd-title":
+        _whole("source.dvd_title", source.get("dvd_title"), 1, DVD_TITLE_CAP)
+    return source
+
+
+def _check_names(record):
+    source = _check_key(record)
+    if _source_kind(source) == "vob-group":
+        members = _sequence("source.members", source.get("members"), optional=False)
+        if not members:
+            _fail("source.members", members, "a list of the group's VOB files")
+        for position, member in enumerate(members):
+            field = "source.members[{}]".format(position)
+            _plain_name(field + ".name", _mapping(field, member, optional=False).get("name"))
+    if _source_kind(source) == "dvd-title" and source.get("fingerprint_of") is not None:
+        _plain_name("source.fingerprint_of", source["fingerprint_of"])
+    output = _mapping("output", record.get("output"), optional=False)
+    _output_name("output.name", output.get("name"))
+    if output.get("interim_name") is not None:
+        _output_name("output.interim_name", output["interim_name"])
+
+
+def _analysis_result(analysis, name):
+    section = _mapping("stages.analyze." + name, analysis.get(name))
+    return _mapping("stages.analyze.{}.result".format(name), section.get("result"))
+
+
+def _check_values(record):
+    _check_names(record)
+    _form("id", record.get("id"), RECORD_ID_FORM, "a record ID (a UUID in lowercase hex)", optional=False)
+    _form("source.sha256", record["source"].get("sha256"), SHA256_FORM, "a SHA-256 in 64 lowercase hex digits",
+          optional=False)
+    stages = _mapping("stages", record.get("stages"), optional=False)
+    plan = _mapping("stages.plan", stages.get("plan"), optional=False)
+    _flag("stages.plan.plain_mp4", plan.get("plain_mp4"), optional=False)
+    _flag("stages.plan.mark_outputs", plan.get("mark_outputs"))
+    _whole("stages.plan.par2", plan.get("par2"), 1, optional=True)
+    output = record["output"]
+    for field, names in (("stages.plan.sidecars_skipped", plan.get("sidecars_skipped")),
+                         ("output.sidecars", output.get("sidecars")),
+                         ("output.interim_sidecars", output.get("interim_sidecars"))):
+        for position, name in enumerate(_sequence(field, names)):
+            _plain_name("{}[{}]".format(field, position), name)
+
+    probe = _mapping("stages.probe", stages.get("probe"), optional=False)
+    video = _mapping("stages.probe.video", probe.get("video"), optional=False)
+    _whole("stages.probe.video.index", video.get("index"), 0)
+    _whole("stages.probe.video.height", video.get("height"), 1, optional=True)
+    _finite("stages.probe.video.fps", video.get("fps"), positive=True)
+    _finite("stages.probe.video.avg_fps", video.get("avg_fps"), positive=True)
+    for position, stream in enumerate(_sequence("stages.probe.streams", probe.get("streams"))):
+        _mapping("stages.probe.streams[{}]".format(position), stream, optional=False)
+
+    analysis = _mapping("stages.analyze", stages.get("analyze"), optional=False)
+    cadence = _analysis_result(analysis, "cadence")
+    _form("stages.analyze.cadence.result.filter", cadence.get("filter"), CADENCE_FILTER_FORM,
+          "'fieldmatch,decimate' or 'bwdif=mode=M:parity=P'")
+    _choice("stages.analyze.cadence.result.level", cadence.get("level"), MAX_LEVELS)
+    _form("stages.analyze.cadence.result.output_fps", cadence.get("output_fps"), FRAME_RATE_FORM,
+          "a frame rate 'N/D'")
+    multiplier = cadence.get("fps_multiplier")
+    if multiplier is not None:
+        _finite("stages.analyze.cadence.result.fps_multiplier", multiplier)
+        if multiplier not in FPS_MULTIPLIERS:
+            _fail("stages.analyze.cadence.result.fps_multiplier", multiplier,
+                  "one of {}".format(", ".join(str(value) for value in FPS_MULTIPLIERS)))
+    pixelart = _analysis_result(analysis, "pixelart")
+    _form("stages.analyze.pixelart.result.filter", pixelart.get("filter"), PIXELART_FILTER_FORM,
+          "'scale=iw*N:ih*N:flags=neighbor' with N 2 or 3")
+    _choice("stages.analyze.pixelart.result.tune", pixelart.get("tune"), PIXELART_TUNES)
+    aspect = _analysis_result(analysis, "aspect")
+    for key in ("sar", "dar"):
+        _form("stages.analyze.aspect.result." + key, aspect.get(key), RATIO_FORM, "a ratio 'W:H'")
+    colour = _analysis_result(analysis, "colour")
+    _choice("stages.analyze.colour.result.range", colour.get("range"), COLOUR_RANGES)
+    for key in ("space", "primaries", "trc"):
+        _form("stages.analyze.colour.result." + key, colour.get(key), COLOUR_NAME_FORM,
+              "an ffmpeg colour name (lowercase letters, digits and '-')")
+
+    for position, decision in enumerate(_sequence("stages.analyze.audio", analysis.get("audio"))):
+        field = "stages.analyze.audio[{}]".format(position)
+        result = _mapping(field + ".result", _mapping(field, decision, optional=False).get("result"),
+                          optional=False)
+        _choice(field + ".result.action", result.get("action"), AUDIO_ACTIONS, optional=False)
+        _whole(field + ".result.index", result.get("index"), 0)
+        _form(field + ".result.bitrate", result.get("bitrate"), AUDIO_BITRATE_FORM, "a bitrate such as '192k'")
+        _form(field + ".result.filters", result.get("filters"), AUDIO_FILTER_FORM,
+              "'aresample=async=1', optionally followed by ',atempo=R'")
+    sync = _mapping("stages.analyze.sync", analysis.get("sync"))
+    for position, entry in enumerate(_sequence("stages.analyze.sync.result", sync.get("result"))):
+        field = "stages.analyze.sync.result[{}]".format(position)
+        entry = _mapping(field, entry, optional=False)
+        _whole(field + ".index", entry.get("index"), 0)
+        _finite(field + ".offset", entry.get("offset"))
+        _finite(field + ".measured_offset", entry.get("measured_offset"))
+    subtitles = _mapping("stages.analyze.subtitles", analysis.get("subtitles"))
+    for position, entry in enumerate(_sequence("stages.analyze.subtitles.result", subtitles.get("result"))):
+        _mapping("stages.analyze.subtitles.result[{}]".format(position), entry, optional=False)
+
+
+def record_key_problem(record):
+    """None when source.kind, source.name and (for a DVD title) source.dvd_title can key the record, else why.
+
+    The key (encode.record_key) is the folder joined with the source name, so
+    a name with a directory part would lead to another folder's record.
+    """
+    try:
+        _check_key(record)
+    except _ValueProblem as problem:
+        return str(problem)
+    return None
+
+
+def record_name_problem(record):
+    """None when every file name the record gives is a plain name in its folder, else the reason naming the field.
+
+    source.name, the VOB members, source.fingerprint_of of a DVD title,
+    output.name and output.interim_name (both ending in '.mp4').
+    """
+    try:
+        _check_names(record)
+    except _ValueProblem as problem:
+        return str(problem)
+    return None
+
+
+def record_value_problem(record):
+    """None when every value render_record reads has the form analyze and plan write, else the reason. Pure.
+
+    The names of record_name_problem, the record ID, the source SHA-256, the
+    plan's plain_mp4, mark_outputs, par2 and skipped sidecars, the sidecar
+    names, the probe's video index, height and frame rates, and the analysis
+    values that go into the command: the cadence filter, level, output rate
+    and multiplier, the pixel-art filter and tune, the aspect ratios, the
+    colour range and names, each audio decision (action, index, bitrate,
+    filter chain) and each sync entry (index and offsets). A filter chain is
+    accepted only in the exact forms analyze writes, so it cannot carry a
+    filter of its own (movie=, amovie=, or one appended after a ',').
+    """
+    try:
+        _check_values(record)
+    except _ValueProblem as problem:
+        return str(problem)
+    return None
+
+
+def record_inputs(folder, record):
+    """(input paths, dvd title or None) from the record's source section and the folder it sits in."""
+    source = record["source"]
+    folder = Path(os.path.abspath(os.fspath(folder)))
+    if _source_kind(source) == "vob-group":
+        return [str(folder / member["name"]) for member in source["members"]], None
+    if _source_kind(source) == "dvd-title":
+        return [str(folder / source["name"])], source["dvd_title"]
+    return [str(folder / source["name"])], None
+
+
+def render_record(tools, folder, record, plan=None):
+    """{'argv', 'sidecars', 'output_path'}: the ffmpeg commands of a planned record, rendered here.
+
+    Built from the record (probe, analysis, action, the plan's plain_mp4,
+    mark_outputs and sidecars_skipped, record ID, source SHA-256, the source
+    and output names), the folder the record sits in, and tools.ffmpeg. The
+    main argv ends in folder / (output.interim_name or output.name); the
+    sidecars are those of build_sidecar_argvs without the ones plan skipped,
+    under interim names when planned with --mark-outputs. `plan` is the plan
+    stage (default: stages.plan). Never reads stages.plan.argv or its
+    sidecars. The values are assumed checked (record_value_problem); raises
+    PlanError when a path cannot be expressed or when the sidecar names do
+    not match output.sidecars (or output.interim_sidecars).
+    """
+    stages = record["stages"]
+    plan = stages["plan"] if plan is None else plan
+    folder = Path(os.path.abspath(os.fspath(folder)))
+    inputs, dvd_title = record_inputs(folder, record)
+    output = record["output"]
+    output_path = folder / (output.get("interim_name") or output["name"])
+    options = types.SimpleNamespace(plain_mp4=bool(plan.get("plain_mp4")))
+    analysis = stages["analyze"]
+    argv = build_argv(tools, inputs, output_path, stages["probe"], analysis, record["action"], options,
+                      record["id"], record["source"]["sha256"], dvd_title)
+    final_path = folder / output["name"]
+    skipped = set(plan.get("sidecars_skipped") or [])
+    sidecars = [entry for entry in build_sidecar_argvs(tools, inputs, final_path, analysis, dvd_title)
+                if Path(entry["path"]).name not in skipped]
+    _match_sidecar_names("output.sidecars", output.get("sidecars"), sidecars)
+    if plan.get("mark_outputs") and output.get("interim_name"):
+        sidecars = interim_sidecars(sidecars, final_path, folder / output["interim_name"])
+        _match_sidecar_names("output.interim_sidecars", output.get("interim_sidecars"), sidecars)
+    return {"argv": argv, "sidecars": sidecars, "output_path": output_path}
+
+
+def _match_sidecar_names(field, recorded, sidecars):
+    names = [Path(entry["path"]).name for entry in sidecars]
+    if recorded is not None and list(recorded) != names:
+        raise PlanError("{} lists {} but the record's analysis gives {}; plan again with --replan".format(
+            field, ", ".join("'{}'".format(name) for name in recorded) or "none",
+            ", ".join("'{}'".format(name) for name in names) or "none"))
 
 
 def _collision_reason(collision, names, taken):
