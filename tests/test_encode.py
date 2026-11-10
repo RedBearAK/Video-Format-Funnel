@@ -8,7 +8,7 @@ ends at 'converted' or 'verified' depends on whether vidfunnel.verify is
 present, so both are accepted.
 """
 
-VERSION = "20261110.3"
+VERSION = "20261110.4"
 
 import argparse
 import contextlib
@@ -334,6 +334,25 @@ def write_bytes(path, content):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
     return path
+
+
+def write_named_files(test, folder, names):
+    """Write each name in names into folder, its own name as content, after checking no two names fold alike.
+
+    The names, and those already in folder, must differ under str.casefold():
+    on a case-insensitive file system (macOS by default) two names that differ
+    only in case are one file, so a look-alike would overwrite a stale file
+    and the test would check something else. This fails on every system.
+    """
+    seen = {}
+    for name in sorted(os.listdir(str(folder))) + list(names):
+        other = seen.get(name.casefold())
+        if other is not None:
+            test.fail("the fixture names '{}' and '{}' in '{}' are one file on a case-insensitive file "
+                      "system".format(other, name, folder))
+        seen[name.casefold()] = name
+    for name in names:
+        (Path(folder) / name).write_bytes(name.encode("utf-8"))
 
 
 def captured_record(folder, fixture, action, kind="file", stand_in=None):
@@ -1320,10 +1339,9 @@ class ConvertRunTest(unittest.TestCase):
                 ".h264_high_mkv_aac.mp4.{}.notes.part".format(id8),              # a user's file
                 ".h264_high_mkv_aac.mp4.{}.0123456789a.part".format(id8),        # token too short
                 ".h264_high_mkv_aac.mp4.{}.0123456789abc.part".format(id8),      # token too long
-                ".h264_high_mkv_aac.mp4.{}.0123456789AB.part".format(id8),       # wrong alphabet
+                ".h264_high_mkv_aac.mp4.{}.0123456789CD.part".format(id8),       # wrong alphabet
                 ".h264_high_mkv_aac.mp4.{}.0123456789xy.part".format(id8)]
-        for name in stale + kept:
-            (self.root / name).write_bytes(name.encode("utf-8"))
+        write_named_files(self, self.root, stale + kept)
         progress = quiet()
         stage = convert_one(TOOLS, self.root / REMUX_SOURCE, record, convert_options(), progress=progress)
         self.assertEqual(stage["outcome"], "ok", stage)
@@ -2024,10 +2042,9 @@ class ConvertRunTest(unittest.TestCase):
                  ".{}.{}.0123456789ab.part".format(sidecar, id8)]        # an earlier attempt
         kept = [".{}.{}.0123456789ab.part".format(sidecar, other_id[:8]),  # another record's
                 ".{}.{}.notes.part".format(sidecar, id8),                 # a user's file
-                ".{}.{}.0123456789AB.part".format(sidecar, id8),          # wrong alphabet
+                ".{}.{}.0123456789CD.part".format(sidecar, id8),          # wrong alphabet
                 ".{}.{}.0123456789a.part".format(sidecar, id8)]           # token too short
-        for name in stale + kept:
-            (self.root / name).write_bytes(name.encode("utf-8"))
+        write_named_files(self, self.root, stale + kept)
         progress = quiet()
         stage = convert_one(TOOLS, self.root / SUBTITLE_SOURCE, record, convert_options(), progress=progress)
         self.assertEqual(stage["outcome"], "ok", stage)
@@ -2188,14 +2205,13 @@ class ConvertRunTest(unittest.TestCase):
                  ".vidfunnel-part-{}-{}-fedcba987654.part".format(id8, name_hash)]
         kept = [".vidfunnel-part-{}-{}-0123456789ab.part".format(other_id8, name_hash),    # another record
                 ".vidfunnel-part-{}-{}-0123456789ab.part".format(id8, other_hash),         # another output
-                ".vidfunnel-part-{}-{}-0123456789AB.part".format(id8, name_hash),          # upper-case token
-                ".vidfunnel-part-{}-{}-0123456789ab.part".format(id8, name_hash.upper()),  # upper-case hash
+                ".vidfunnel-part-{}-{}-0123456789CD.part".format(id8, name_hash),          # upper-case token
+                ".vidfunnel-part-{}-{}-13579bdf2468.part".format(id8, name_hash.upper()),  # upper-case hash
                 ".vidfunnel-part-{}-{}-0123456789a.part".format(id8, name_hash),           # token too short
                 ".vidfunnel-part-{}-{}-0123456789ab.part".format(id8, name_hash[:15]),     # hash too short
                 "vidfunnel-part-{}-{}-0123456789ab.part".format(id8, name_hash),           # not hidden
                 ".vidfunnel-part-{}-{}-0123456789ab.part.bak".format(id8, name_hash)]
-        for name in stale + kept:
-            (self.root / name).write_bytes(name.encode("utf-8"))
+        write_named_files(self, self.root, stale + kept)
         progress = quiet()
         stage = convert_one(TOOLS, self.root / LONG_REMUX_SOURCE, record, convert_options(), progress=progress)
         text = progress.stream.getvalue()
@@ -2674,10 +2690,9 @@ class RefitRunTest(unittest.TestCase):
         id8 = load_record(self.root / REFIT_SOURCE)["id"][:8]
         stale = [".{}.{}.part".format(REFIT_OUTPUT, id8), ".{}.{}.0123456789ab.part".format(REFIT_OUTPUT, id8)]
         kept = [".{}.{}.notes.part".format(REFIT_OUTPUT, id8), ".{}.{}.0123456789a.part".format(REFIT_OUTPUT, id8),
-                ".{}.{}.0123456789AB.part".format(REFIT_OUTPUT, id8),
+                ".{}.{}.0123456789CD.part".format(REFIT_OUTPUT, id8),
                 ".{}.{}.0123456789ab.part".format(REFIT_OUTPUT, "a91c44d0" if id8 != "a91c44d0" else "0f2b6c1e")]
-        for name in stale + kept:
-            (self.root / name).write_bytes(name.encode("utf-8"))
+        write_named_files(self, self.root, stale + kept)
         summary, text = self.refit()
         self.assertEqual(summary.counts["refitted"], 1, text)
         for name in stale:
@@ -3550,15 +3565,14 @@ class Par2AttemptTest(unittest.TestCase):
                  ".vidfunnel-par2-{}-0123456789ab.vol000+01.par2".format(name_hash),
                  ".vidfunnel-par2-{}-fedcba987654.vol00+10.par2".format(name_hash)]
         kept = [".vidfunnel-par2-{}-0123456789ab.par2".format(other_hash),            # another output
-                ".vidfunnel-par2-{}-0123456789AB.par2".format(name_hash),             # upper-case token
-                ".vidfunnel-par2-{}-0123456789ab.par2".format(name_hash.upper()),     # upper-case hash
+                ".vidfunnel-par2-{}-0123456789CD.par2".format(name_hash),             # upper-case token
+                ".vidfunnel-par2-{}-13579bdf2468.par2".format(name_hash.upper()),     # upper-case hash
                 ".vidfunnel-par2-{}-0123456789a.par2".format(name_hash),              # token too short
                 ".vidfunnel-par2-{}-0123456789ab.par2".format(name_hash[:15]),        # hash too short
                 ".vidfunnel-par2-{}-0123456789ab.volume.par2".format(name_hash),
                 ".vidfunnel-part-0f2b6c1e-{}-0123456789ab.part".format(name_hash),    # a part file, not PAR2
                 "vidfunnel-par2-{}-0123456789ab.par2".format(name_hash)]              # not hidden
-        for name in stale + kept:
-            (self.folder / name).write_bytes(name.encode("utf-8"))
+        write_named_files(self, self.folder, stale + kept)
         patch, stems = self.stems_seen()
         progress = quiet()
         with patch:
@@ -3613,11 +3627,10 @@ class Par2AttemptTest(unittest.TestCase):
     def test_par2_files_of_earlier_attempts_are_removed_and_look_alikes_kept(self):
         stale = [".harbour.mp4.0123456789ab.par2", ".harbour.mp4.0123456789ab.vol000+01.par2",
                  ".harbour.mp4.fedcba987654.vol00+10.par2"]
-        kept = [".harbour.mp4.notes.par2", ".harbour.mp4.0123456789a.par2", ".harbour.mp4.0123456789AB.par2",
+        kept = [".harbour.mp4.notes.par2", ".harbour.mp4.0123456789a.par2", ".harbour.mp4.0123456789CD.par2",
                 ".harbour.mp4.0123456789ab.volume.par2", ".harbour.mp4.0123456789ab.par2.bak",
                 ".meadow.mp4.0123456789ab.par2", "harbour.mp4.0123456789ab.par2"]
-        for name in stale + kept:
-            (self.folder / name).write_bytes(name.encode("utf-8"))
+        write_named_files(self, self.folder, stale + kept)
         progress = quiet()
         files = write_par2(self.output, 5, progress=progress)
         text = progress.stream.getvalue()
@@ -3674,8 +3687,7 @@ class LeftoverPartTest(unittest.TestCase):
             kept = [".movie.mp4.0f2b6c1e.0123456789ab.part", ".movie.en.srt.0f2b6c1e.notes.part",
                     ".movie.en.srt.a91c44d0.0123456789ab.part", ".movie.en.srt.0f2b6c1e.0123456789abcd.part",
                     "movie.en.srt"]
-            for name in stale + kept:
-                (folder / name).write_bytes(name.encode("utf-8"))
+            write_named_files(self, folder, stale + kept)
             removed, problem = encode._clear_leftovers(folder / "movie.en.srt", FIRST_RECORD_ID)
             self.assertIsNone(problem)
             self.assertEqual(removed, sorted(stale))
@@ -3809,16 +3821,15 @@ class LongNameTest(unittest.TestCase):
                  ".vidfunnel-part-0f2b6c1e-{}-fedcba987654.part".format(name_hash)]
         kept = [".vidfunnel-part-a91c44d0-{}-0123456789ab.part".format(name_hash),     # another record
                 ".vidfunnel-part-0f2b6c1e-{}-0123456789ab.part".format(sidecar_hash),  # another output
-                ".vidfunnel-part-0F2B6C1E-{}-0123456789ab.part".format(name_hash),     # upper-case id
-                ".vidfunnel-part-0f2b6c1e-{}-0123456789ab.part".format(name_hash.upper()),
-                ".vidfunnel-part-0f2b6c1e-{}-0123456789AB.part".format(name_hash),
+                ".vidfunnel-part-0F2B6C1E-{}-2468ace13579.part".format(name_hash),     # upper-case id
+                ".vidfunnel-part-0f2b6c1e-{}-13579bdf2468.part".format(name_hash.upper()),
+                ".vidfunnel-part-0f2b6c1e-{}-0123456789CD.part".format(name_hash),
                 ".vidfunnel-part-0f2b6c1e-{}-0123456789abc.part".format(name_hash),    # token too long
                 ".vidfunnel-part-0f2b6c1e-{}0-0123456789ab.part".format(name_hash),    # hash too long
                 ".vidfunnel-part-0f2b6c1e-{}-0123456789ab.par2".format(name_hash),
                 ".vidfunnel-par2-{}-0123456789ab.par2".format(name_hash),
                 "vidfunnel-part-0f2b6c1e-{}-0123456789ab.part".format(name_hash)]       # not hidden
-        for name in stale + kept:
-            (self.folder / name).write_bytes(name.encode("utf-8"))
+        write_named_files(self, self.folder, stale + kept)
         removed, problem = encode._clear_leftovers(output, FIRST_RECORD_ID)
         self.assertIsNone(problem)
         self.assertEqual(removed, sorted(stale))
