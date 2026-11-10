@@ -508,7 +508,7 @@ python3 -m unittest discover -s tests
 
 `make_fixtures.sh` writes 39 short clips to `tests/fixtures/` (about 29 MB): XviD and H.264 AVI, FLV and SWF, WMV, MPEG-2 program streams with 4:3, 16:9, interlaced, telecined and PAL variants, DV, palette and RLE animation, QuickTime Animation, letterboxed 720×480 with square and 8:9 pixels, an audio offset, drift within and beyond tolerance, VFR, several audio codecs, subtitles and chapters, a damaged FLV, a 1080i transport stream, an MP4 source, a `movie.avi`/`movie.mkv` collision pair and loose VOB fragments without an IFO. `--force` remakes existing ones. It prints a SKIP line for the four cases ffmpeg cannot produce: a vector SWF, a FLIC file and a `VIDEO_TS` tree with an IFO.
 
-The rule tests run against probe and analysis JSON captured from the fixtures and committed under `tests/probe_json/` and `tests/analysis_json/`, so they need no ffmpeg. The integration tests that run ffmpeg or par2 skip themselves when the tool is not on PATH and say so.
+The rule tests run against probe and analysis JSON captured from the fixtures and committed under `tests/probe_json/` and `tests/analysis_json/`, so they need no ffmpeg. The integration tests that run ffmpeg or par2 skip themselves when the tool is not on PATH and say so. `sh tests/run_gate.sh` runs the same test modules in parallel processes, with the timing-sensitive ones afterwards one at a time, and finishes somewhat sooner.
 
 ## Known limits
 

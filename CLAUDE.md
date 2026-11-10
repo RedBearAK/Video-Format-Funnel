@@ -27,6 +27,8 @@ Test the metadata-tag round trip (HANDOFF §6.7 and §9) on the first remux that
 
 ## Testing
 
-`python3 -m unittest discover -s tests` must pass before any commit that touches the package. Integration tests that run ffmpeg are skipped automatically when ffmpeg is absent, and say so.
+`python3 -m unittest discover -s tests` must pass before any commit that touches the package. Integration tests that run ffmpeg are skipped automatically when ffmpeg is absent, and say so. That sequential command is the reference and is what CI runs.
+
+`sh tests/run_gate.sh` runs the same modules as separate processes: first the ones that are safe side by side, four at a time (`-j N` or `VIDFUNNEL_GATE_JOBS` changes that), then the timing-sensitive ones (signals, locks, grace periods; the list and reasons are in the script) one at a time, alone. It prints every failing module's output in full, exits non-zero on any failure, and may be used as the gate before a commit. On the 4-core iMac (2026-11-09, 1060 tests, 1 skip) the sequential command took about 11 minutes and the runner about 9 min 20 s; the timing-sensitive modules alone take about 5 min 20 s of that.
 
 # End of File #
