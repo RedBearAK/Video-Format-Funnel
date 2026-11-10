@@ -1,6 +1,6 @@
 """Tests for vidfunnel.record: paths, atomic saves, fingerprints, hashes, stages, lock."""
 
-VERSION = "20261109.4"
+VERSION = "20261110"
 
 import datetime
 import errno
@@ -1702,11 +1702,7 @@ class HeartbeatTests(TempDirCase):
         with mock.patch("vidfunnel.record._warn", side_effect=lines.append):
             lock = self.judge()
             self.wait_until(lambda: lock.beat.count >= 2, 5, "the holder never beat")
-            os.unlink(str(self.lock_file()))
-            winner = {"host": "winnerhost", "pid": 999, "started": "2026-11-09T12:00:00Z",
-                      "heartbeat": {"interval": 300}}
-            write_bytes(self.lock_file(), json.dumps(winner).encode("utf-8"))
-            taken = self.lock_file().read_bytes()
+            taken = self.replace_lock()
             self.wait_until(vidfunnel.interrupt.draining.is_set, 5, "the holder did not drain")
             self.wait_until(lambda: lines, 5, "the lost lock was not reported")  # printed after the drain
         self.assertEqual(len(lines), 1, lines)
@@ -1741,12 +1737,75 @@ class HeartbeatTests(TempDirCase):
             self.addCleanup(patch.stop)
         return clock
 
+    WINNER = {"host": "winnerhost", "pid": 999, "started": "2026-11-09T12:00:00Z", "heartbeat": {"interval": 300}}
+
     def replace_lock(self):
-        os.unlink(str(self.lock_file()))
-        winner = {"host": "winnerhost", "pid": 999, "started": "2026-11-09T12:00:00Z",
-                  "heartbeat": {"interval": 300}}
-        write_bytes(self.lock_file(), json.dumps(winner).encode("utf-8"))
+        """Put another run's lock at the lock path in one rename, so no look at the path finds it missing.
+
+        A real takeover unlinks the lock and then creates its own, so the path
+        is missing for a moment; a beat polling during that moment says 'gone'
+        and cannot name the new holder. Tests of that sequence unlink and write
+        in two steps on purpose (test_a_holder_whose_lock_is_gone_...).
+        """
+        staged = self.base / RECORD_DIR / "replacement-lock.tmp"
+        write_bytes(staged, json.dumps(self.WINNER).encode("utf-8"))
+        os.replace(str(staged), str(self.lock_file()))
         return self.lock_file().read_bytes()
+
+    def test_a_holder_whose_lock_is_gone_before_the_new_one_appears_drains_and_leaves_the_new_lock(self):
+        """A takeover's unlink seen before its create: the run drains, writes nothing, and keeps off the new lock."""
+        from vidfunnel.record import LockLost, lock_problem
+        self.fast_beats()
+        source = self.base / "clip.avi"
+        lines = []
+        with mock.patch("vidfunnel.record._warn", side_effect=lines.append):
+            lock = self.judge()
+            self.wait_until(lambda: lock.beat.count >= 2, 5, "the holder never beat")
+            os.unlink(str(self.lock_file()))
+            self.wait_until(vidfunnel.interrupt.draining.is_set, 5, "the holder did not drain")
+            self.wait_until(lambda: lines, 5, "the lost lock was not reported")
+            write_bytes(self.lock_file(), json.dumps(self.WINNER).encode("utf-8"))
+            taken = self.lock_file().read_bytes()
+            self.assertIn("was taken over by another run", lock_problem(self.base))
+            with self.assertRaises(LockLost):
+                save_record(source, {"id": "after"})
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("lost the lock of folder '{}': its lock file is gone".format(self.base), lines[0])
+        self.assertNotIn("holds it now", lines[0])
+        self.assertEqual(vidfunnel.interrupt.drain_tally.lost_locks, [str(self.base)])
+        self.assertFalse(record_path(source).exists())
+        beats = lock.beat.count
+        time.sleep(0.2)  # ten intervals: no further beat
+        self.assertEqual(lock.beat.count, beats)
+        warnings = []
+        lock.warn = warnings.append
+        lock.release()
+        self.assertEqual(self.lock_file().read_bytes(), taken)
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("was taken over by another run; left in place", warnings[0])
+
+    def test_a_release_that_finds_the_lock_path_missing_leaves_the_lock_created_just_after(self):
+        """No beat has looked yet; release's own look finds the path missing, and the new lock appears at once."""
+        lock = self.judge()  # the default interval: no beat during this test
+        os.unlink(str(self.lock_file()))
+        real_stat = os.stat
+        created = []
+
+        def stat_then_create(path, *rest, **values):
+            try:
+                return real_stat(path, *rest, **values)
+            finally:
+                if os.fspath(path) == str(self.lock_file()) and not created:
+                    created.append(write_bytes(self.lock_file(), json.dumps(self.WINNER).encode("utf-8")))
+
+        warnings = []
+        lock.warn = warnings.append
+        with mock.patch("vidfunnel.record.os.stat", side_effect=stat_then_create):
+            lock.release()
+        self.assertEqual(len(created), 1, "release never looked at the lock path")
+        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), self.WINNER)
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("no longer holds this run's entry; left in place", warnings[0])
 
     def test_after_a_suspend_a_taken_lock_is_found_at_the_next_poll(self):
         clock = self.stepping_clock()
