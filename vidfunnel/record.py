@@ -68,12 +68,23 @@ HEARTBEAT_POLL_SECONDS = 1.0         # the heartbeat thread looks for released l
 # A poll whose wall clock moved this much more than its monotonic clock follows a suspend: beat every lock now.
 # Well above the poll interval and scheduling delays, well below HEARTBEAT_STALE_SECONDS.
 HEARTBEAT_WAKE_GAP_SECONDS = 30
+# A lock's last beat may sit this far ahead of the share's clock (attribute rounding) and still be judged by it;
+# further ahead, the share's clock cannot judge that lock and the 24 h rule applies.
+HEARTBEAT_AHEAD_SECONDS = 5
 HEARTBEAT_FIELD = "heartbeat"        # the lock JSON field that says its holder beats
 PROBE_PREFIX = "lock.probe."         # probe files that read the share's clock: 'lock.probe.<uuid4 hex>'
 
 
 class RecordError(Exception):
     """A record or folder file exists but cannot be read or parsed."""
+
+
+class LockLost(Exception):
+    """This process's lock of a folder was taken over by another run, or could not be checked (see ensure_lock).
+
+    Raised before anything more of an item is written in that folder; the
+    stages count the item as skipped with this message.
+    """
 
 
 class LockHeld(Exception):
@@ -167,7 +178,12 @@ def load_record(source):
 
 
 def save_record(source, record):
-    """Write the record of a source atomically, creating '.vidfunnel/' when needed."""
+    """Write the record of a source atomically, creating '.vidfunnel/' when needed.
+
+    LockLost, and nothing written, when this process held the folder's lock
+    and another run has taken it over, or it cannot be checked (ensure_lock).
+    """
+    ensure_lock(Path(source).parent)
     _write_json_atomic(record_path(source), record)
 
 
@@ -542,7 +558,8 @@ def load_folder(folder):
 
 
 def save_folder(folder, data):
-    """Write '.vidfunnel/folder.json' atomically."""
+    """Write '.vidfunnel/folder.json' atomically; LockLost, and nothing written, as for save_record."""
+    ensure_lock(folder)
     _write_json_atomic(record_dir(folder) / FOLDER_FILE, data)
 
 
@@ -678,6 +695,7 @@ class _Beat:
 
 
 _beats = []          # the _Beat of every lock this process holds and still beats; under _held_locks_guard
+_folder_beats = {}   # os.path.abspath(folder) -> its _Beat while this process holds that lock, lost or not; same guard
 _beat_thread = None  # the heartbeat thread while one runs; under _held_locks_guard
 
 
@@ -844,7 +862,7 @@ def _lose_lock(beat, words):
     missing in that moment has not lost the lock.
     """
     with _held_locks_guard:
-        if beat.released:
+        if beat.released or beat.lost:  # released: see above; lost: another thread has already said so
             return
         beat.lost = True
         if beat in _beats:
@@ -860,6 +878,46 @@ def _lose_lock(beat, words):
     holder_words = "; host '{}' holds it now".format(host) if host is not None else ""
     _warn("vidfunnel: lost the lock of folder '{}': {}{}; finishing the items in progress, starting no "
           "more".format(beat.folder, words, holder_words))
+
+
+def _folder_key(folder):
+    return os.path.abspath(os.fspath(folder))
+
+
+def lock_problem(folder):
+    """None when this process may write in `folder`, else why not; checked now, on the calling thread.
+
+    None also when this process holds no lock of `folder` (nothing to lose).
+    Otherwise the same identity check as the heartbeat's (_lock_state: one
+    stat of the lock path, one fstat of the held descriptor) runs at once.
+    A lock found taken is handled as the heartbeat thread would (marked
+    lost, the run drained, one line on stderr); a lock already marked lost
+    answers without a look. A check that cannot decide (the share cannot be
+    reached) is not safe either: its reason says the lock could not be
+    checked.
+    """
+    with _held_locks_guard:
+        beat = _folder_beats.get(_folder_key(folder))
+        if beat is None:
+            return None
+        lost = beat.lost
+    if not lost:
+        state = _lock_state(beat)
+        if state is None:
+            return None
+        if state[0] != "lost":
+            return ("the lock of folder '{}' could not be checked ({}); nothing more of this item is written "
+                    "there".format(beat.folder, state[1]))
+        _lose_lock(beat, state[1])
+    return "the lock of folder '{}' was taken over by another run; nothing more of this item is written there".format(
+        beat.folder)
+
+
+def ensure_lock(folder):
+    """Raise LockLost when lock_problem(folder) finds a reason not to write in `folder`."""
+    problem = lock_problem(folder)
+    if problem is not None:
+        raise LockLost(problem)
 
 
 def _share_clock_ns(directory):
@@ -1169,11 +1227,14 @@ class FolderLock:
             with _held_locks_guard:
                 _held_locks[handle] = (status.st_dev, status.st_ino)
                 _start_beating(beat)
+                _folder_beats[_folder_key(self.folder)] = beat
         except BaseException:
             with _held_locks_guard:
                 _held_locks.pop(handle, None)
                 if beat in _beats:
                     _beats.remove(beat)
+                if _folder_beats.get(_folder_key(self.folder)) is beat:
+                    del _folder_beats[_folder_key(self.folder)]
             try:
                 os.unlink(str(self.path))
             except OSError:
@@ -1244,15 +1305,24 @@ class FolderLock:
                     and holder_in_container == content["container"] and pid != content["pid"]):
                 liveness = pid_alive(pid)
             beat_age = None    # seconds since the holder's last beat, on the share's clock
-            clock_error = None
+            clock_doubt = None  # why the share's clock cannot judge this heartbeat lock
             rule_age = age     # what the 24 h rule compares
             if judgement is None and not rebooted and liveness is not False and _claims_heartbeat(holder):
                 try:
                     beat_age = (_share_clock_ns(record_dir(self.folder)) - judged[2]) / 1e9
                 except OSError as error:
-                    clock_error = error
-                    # The lock's last beat on our clock: a beating holder is never older than its beat.
-                    rule_age = min(age, time.time() - judged[2] / 1e9)
+                    clock_doubt = "no probe file can be created in '{}' to read the share's clock ({})".format(
+                        record_dir(self.folder), error)
+                else:
+                    if beat_age < -HEARTBEAT_AHEAD_SECONDS:  # stamped in the share's future: its clock stepped back
+                        clock_doubt = "its last beat is {:.0f} s ahead of the share's clock".format(-beat_age)
+                        beat_age = None
+                if clock_doubt is not None:
+                    # The 24 h rule on the younger of start and last beat on our clock (a beating holder is never
+                    # older than its beat); a last beat ahead of our clock too cannot shorten the age.
+                    beat_here = time.time() - judged[2] / 1e9
+                    if beat_here >= -HEARTBEAT_AHEAD_SECONDS:
+                        rule_age = min(age, beat_here)
             if judgement == "free":
                 warning = ("warning: taking over lock '{}': its holder, {} '{}' pid {}, has exited (nothing "
                            "holds the lock file's flock; lock written {} s ago)".format(
@@ -1268,7 +1338,7 @@ class FolderLock:
                 raise self._held(holder, age, "{}its holder last beat {:.0f} s ago on the share's clock; taken over "
                                  "once it has been silent for {:.0f} s".format(
                                      "its pid {} is running here and ".format(pid) if liveness is True else "",
-                                     beat_age, HEARTBEAT_STALE_SECONDS))
+                                     max(0.0, beat_age), HEARTBEAT_STALE_SECONDS))
             elif beat_age is not None and liveness is True and age < self.stale_seconds:
                 raise self._held(holder, age, "its pid {} is running here, although its holder last beat {:.0f} s "
                                  "ago on the share's clock; taken over once 24 h old".format(pid, beat_age))
@@ -1286,17 +1356,16 @@ class FolderLock:
                            "recorded), whose pid cannot be checked from here; taken over once 24 h old")
                 else:
                     why = _unjudged_reason(host, holder_in_container, content, pid)
-                if clock_error is not None:
-                    why += ("; its heartbeat cannot be judged, since no probe file can be created in '{}' to read "
-                            "the share's clock ({}), so the 24 h rule applies to its last beat".format(
-                                record_dir(self.folder), clock_error))
+                if clock_doubt is not None:
+                    why += "; its heartbeat cannot be judged, since {}, so the 24 h rule applies to its last beat".format(
+                        clock_doubt)
                 raise self._held(holder, age, why)
-            elif clock_error is not None:
-                warning = ("warning: taking over stale lock '{}' held by {} '{}' pid {} since {}: no probe file can "
-                           "be created in '{}' to read the share's clock ({}), so the 24 h rule decided on the "
-                           "younger of its start and its last beat, {:.1f} h ago on this machine's clock{}".format(
-                               self.path, holder_words, host, pid, holder.get("started"), record_dir(self.folder),
-                               clock_error, rule_age / 3600.0,
+            elif clock_doubt is not None:
+                warning = ("warning: taking over stale lock '{}' held by {} '{}' pid {} since {}: {}, so the 24 h "
+                           "rule decided on the younger of its start and its last beat, {:.1f} h ago on this "
+                           "machine's clock{}".format(
+                               self.path, holder_words, host, pid, holder.get("started"), clock_doubt,
+                               rule_age / 3600.0,
                                "; its pid is running here, taken for a reused one" if liveness is True else ""))
             else:
                 warning = "warning: taking over stale lock '{}' held by {} '{}' pid {} since {} ({:.1f} h ago{})".format(
@@ -1398,6 +1467,8 @@ class FolderLock:
                 beat.released = True
                 if beat in _beats:
                     _beats.remove(beat)
+                if _folder_beats.get(_folder_key(self.folder)) is beat:
+                    del _folder_beats[_folder_key(self.folder)]
                 lost = beat.lost
         try:
             if lost:

@@ -62,7 +62,7 @@ checks them (plan.record_value_problem), in verify_record before any file
 is read, and a record that fails is refused the same way.
 """
 
-VERSION = "20261109.3"
+VERSION = "20261109.4"
 
 import json
 import os
@@ -83,6 +83,7 @@ from vidfunnel.record import (
     RECORD_DIR,
     FolderLock,
     LockHeld,
+    LockLost,
     RecordError,
     add_flag,
     add_stage,
@@ -861,6 +862,12 @@ def run(args):
                     except RecordRefused as error:
                         # Changed on disk since it was collected; left as it is.
                         say("skipping '{}': {}".format(key.name, error), item.stream)
+                        summary.add("skipped")
+                        drain_after_item()
+                        continue
+                    except LockLost as lost:
+                        # Another run took the folder over: the record is not saved.
+                        say("skipping '{}': {}".format(key.name, lost), item.stream)
                         summary.add("skipped")
                         drain_after_item()
                         continue

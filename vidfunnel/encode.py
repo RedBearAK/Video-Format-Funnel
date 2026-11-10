@@ -111,15 +111,18 @@ from vidfunnel.record import (
     RECORD_DIR,
     FolderLock,
     LockHeld,
+    LockLost,
     RecordError,
     add_flag,
     add_stage,
     cheap_fingerprint,
     check_source,
     fingerprint_matches,
+    ensure_lock,
     held_lock_fds,
     iter_records,
     load_record,
+    lock_problem,
     mtime_difference,
     record_path,
     save_record,
@@ -425,6 +428,12 @@ def _remove(path):
         return False
 
 
+def _remove_if_ours(path, folder):
+    """_remove(path) unless the folder's lock is found taken (or cannot be checked): the path may be another run's."""
+    if folder is None or lock_problem(folder) is None:
+        _remove(path)
+
+
 def _clear_leftover(temp):
     """Unlink a part file left by an earlier run before a new one is written: (removed, None) or (False, reason).
 
@@ -529,8 +538,12 @@ def _par2_files(output_path):
     return found
 
 
-def _write_sidecars(sidecars, record_id, stream, verbose):
-    """Run each rendered sidecar argv to its own part file and rename; (names written, [error dicts], argvs run)."""
+def _write_sidecars(sidecars, record_id, stream, verbose, folder=None):
+    """Run each rendered sidecar argv to its own part file and rename; (names written, [error dicts], argvs run).
+
+    With `folder`, LockLost before each part file is cleared and each rename,
+    and no part file is removed once the folder's lock is found taken.
+    """
     written = []
     errors = []
     started = []
@@ -548,6 +561,8 @@ def _write_sidecars(sidecars, record_id, stream, verbose):
         say("  writing sidecar '{}' ({})".format(final.name, entry.get("kind")), stream)
         if verbose:
             say("  " + shlex.join(argv), stream)
+        if folder is not None:
+            ensure_lock(folder)
         _removed, problem = _clear_leftover(temp)
         if problem is not None:
             errors.append({"path": final.name, "error": problem})
@@ -556,6 +571,8 @@ def _write_sidecars(sidecars, record_id, stream, verbose):
         started.append(argv)
         try:
             run_tool(argv)
+            if folder is not None:
+                ensure_lock(folder)
             os.replace(str(temp), str(final))
             written.append(final.name)
         except (FfmpegError, ToolNotFound, OSError) as error:
@@ -563,7 +580,7 @@ def _write_sidecars(sidecars, record_id, stream, verbose):
                            "stderr": _tail(getattr(error, "stderr", None))})
             say("  sidecar '{}' failed: {}".format(final.name, error), stream)
         finally:
-            _remove(temp)
+            _remove_if_ours(temp, folder)
     return written, errors, started
 
 
@@ -604,9 +621,18 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
     stream, quiet, verbose = _stream_of(progress)
     verbose = verbose or bool(getattr(options, "verbose", False))
     key = Path(os.path.abspath(os.fspath(source)))
-    folder = key.parent
     label = _label(record)
+    try:
+        return _convert_one(tools, key, record, options, progress, stream, quiet, verbose, label)
+    except LockLost as lost:
+        # Another run took the folder over: nothing more of this item is renamed, removed or saved there.
+        say("skipping '{}': {}".format(label, lost), stream)
+        return {"outcome": "skipped", "skipped": str(lost)}
 
+
+def _convert_one(tools, key, record, options, progress, stream, quiet, verbose, label):
+    """convert_one's work; LockLost as soon as the folder's lock is found taken before a write (ensure_lock)."""
+    folder = key.parent
     output_path, rendered, reason = _conversion(tools, record, folder)
     if reason is not None:
         say("skipping '{}': {}".format(label, reason), stream)
@@ -653,8 +679,12 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
     try:
         with Progress(action_word, total=duration, unit="s", stream=stream, quiet=quiet) as live:
             completed = run_tool(argv, progress=ffmpeg_progress_callback(live, duration))
+        # A host that took the folder over meanwhile may have started this record into this part path:
+        # nothing is renamed, removed or saved unless the lock is still ours.
+        ensure_lock(folder)
         os.replace(str(temp), str(output_path))
     except (FfmpegError, ToolNotFound, OSError) as error:
+        ensure_lock(folder)
         _remove(temp)
         stage = {"outcome": "failed", "error": str(error), "returncode": getattr(error, "returncode", None),
                  "stderr": _tail(getattr(error, "stderr", None))}
@@ -665,13 +695,14 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
         say("failed: '{}': {}".format(label, error), stream)
         return record["stages"]["convert"]
     finally:
-        _remove(temp)
+        _remove_if_ours(temp, folder)
     elapsed = time.monotonic() - started
     # The encode is done: a 'now' stop file no longer cuts this item at its sidecar or PAR2
     # child starts, which would throw the finished encode away; it applies again at verify.
     item_folder = forget_item()
 
     first_source = _source_files(folder, record)[0][0]
+    ensure_lock(folder)
     try:
         source_mtime = os.stat(str(first_source)).st_mtime_ns
         os.utime(str(output_path), ns=(os.stat(str(output_path)).st_atime_ns, source_mtime))
@@ -700,7 +731,7 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
         say("  source size unknown; the size rule could not be applied to '{}'".format(output_path.name), stream)
 
     sidecars_written, sidecar_errors, ran["sidecar_argvs"] = _write_sidecars(rendered["sidecars"], record.get("id"),
-                                                                             stream, verbose)
+                                                                             stream, verbose, folder)
     if sidecar_errors:
         add_flag(record, "sidecar-failed")
 
@@ -715,6 +746,7 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
             say("  PAR2 asked for ({} %) but 'par2' is not on PATH; skipped for '{}'".format(
                 redundancy, output_path.name), stream)
         else:
+            ensure_lock(folder)
             try:
                 par2_files = [path.name for path in write_par2(output_path, redundancy, progress)]
             except OSError as error:
@@ -740,6 +772,7 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
     say("  converted '{}' ({} bytes, {:.0f} % of the source) in {:.1f} s".format(
         output_path.name, output_size, 100.0 * ratio if ratio is not None else 0.0, elapsed), stream)
     remember_item(item_folder)
+    ensure_lock(folder)
     _verify(tools, key, record, options, progress, stream)
     return record["stages"]["convert"]
 
@@ -1094,9 +1127,13 @@ def refit_one(tools, source, record, options, progress=None, position=None, tota
     duration = expected_duration(record)
     try:
         return _refit_attempt(tools, key, record, options, progress, plan, attempt, label, started, duration)
+    except LockLost as lost:
+        # Another run took the folder over: nothing more of this item is renamed, removed or saved there.
+        say("skipping '{}': {}".format(label, lost), stream)
+        return "skipped", str(lost)
     finally:
         # Gone after a replace or a removal; this catches an exception between the encode and either.
-        _remove(temp)
+        _remove_if_ours(temp, folder)
 
 
 def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, started, duration):
@@ -1110,6 +1147,7 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
         with Progress("refit", total=duration, unit="s", stream=stream, quiet=quiet) as live:
             completed = run_tool(plan["argv"], progress=ffmpeg_progress_callback(live, duration))
     except (FfmpegError, ToolNotFound, OSError) as error:
+        ensure_lock(folder)
         _remove(temp)
         attempt["elapsed_s"] = round(time.monotonic() - started, 3)
         add_stage(record, "refit", dict({"attempt": attempt, "outcome": "failed", "error": str(error),
@@ -1117,6 +1155,9 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
         save_record(key, record)
         say("failed: refit of '{}': {}; the existing output is kept".format(label, error), stream)
         return "failed", str(error)
+    # A host that took the folder over meanwhile may have started this record into this part path:
+    # nothing is done with the result unless the lock is still ours.
+    ensure_lock(folder)
     attempt["elapsed_s"] = round(time.monotonic() - started, 3)
     attempt["ffmpeg_stderr"] = _tail(completed.stderr)
     # The encode is done: a 'now' stop file no longer cuts this item at the checks' ffprobe or
@@ -1139,6 +1180,7 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
     result_words = "{} -> {}".format(_refit_words(plan),
                                      "?" if attempt["ratio"] is None else "{:.2f}".format(attempt["ratio"]))
     if problem is not None:
+        ensure_lock(folder)
         _remove(temp)
         add_stage(record, "refit", dict({"attempt": attempt, "outcome": "kept-existing", "reason": problem},
                                         **plan["mtime_notes"]))
@@ -1148,9 +1190,11 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
             label, result_words, problem, FIT_CAPPED_FLAG), stream)
         return "kept", problem
 
+    ensure_lock(folder)
     try:
         os.replace(str(temp), str(output_path))
     except OSError as error:
+        ensure_lock(folder)
         _remove(temp)
         add_stage(record, "refit", dict({"attempt": attempt, "outcome": "failed",
                                          "error": "could not replace '{}': {}".format(output_path.name, error)},
@@ -1163,6 +1207,7 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
     # record and is saved before the slow PAR2 step, so an interrupt there leaves a
     # record that says what happened (a convert PAR2 set is then stale, see below).
     first_source = _source_files(folder, record)[0][0]
+    ensure_lock(folder)
     try:
         source_mtime = os.stat(str(first_source)).st_mtime_ns
         os.utime(str(output_path), ns=(os.stat(str(output_path)).st_atime_ns, source_mtime))
@@ -1196,6 +1241,7 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
     save_record(key, record)
 
     if redundancy:
+        ensure_lock(folder)
         if shutil.which("par2") is None:
             for path in stale_par2:
                 _remove(path)
@@ -1216,6 +1262,7 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
         "" if new_size <= plan["source_size"] else "; still larger than the source, '{}' kept".format(
             OUTPUT_LARGER_FLAG)), stream)
     remember_item(item_folder)
+    ensure_lock(folder)
     _verify(tools, key, record, options, progress, stream)
     if record.get("status") == "failed":
         return "failed", "verify failed after the refit"

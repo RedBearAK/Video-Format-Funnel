@@ -57,6 +57,7 @@ from vidfunnel.progress import Progress, StageSummary, is_tty, say
 from vidfunnel.record import (
     FolderLock,
     LockHeld,
+    LockLost,
     RecordError,
     add_flag,
     band,
@@ -70,6 +71,7 @@ from vidfunnel.record import (
     save_record,
     set_status,
     sha256_file,
+    ensure_lock,
 )
 from vidfunnel.stopfile import forget_item
 
@@ -500,7 +502,13 @@ def _redo_par2(record, interim_path, final_path, quiet):
 
 
 def _retire_member(source, destination, quiet):
-    """Unlink source (destination None) or move it to destination; return 'unlink', 'rename' or 'copy'."""
+    """Unlink source (destination None) or move it to destination; return 'unlink', 'rename' or 'copy'.
+
+    LockLost, and nothing moved or unlinked, when the folder's lock was
+    taken over by another run or cannot be checked (checked now, not at the
+    next heartbeat).
+    """
+    ensure_lock(source.parent)
     if destination is None:
         os.unlink(str(source))
         return "unlink"
@@ -908,6 +916,11 @@ def _retire_candidate(candidate, prefix, quarantine_dir, destroy, allow_review, 
                            destroy=destroy, allow_review=allow_review, quiet=quiet, allow_larger=allow_larger)
     except RetireRefused as refusal:
         _refused(prefix, candidate, refusal, summary)
+        return
+    except LockLost as lost:
+        _error("{} '{}' skipped: {}".format(prefix, candidate.display, lost))
+        summary.add("skipped (lock taken)")
+        problems.append(str(lost))
         return
     except (OSError, RecordError, ValueError) as error:
         _error("'{}': {}".format(candidate.display, error))

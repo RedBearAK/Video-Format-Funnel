@@ -933,6 +933,66 @@ class RunTests(RetireCase):
         self.assertIn("1 retired", out.getvalue())
         self.assertIn("1 skipped (locked)", out.getvalue())
 
+    def take_over(self, folder):
+        """Host B takes `folder` over: its lock file is replaced under this run."""
+        lock_file = folder / ".vidfunnel" / "lock"
+        os.unlink(str(lock_file))
+        lock_file.write_text(json.dumps({"host": "hostb", "pid": 4242, "started": "2026-11-09T12:00:00Z",
+                                         "heartbeat": {"interval": 300}}), encoding="utf-8")
+
+    def assert_nothing_retired_after_the_takeover(self, before, records, result, out, err):
+        from vidfunnel.cli import EXIT_ERROR
+        self.assertEqual(result, EXIT_ERROR)
+        after = snapshot(self.root)
+        for name in list(after):
+            if name.endswith(os.path.join(".vidfunnel", "lock")):
+                del after[name]
+                before.pop(name, None)
+        self.assertEqual(after, before, "a source was moved or deleted, or a record saved, after the takeover")
+        self.assertTrue(self.beach_source.is_file())
+        self.assertTrue(self.meeting_source.is_file())
+        self.assertEqual({path: path.read_bytes() for path in records}, records)
+        self.assertIn("2 skipped (lock taken)", out.getvalue())
+        self.assertIn("was taken over by another run", err.getvalue())
+
+    def lost_lock_setup(self):
+        import vidfunnel.interrupt
+        self.addCleanup(vidfunnel.interrupt.draining.clear)
+        self.addCleanup(vidfunnel.interrupt.drain_tally.reset)
+        patch = mock.patch("vidfunnel.record._warn")
+        patch.start()
+        self.addCleanup(patch.stop)
+        records = [record_module.record_path(self.beach_source), record_module.record_path(self.meeting_source)]
+        return snapshot(self.root), {path: path.read_bytes() for path in records}
+
+    def test_run_moves_nothing_after_the_folder_lock_was_taken(self):
+        before, records = self.lost_lock_setup()
+        real_fresh = retire._fresh_record
+
+        def taken_then_read(candidate):
+            self.take_over(candidate.folder)
+            return real_fresh(candidate)
+
+        out, err = self.quietly()
+        with mock.patch.object(retire, "_fresh_record", side_effect=taken_then_read), \
+                mock.patch.object(retire, "drain_before_next", return_value=False):
+            result = run(self.namespace(str(self.root)))
+        self.assert_nothing_retired_after_the_takeover(before, records, result, out, err)
+
+    def test_destroy_deletes_nothing_after_the_folder_lock_was_taken(self):
+        before, records = self.lost_lock_setup()
+
+        def confirmed_then_taken(*arguments, **values):
+            self.take_over(self.holidays)
+            self.take_over(self.meetings)
+            return True
+
+        out, err = self.quietly()
+        with mock.patch.object(retire, "confirm_destroy", side_effect=confirmed_then_taken), \
+                mock.patch.object(retire, "drain_before_next", return_value=False):
+            result = run(self.namespace("--destroy-originals-now", str(self.root), yes=True))
+        self.assert_nothing_retired_after_the_takeover(before, records, result, out, err)
+
     def test_run_skips_every_folder_when_no_heartbeat_thread_can_start(self):
         """A pids limit: the lock cannot beat, so it is not taken; each folder is skipped, nothing is moved."""
         import threading

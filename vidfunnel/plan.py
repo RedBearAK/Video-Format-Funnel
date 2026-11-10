@@ -113,6 +113,7 @@ from vidfunnel.record import (
     RECORD_SUFFIX,
     FolderLock,
     LockHeld,
+    LockLost,
     RecordError,
     add_flag,
     add_penalty,
@@ -1899,6 +1900,9 @@ def _plan_entry(tools, work, found, options, folder_sources, capabilities, progr
     except RecordError as error:
         say("failed: '{}': {}".format(work.label, error), stream)
         return "failed", None
+    except LockLost as lost:  # another run took the folder over: its record is not saved
+        say("skipping '{}': {}".format(work.label, lost), stream)
+        return "skipped", None
     if outcome == "skipped":
         say("  skipped: record {} is '{}' and the source is unchanged (--replan to plan again)".format(
             record.get("id"), record.get("status")), stream)
@@ -2025,7 +2029,10 @@ def _update_folder_file(folder, works):
     names = set(data.get("sources") or [])
     names.update(work.key.name for work in works)
     data.update(last_scan=now_iso(), tool_version=vidfunnel.VERSION, sources=sorted(names))
-    save_folder(folder, data)
+    try:
+        save_folder(folder, data)
+    except LockLost:
+        pass  # another run took the folder over (already said on stderr): its folder file is left to it
 
 
 # --- command line ---------------------------------------------------------------------

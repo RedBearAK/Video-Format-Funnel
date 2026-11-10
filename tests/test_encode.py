@@ -12,6 +12,7 @@ VERSION = "20261109.4"
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import io
 import json
@@ -1314,6 +1315,101 @@ class ConvertRunTest(unittest.TestCase):
         self.assertFalse((self.root / "h264_high_mkv_aac.mp4").exists())
         self.assertIn("skipping 'h264_high_mkv_aac.mkv': cannot remove the part file", progress.stream.getvalue())
 
+    def taken_over_after_the_encode(self, fail=False, silent_stat=False):
+        """run_tool for convert_paths: A's ffmpeg runs, then host B takes the folder and starts the same record.
+
+        B replaces the lock file, clears A's part file as a leftover and writes its own partial output there.
+        Returns (patch, seen); seen gets B's part path, its bytes and the record's bytes as B left them.
+        """
+        seen = {}
+        lock_file = self.root / ".vidfunnel" / "lock"
+
+        def encode_then_host_b(argv, *rest, **values):
+            completed = ffmpeg_run(argv, *rest, **values)
+            part = Path(argv[-1])
+            if silent_stat:
+                seen["unreachable"] = str(lock_file)
+            else:
+                os.unlink(str(lock_file))
+                lock_file.write_text(json.dumps({"host": "hostb", "pid": 4242, "started": "2026-11-09T12:00:00Z",
+                                                 "heartbeat": {"interval": 300}}), encoding="utf-8")
+                self.assertEqual(encode._clear_leftover(part), (True, None))
+                part.write_bytes(b"PARTIAL OUTPUT OF HOST B, STILL BEING WRITTEN")
+            seen.update(part=part, part_bytes=part.read_bytes(), record_bytes=record_path(self.root / REMUX_SOURCE)
+                        .read_bytes())
+            if fail:
+                raise FfmpegError("ffmpeg failed after the takeover", argv=argv, returncode=1, stderr="simulated")
+            return completed
+
+        return unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=encode_then_host_b), seen
+
+    def quiet_lost_lock(self):
+        self.addCleanup(vidfunnel.interrupt.draining.clear)
+        self.addCleanup(vidfunnel.interrupt.drain_tally.reset)
+        lines = []
+        patch = unittest.mock.patch("vidfunnel.record._warn", side_effect=lines.append)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return lines
+
+    def assert_nothing_written_after_the_takeover(self, seen, summary, text, reason):
+        output = self.root / "h264_high_mkv_aac.mp4"
+        self.assertFalse(output.exists(), "the old holder put a file in place as the output")
+        self.assertEqual(seen["part"].read_bytes(), seen["part_bytes"], "the part file at the path was touched")
+        self.assertEqual(record_path(self.root / REMUX_SOURCE).read_bytes(), seen["record_bytes"])
+        self.assertEqual(summary.counts.get("skipped"), 1, text)
+        self.assertIn("skipping 'h264_high_mkv_aac.mkv': the lock of folder '{}' {}".format(self.root, reason), text)
+
+    def test_a_holder_whose_lock_was_taken_during_the_encode_writes_nothing(self):
+        self.plan(REMUX_SOURCE)
+        lines = self.quiet_lost_lock()
+        patch, seen = self.taken_over_after_the_encode()
+        progress = quiet()
+        with patch:
+            summary = convert_paths(TOOLS, [str(self.root)], convert_options(), progress)
+        text = progress.stream.getvalue()
+        self.assert_nothing_written_after_the_takeover(seen, summary, text, "was taken over by another run")
+        self.assertTrue(vidfunnel.interrupt.draining.is_set())
+        self.assertIn("lost the lock of folder '{}'".format(self.root), "".join(lines))
+
+    def test_a_failed_encode_after_the_takeover_removes_and_saves_nothing(self):
+        self.plan(REMUX_SOURCE)
+        self.quiet_lost_lock()
+        patch, seen = self.taken_over_after_the_encode(fail=True)
+        progress = quiet()
+        with patch:
+            summary = convert_paths(TOOLS, [str(self.root)], convert_options(), progress)
+        text = progress.stream.getvalue()
+        self.assert_nothing_written_after_the_takeover(seen, summary, text, "was taken over by another run")
+        self.assertEqual(summary.counts.get("failed"), 0, text)
+
+    def test_a_lock_that_cannot_be_checked_after_the_encode_writes_nothing(self):
+        self.plan(REMUX_SOURCE)
+        self.quiet_lost_lock()
+        patch, seen = self.taken_over_after_the_encode(silent_stat=True)
+        real_stat = os.stat
+
+        def unreachable(path, *rest, **values):
+            if "unreachable" in seen and os.fspath(path) == seen["unreachable"]:
+                raise OSError(errno.EIO, "Input/output error")
+            return real_stat(path, *rest, **values)
+
+        progress = quiet()
+        with patch, unittest.mock.patch("vidfunnel.record.os.stat", side_effect=unreachable):
+            summary = convert_paths(TOOLS, [str(self.root)], convert_options(), progress)
+        text = progress.stream.getvalue()
+        self.assert_nothing_written_after_the_takeover(seen, summary, text, "could not be checked")
+        self.assertIn("Input/output error", text)
+
+    def test_a_held_lock_converts_as_before(self):
+        self.plan(REMUX_SOURCE)
+        progress = quiet()
+        summary = convert_paths(TOOLS, [str(self.root)], convert_options(), progress)
+        self.assertEqual(summary.counts.get("skipped"), 0, progress.stream.getvalue())
+        self.assertTrue((self.root / "h264_high_mkv_aac.mp4").is_file())
+        self.assertIn(load_record(self.root / REMUX_SOURCE)["status"], DONE)
+        self.assertFalse(vidfunnel.interrupt.draining.is_set())
+
     def test_reencode_output_decodes_as_h264(self):
         record = self.plan(REENCODE_SOURCE)[REENCODE_SOURCE]
         self.assertEqual(record["action"], "reencode")
@@ -1968,6 +2064,37 @@ class RefitRunTest(unittest.TestCase):
 
     def leftover_parts(self):
         return [name for name in os.listdir(str(self.root)) if name.endswith(".part")]
+
+    def test_a_refit_whose_lock_was_taken_during_the_encode_writes_nothing(self):
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
+        output = self.root / REFIT_OUTPUT
+        output_bytes = output.read_bytes()
+        self.addCleanup(vidfunnel.interrupt.draining.clear)
+        self.addCleanup(vidfunnel.interrupt.drain_tally.reset)
+        lock_file = self.root / ".vidfunnel" / "lock"
+        seen = {}
+
+        def encode_then_host_b(argv, *rest, **values):
+            completed = ffmpeg_run(argv, *rest, **values)
+            part = Path(argv[-1])
+            os.unlink(str(lock_file))
+            lock_file.write_text(json.dumps({"host": "hostb", "pid": 4242, "started": "2026-11-09T12:00:00Z",
+                                             "heartbeat": {"interval": 300}}), encoding="utf-8")
+            self.assertEqual(encode._clear_leftover(part), (True, None))
+            part.write_bytes(b"PARTIAL REFIT OF HOST B")
+            seen.update(part=part, record_bytes=record_path(self.root / REFIT_SOURCE).read_bytes())
+            return completed
+
+        with unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=encode_then_host_b), \
+                unittest.mock.patch("vidfunnel.record._warn"):
+            summary, text = self.refit()
+        self.assertEqual(output.read_bytes(), output_bytes, "the old holder replaced the output")
+        self.assertEqual(seen["part"].read_bytes(), b"PARTIAL REFIT OF HOST B")
+        self.assertEqual(record_path(self.root / REFIT_SOURCE).read_bytes(), seen["record_bytes"])
+        self.assertEqual(summary.counts["refitted"] + summary.counts["kept"] + summary.counts["failed"], 0, text)
+        self.assertIn("skipping '{}': the lock of folder '{}' was taken over by another run".format(
+            REFIT_SOURCE, self.root), text)
+        self.assertTrue(vidfunnel.interrupt.draining.is_set())
 
     def test_larger_reencode_is_refitted_replaced_and_verified(self):
         records = self.plan_and_convert(REFIT_SOURCE, REENCODE_SOURCE, reencode_video=True)

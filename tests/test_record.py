@@ -1540,6 +1540,75 @@ class HeartbeatTests(TempDirCase):
                     else:
                         self.assertIn("more than 3600 s", self.assert_taken())
 
+    def test_record_and_folder_saves_refuse_once_the_lock_is_taken_and_not_before(self):
+        from vidfunnel.record import LockLost, lock_problem, save_folder
+        source = self.base / "clip.avi"
+        save_record(source, {"id": "before"})  # no lock of this folder held here: nothing to lose
+        lock = self.judge()
+        lock.warn = lambda line: None
+        save_record(source, {"id": "held"})
+        self.assertEqual(load_record(source), {"id": "held"})
+        record_bytes = record_path(source).read_bytes()
+        os.unlink(str(self.lock_file()))
+        write_bytes(self.lock_file(), json.dumps({"host": "hostb", "pid": 4242}).encode("utf-8"))
+        lines = []
+        with mock.patch("vidfunnel.record._warn", side_effect=lines.append):
+            with self.assertRaises(LockLost) as caught:
+                save_record(source, {"id": "after"})
+            with self.assertRaises(LockLost):
+                save_folder(self.base, {"sources": []})
+        self.assertIn("the lock of folder '{}' was taken over by another run".format(self.base), str(caught.exception))
+        self.assertEqual(record_path(source).read_bytes(), record_bytes)
+        self.assertFalse((self.base / RECORD_DIR / FOLDER_FILE).exists())
+        self.assertTrue(vidfunnel.interrupt.draining.is_set())
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIsNotNone(lock_problem(self.base))
+
+    def test_a_lock_that_cannot_be_checked_refuses_a_save_without_draining(self):
+        from vidfunnel.record import LockLost
+        source = self.base / "clip.avi"
+        lock = self.judge()
+        real_stat = os.stat
+
+        def unreachable(path, *rest, **values):
+            if os.fspath(path) == str(self.lock_file()):
+                raise OSError(errno.EIO, "Input/output error")
+            return real_stat(path, *rest, **values)
+
+        with mock.patch("vidfunnel.record.os.stat", side_effect=unreachable):
+            with self.assertRaises(LockLost) as caught:
+                save_record(source, {"id": "unchecked"})
+        self.assertIn("the lock of folder '{}' could not be checked".format(self.base), str(caught.exception))
+        self.assertFalse(record_path(source).exists())
+        self.assertFalse(vidfunnel.interrupt.draining.is_set())
+        save_record(source, {"id": "checked"})
+        lock.release()
+
+    def test_a_beat_a_little_ahead_of_the_share_is_judged_by_it_and_further_ahead_by_the_24_hour_rule(self):
+        ahead = vidfunnel.record.HEARTBEAT_AHEAD_SECONDS
+        for seconds_ahead, by_beat in ((ahead - 1, True), (ahead + 1, False)):
+            with self.subTest(seconds_ahead=seconds_ahead):
+                content = self.write_other_lock(10)
+                beat = os.stat(str(self.lock_file())).st_mtime_ns
+                with mock.patch("vidfunnel.record._share_clock_ns", return_value=beat - seconds_ahead * 10 ** 9):
+                    message = self.assert_held(content)
+                if by_beat:
+                    self.assertIn("its holder last beat 0 s ago on the share's clock", message)
+                else:
+                    self.assertIn("its last beat is {} s ahead of the share's clock, so the 24 h rule applies".format(
+                        seconds_ahead), message)
+
+    def test_a_dead_lock_stamped_in_the_shares_future_is_taken_over_at_24_hours(self):
+        future = 400 * 24 * 3600
+        held = self.write_other_lock(-future, started_hours_ago=23)
+        message = self.assert_held(held)
+        self.assertIn("ahead of the share's clock, so the 24 h rule applies", message)
+        self.write_other_lock(-future, started_hours_ago=25)
+        warning = self.assert_taken()
+        self.assertIn("stale lock", warning)
+        self.assertIn("ahead of the share's clock, so the 24 h rule decided", warning)
+        self.assertIn("25.0 h ago on this machine's clock", warning)
+
     def test_the_share_clock_decides_whatever_this_machines_clock_says(self):
         for shift_hours in (5, -5):
             with self.subTest(shift_hours=shift_hours):

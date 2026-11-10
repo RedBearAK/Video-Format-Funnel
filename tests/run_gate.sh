@@ -11,7 +11,7 @@
 # Logs go to a temporary folder that is removed when every module passes and kept
 # (its path printed) otherwise. Exit status 0 only when every module passed.
 
-VERSION="20261109"
+VERSION="20261109.1"
 
 set -u
 unset CDPATH
@@ -183,8 +183,12 @@ finish_module() {
     total_skips=$((total_skips + ${skips:-0}))
     total_failures=$((total_failures + ${failures:-0}))
     total_errors=$((total_errors + ${errors:-0}))
-    if [ "$status" = 0 ]; then
-        result="${verdict:-OK}"
+    if [ "$status" = 0 ] && [ -n "$ran" ] && [ -n "$verdict" ]; then
+        result="$verdict"
+    elif [ "$status" = 0 ]; then
+        # A process that ends with status 0 before unittest reports (os._exit(0) in a test) is no pass.
+        result="exit status 0 without a unittest summary ('Ran N tests' and OK or FAILED)"
+        failed="$failed $module"
     else
         result="${verdict:-no unittest summary}, exit status $status"
         failed="$failed $module"
