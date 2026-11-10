@@ -6,7 +6,7 @@ per source file, named after the full source file name including its extension
 Records are the authority; every write is atomic (temp file, then os.replace).
 """
 
-VERSION = "20261109.4"
+VERSION = "20261110"
 
 import contextlib
 import datetime
@@ -73,6 +73,18 @@ HEARTBEAT_WAKE_GAP_SECONDS = 30
 HEARTBEAT_AHEAD_SECONDS = 5
 HEARTBEAT_FIELD = "heartbeat"        # the lock JSON field that says its holder beats
 PROBE_PREFIX = "lock.probe."         # probe files that read the share's clock: 'lock.probe.<uuid4 hex>'
+
+# A takeover of a lock judged dead (see FolderLock._replace). Its marker is created with O_EXCL, so one run at a
+# time may replace the lock; a marker older than TAKEOVER_MARKER_STALE_SECONDS on the share's clock was left by a
+# run that stopped mid-takeover and is moved aside. A taker writes its lock to 'lock.new.<uuid4 hex>' and renames
+# it over the lock path; a stale marker is moved to 'lock.aside.<uuid4 hex>' and removed. Either can be left
+# behind by a run that died; a later takeover removes those older than TAKEOVER_MARKER_STALE_SECONDS. No name
+# ends in '.json', so none is ever read as a record.
+TAKEOVER_MARKER = "lock.taking"
+TAKEOVER_MARKER_STALE_SECONDS = 300
+NEW_LOCK_PREFIX = "lock.new."
+MARKER_ASIDE_PREFIX = "lock.aside."
+TAKEOVER_LEFTOVER_PREFIXES = (NEW_LOCK_PREFIX, MARKER_ASIDE_PREFIX)
 
 
 class RecordError(Exception):
@@ -942,6 +954,31 @@ def _share_clock_ns(directory):
                 pass
 
 
+def _age_on_share_clock(directory, mtime_ns):
+    """(seconds since mtime_ns, which clock) on the share's clock (a probe file), else on this machine's clock."""
+    try:
+        return (_share_clock_ns(directory) - mtime_ns) / 1e9, "the share's clock"
+    except OSError:
+        return (time.time_ns() - mtime_ns) / 1e9, "this machine's clock (no probe file could be created)"
+
+
+def _takeover_step(step):
+    """Called between the steps of a takeover (FolderLock._replace) with the step's name; does nothing.
+
+    Tests patch it to widen the window between two steps or to act in it.
+    """
+
+
+class _Takeover:
+    """What _create needs to put a taker's lock in place: its marker and the dead lock it judged."""
+
+    def __init__(self, marker, judged, holder, age):
+        self.marker = marker  # (descriptor, (st_dev, st_ino)) of our marker; the descriptor keeps the inode ours
+        self.judged = judged  # the dead lock's identity (_identity_of)
+        self.holder = holder  # its content
+        self.age = age
+
+
 def _claims_heartbeat(holder):
     """True when the lock says its holder beats (written by a vidfunnel with the heartbeat)."""
     return isinstance(holder.get(HEARTBEAT_FIELD), dict)
@@ -1114,17 +1151,19 @@ class FolderLock:
     younger of the lock's start and its last beat on this machine's clock.
     A lock without the field (an older vidfunnel) is judged as before.
 
-    The lock file is only ever created with O_CREAT | O_EXCL, so of several
-    runs that find no lock, one creates it and the others raise LockHeld
-    naming it. Takeovers are serialised by flock() on the regular file
-    '.vidfunnel/lock.takeover' (else on the directory), which the kernel
-    releases when its holder exits: inside it a run reads and judges the
-    lock, checks that the file is still the one it judged (inode, mtime,
-    size and content), unlinks it and creates its own with O_EXCL; a run
-    that gets the flock after it then judges the new, live lock and raises
-    LockHeld. Where the file system refuses flock() on both, the takeover
-    runs without it and only that check and the O_EXCL create guard it (two
-    racers can then both get in). The lock file is removed on exit, including
+    Where no lock file exists, a run creates it at the lock path with
+    O_CREAT | O_EXCL, so of several runs that find no lock, one creates it
+    and the others raise LockHeld naming it. A lock judged dead is replaced
+    (see _replace): under flock() on the regular file '.vidfunnel/lock.takeover'
+    (else on the directory), which serialises takeovers on one kernel, the
+    run creates the marker '.vidfunnel/lock.taking' with O_EXCL, which
+    serialises them across machines; checks again that the lock is the one
+    it judged (inode, mtime, size and content); writes its own lock to a
+    temporary file, flocks and fsyncs it, and renames it over the lock path,
+    so the path names the old lock and then the new one and is never empty;
+    and removes its marker. A run that gets the flock or finds the marker
+    after it judges the new, live lock, or the marker, and raises LockHeld.
+    The lock file is removed on exit, including
     on exception, if it is still ours: unlinked first and its descriptor
     closed after, so the file never exists with its flock free while this
     run holds it. The holder never opens and closes its own lock file while
@@ -1184,8 +1223,8 @@ class FolderLock:
         The flock is taken on the regular file '.vidfunnel/lock.takeover'
         (created if absent; it stays, empty), which more file systems support
         than a flock on a directory, NFS among them; the directory is the
-        second choice. When neither works the takeover runs unguarded, with
-        only the identity re-check and the O_EXCL create protecting it.
+        second choice. When neither works the takeover runs without it,
+        guarded by the marker and the identity re-checks (_replace).
         """
         handle = None
         if fcntl is not None:
@@ -1206,17 +1245,34 @@ class FolderLock:
             if handle is not None:
                 os.close(handle)  # closing the descriptor releases the flock
 
-    def _create(self, content):
-        """Create the lock file, flock it, write our entry; FileExistsError when any lock file exists.
+    def _create(self, content, takeover=None):
+        """Create our lock file, flock it, write our entry; FileExistsError when any lock file exists.
 
         Sets content["flock"] to whether the flock was taken and
         content["device"] to the file's st_dev, and keeps the descriptor open in self.handle and in the registry of held_lock_fds()
         until release(). A file whose entry could not be written is unlinked
         before its descriptor is closed.
+
+        With `takeover` (a _Takeover, from _replace) the file is created under
+        a unique temporary name ('lock.new.<uuid4 hex>') instead, written in
+        full and fsynced, and renamed over the lock path with os.replace once
+        the marker is still ours and the lock still the one judged; after the
+        rename the lock path must name our file, else LockHeld naming the run
+        whose file it names. A failure before the rename unlinks the temporary
+        file and leaves the lock path alone; one after it unlinks our file
+        from the lock path only while the path still names it.
         """
-        handle = os.open(str(self.path), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+        if takeover is None:
+            name = str(self.path)
+        else:
+            name = str(record_dir(self.folder) / (NEW_LOCK_PREFIX + uuid.uuid4().hex))
+        handle = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
         beat = None
+        renamed = False
+        status = None
         try:
+            if takeover is not None:
+                _takeover_step("created")
             content["flock"] = _take_flock(handle)
             status = os.fstat(handle)
             content["device"] = status.st_dev
@@ -1224,6 +1280,22 @@ class FolderLock:
             beat = _Beat(handle, self.path, self.folder, status, data[:1])
             while data:
                 data = data[os.write(handle, data):]
+            if takeover is not None:
+                os.fsync(handle)
+                _takeover_step("written")
+                self._check_marker(takeover.marker)
+                self._recheck(takeover.judged, takeover.holder, takeover.age)
+                _takeover_step("checked")
+                try:
+                    os.replace(name, str(self.path))
+                except FileNotFoundError:
+                    raise LockHeld("folder '{}': this run's new lock file '{}' was removed before it could be put "
+                                   "in place (another run took it for a leftover); not taken over".format(
+                                       self.folder, name))
+                renamed = True
+                _takeover_step("renamed")
+                if not self._path_names(status):
+                    raise self._lost_race()
             with _held_locks_guard:
                 _held_locks[handle] = (status.st_dev, status.st_ino)
                 _start_beating(beat)
@@ -1233,10 +1305,15 @@ class FolderLock:
                 _held_locks.pop(handle, None)
                 if beat in _beats:
                     _beats.remove(beat)
-                if _folder_beats.get(_folder_key(self.folder)) is beat:
+                if beat is not None and _folder_beats.get(_folder_key(self.folder)) is beat:
                     del _folder_beats[_folder_key(self.folder)]
             try:
-                os.unlink(str(self.path))
+                if takeover is None:
+                    os.unlink(str(self.path))
+                elif not renamed:
+                    os.unlink(name)
+                elif status is not None and self._path_names(status):
+                    os.unlink(str(self.path))
             except OSError:
                 pass
             os.close(handle)
@@ -1257,7 +1334,8 @@ class FolderLock:
         """LockHeld for the run that created the lock file while we were taking it over."""
         holder, age = self._holder()
         if holder is None:
-            holder, age = {}, 0.0
+            return LockHeld("folder '{}': its lock file '{}' was removed by another run while this run was taking "
+                            "it over; not taken over".format(self.folder, self.path))
         return self._held(holder, age, "it took the lock over at the same time and got it first")
 
     def acquire(self):
@@ -1275,7 +1353,7 @@ class FolderLock:
         return self
 
     def _take_over(self, content):
-        """Judge the existing lock; take it over (unlink, then O_EXCL create) or raise LockHeld."""
+        """Judge the existing lock; take it over (_replace) or raise LockHeld."""
         while True:
             judged = self._identity()
             if judged is not None and _held_here(judged[0], judged[1]):
@@ -1371,19 +1449,7 @@ class FolderLock:
                 warning = "warning: taking over stale lock '{}' held by {} '{}' pid {} since {} ({:.1f} h ago{})".format(
                     self.path, holder_words, host, pid, holder.get("started"), age / 3600.0,
                     "; its pid is running here, taken for a reused one" if liveness is True else "")
-            current = self._identity()
-            if current != judged or self._holder()[0] != holder:
-                if current is not None and current[:2] == judged[:2] and _claims_heartbeat(holder):
-                    raise self._held(holder, age, "its holder beat while the lock was being judged; not taken over")
-                raise self._lost_race()
-            try:
-                os.unlink(str(self.path))
-            except FileNotFoundError:
-                pass
-            try:
-                self._create(content)
-            except FileExistsError:
-                raise self._lost_race()
+            self._replace(content, judged, holder, age)
             self.warn(warning)
             return
 
@@ -1423,6 +1489,235 @@ class FolderLock:
             return "free"
         finally:
             os.close(test)
+
+    def _recheck(self, judged, holder, age):
+        """LockHeld unless the lock file is still the one judged dead (inode, mtime, size and content).
+
+        A file with the same inode whose mtime moved, when the lock says its
+        holder beats, means the holder beat meanwhile and is alive.
+        """
+        current = self._identity()
+        if current != judged or self._holder()[0] != holder:
+            if current is not None and current[:2] == judged[:2] and _claims_heartbeat(holder):
+                raise self._held(holder, age, "its holder beat while the lock was being judged; not taken over")
+            raise self._lost_race()
+
+    def _path_names(self, status):
+        """True when the lock path names the file with this os.stat_result's st_dev and st_ino."""
+        try:
+            there = os.stat(str(self.path))
+        except FileNotFoundError:
+            return False
+        return (there.st_dev, there.st_ino) == (status.st_dev, status.st_ino)
+
+    def _replace(self, content, judged, holder, age):
+        """Take over the lock judged dead, or raise LockHeld (or OSError) and leave the lock path alone.
+
+        A: create the marker '.vidfunnel/lock.taking' with O_EXCL (_take_marker);
+        only its creator may replace the lock. B: check again that the lock is
+        the one judged (_recheck). C: write our lock to a temporary file,
+        flock and fsync it. D: check that the marker is still ours and the
+        lock still the one judged, rename our file over the lock path, and
+        check that the path names it (C and D in _create). E: remove our
+        marker if it is still ours (_drop_marker), on every path out. Leftovers
+        of runs that died mid-takeover are removed under the marker.
+        """
+        marker = self._take_marker(content)
+        try:
+            _takeover_step("marked")
+            self._recheck(judged, holder, age)
+            _takeover_step("rechecked")
+            self._clear_leftovers()
+            self._create(content, _Takeover(marker, judged, holder, age))
+            _takeover_step("published")
+        finally:
+            self._drop_marker(marker)
+
+    def _marker_path(self):
+        return str(record_dir(self.folder) / TAKEOVER_MARKER)
+
+    def _take_marker(self, content):
+        """Create the takeover marker with O_EXCL; (descriptor, (st_dev, st_ino)) once it is ours and written.
+
+        The marker holds our host, pid, a random token and the time. An
+        existing marker is another run's takeover in progress: LockHeld naming
+        its host, unless it is older than TAKEOVER_MARKER_STALE_SECONDS on the
+        share's clock (else on ours); such a marker is moved aside (_move_marker_aside)
+        and the exclusive create is tried again, once. The descriptor stays
+        open until _drop_marker, so the inode cannot be reused meanwhile.
+        """
+        path = self._marker_path()
+        data = _dump_json({"host": content["host"], "pid": content["pid"], "token": uuid.uuid4().hex,
+                           "started": now_iso()}).encode("utf-8")
+        cleared = False
+        for _attempt in range(3):
+            try:
+                handle = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+            except FileExistsError:
+                found = self._judge_marker(path)
+                if found is None:  # removed since: its takeover ended; compete for the marker
+                    continue
+                identity, info, age, clock = found
+                if cleared or age <= TAKEOVER_MARKER_STALE_SECONDS:
+                    raise self._marker_held(info, age, clock)
+                self._move_marker_aside(path, identity, info, age, clock)
+                cleared = True
+                continue
+            identity = None
+            try:
+                status = os.fstat(handle)
+                identity = (status.st_dev, status.st_ino)
+                while data:
+                    data = data[os.write(handle, data):]
+                os.fsync(handle)
+            except BaseException:
+                try:
+                    there = os.stat(path)
+                    if identity is not None and (there.st_dev, there.st_ino) == identity:
+                        os.unlink(path)
+                except OSError:
+                    pass
+                os.close(handle)
+                raise
+            return handle, identity
+        raise LockHeld("folder '{}': the takeover marker '{}' kept changing while this run tried to create it; "
+                       "another takeover is in progress, not taken over".format(self.folder, path))
+
+    def _judge_marker(self, path):
+        """(identity, content dict, age in seconds, clock words) of an existing marker; None when it is gone."""
+        try:
+            status = os.stat(path)
+        except FileNotFoundError:
+            return None
+        try:
+            info = _read_json(path)
+        except RecordError:  # a taker that died before it wrote the marker, or one being written now
+            info = {}
+        if info is None:
+            return None
+        if not isinstance(info, dict):
+            info = {}
+        age, clock = _age_on_share_clock(record_dir(self.folder), status.st_mtime_ns)
+        return _identity_of(status), info, age, clock
+
+    def _marker_held(self, info, age, clock):
+        host = info.get("host")
+        pid = info.get("pid")
+        return LockHeld(
+            "folder '{}' is being taken over by host '{}' pid {}: a takeover is in progress (its marker '{}' was "
+            "written {:.0f} s ago on {}; a marker older than {} s is cleared)".format(
+                self.folder, host, pid, self._marker_path(), age, clock, TAKEOVER_MARKER_STALE_SECONDS),
+            host=host, pid=pid, age_seconds=age)
+
+    def _move_marker_aside(self, path, identity, info, age, clock):
+        """Clear a stale marker: rename it to a unique name, check it is the one judged, remove it.
+
+        Of several runs that rename the same marker, one moves it; the others
+        find nothing at the path (and compete for a fresh marker) or move
+        whatever is there by then. A moved file that is not the stale marker
+        judged (same identity and token) is another run's fresh marker: it is
+        left where it now is, under the aside name, and LockHeld is raised.
+        That run then finds its marker gone at its check before the rename
+        and gives up as well; the aside file is a leftover a later takeover
+        removes once it is older than TAKEOVER_MARKER_STALE_SECONDS.
+        """
+        aside = str(record_dir(self.folder) / (MARKER_ASIDE_PREFIX + uuid.uuid4().hex))
+        try:
+            os.rename(path, aside)
+        except FileNotFoundError:
+            return
+        _takeover_step("moved-aside")
+        try:
+            moved = _identity_of(os.stat(aside))
+            moved_info = _read_json(aside)
+        except FileNotFoundError:
+            # Removed meanwhile by another run's sweep of leftovers, which takes only files older than the
+            # threshold: what was moved was a stale marker, not a fresh one. Compete for the marker.
+            return
+        except (OSError, RecordError):
+            moved, moved_info = None, None
+        else:
+            if moved_info is None:  # removed by such a sweep between the stat and the read: as above
+                return
+        same = moved is not None and moved == identity
+        if same and (info or moved_info):  # an empty or unreadable marker has no token: its identity decides
+            same = isinstance(moved_info, dict) and moved_info.get("token") == info.get("token")
+        if not same:
+            raise LockHeld(
+                "folder '{}': the takeover marker '{}' was replaced while this run cleared it as stale; another "
+                "takeover is in progress, not taken over (the marker moved is left as '{}')".format(
+                    self.folder, path, aside))
+        try:
+            os.unlink(aside)
+        except FileNotFoundError:
+            pass
+        self.warn("warning: cleared the takeover marker '{}' of host '{}' pid {}: written {:.0f} s ago on {}, more "
+                  "than {} s; the run that wrote it stopped mid-takeover".format(
+                      path, info.get("host"), info.get("pid"), age, clock, TAKEOVER_MARKER_STALE_SECONDS))
+
+    def _check_marker(self, marker):
+        """LockHeld unless the marker path still names our marker (the inode our descriptor keeps)."""
+        path = self._marker_path()
+        try:
+            there = os.stat(path)
+        except FileNotFoundError:
+            there = None
+        if there is None or (there.st_dev, there.st_ino) != marker[1]:
+            raise LockHeld("folder '{}': this run's takeover marker '{}' is no longer at its path (another run "
+                           "cleared it as stale); the lock is left as it is, not taken over".format(
+                               self.folder, path))
+
+    def _drop_marker(self, marker):
+        """Close our marker's descriptor and remove the marker if the path still names it; never raises OSError."""
+        path = self._marker_path()
+        handle, identity = marker
+        there = None
+        try:
+            there = os.stat(path)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            self.warn("warning: cannot check the takeover marker '{}': {}; a marker older than {} s is cleared by "
+                      "the next takeover".format(path, error, TAKEOVER_MARKER_STALE_SECONDS))
+        finally:
+            os.close(handle)
+        if there is None or (there.st_dev, there.st_ino) != identity:
+            return
+        _takeover_step("unmarking")
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            self.warn("warning: cannot remove the takeover marker '{}': {}; a marker older than {} s is cleared by "
+                      "the next takeover".format(path, error, TAKEOVER_MARKER_STALE_SECONDS))
+
+    def _clear_leftovers(self):
+        """Remove temporary lock files and moved-aside markers older than TAKEOVER_MARKER_STALE_SECONDS.
+
+        Runs under our marker. Their age is read on the share's clock (else
+        ours); a younger one may belong to a taker still at work and stays.
+        """
+        directory = record_dir(self.folder)
+        try:
+            names = sorted(name for name in os.listdir(str(directory)) if name.startswith(TAKEOVER_LEFTOVER_PREFIXES))
+        except OSError:
+            return
+        if not names:
+            return
+        try:
+            now = _share_clock_ns(directory)
+        except OSError:
+            now = time.time_ns()
+        for name in names:
+            path = str(directory / name)
+            try:
+                if (now - os.stat(path).st_mtime_ns) / 1e9 > TAKEOVER_MARKER_STALE_SECONDS:
+                    os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                self.warn("warning: cannot remove '{}', left by a takeover that did not finish: {}".format(path, error))
 
     def _still_ours(self):
         """True when the file at the lock path is the one we created and still holds our entry.

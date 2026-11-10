@@ -2,6 +2,7 @@
 
 VERSION = "20261110"
 
+import contextlib
 import datetime
 import errno
 import hashlib
@@ -31,6 +32,10 @@ from vidfunnel.record import (
     HEARTBEAT_SECONDS,
     HEARTBEAT_STALE_SECONDS,
     PROBE_PREFIX,
+    MARKER_ASIDE_PREFIX,
+    NEW_LOCK_PREFIX,
+    TAKEOVER_MARKER,
+    TAKEOVER_MARKER_STALE_SECONDS,
     held_lock_fds,
     LOCK_NAME,
     RECORD_DIR,
@@ -679,9 +684,13 @@ class FolderLockTests(TempDirCase):
                 pass
         takeover = str(self.lock_file().parent / "lock.takeover")
         self.assertIn(takeover, opened, "the flock is taken on the regular takeover file")
-        last_create = len(opened) - 1 - opened[::-1].index(str(self.lock_file()))
-        self.assertLess(opened.index(takeover), last_create, "the guard is held before our lock file is created")
+        marker = str(self.lock_file().parent / TAKEOVER_MARKER)
+        new_lock = [number for number, path in enumerate(opened) if os.path.basename(path).startswith(NEW_LOCK_PREFIX)]
+        self.assertEqual(len(new_lock), 1, opened)
+        self.assertLess(opened.index(takeover), opened.index(marker), "the guard is held before the marker is created")
+        self.assertLess(opened.index(marker), new_lock[0], "the marker is created before our new lock file")
         self.assertTrue(Path(takeover).exists())
+        self.assertFalse(Path(marker).exists())
 
     def test_dead_holder_on_this_host_is_taken_over_at_once(self):
         dead = self.finished_pid()
@@ -801,30 +810,32 @@ class FolderLockTests(TempDirCase):
                 self.assertEqual(outcomes, ["ACQUIRED"] + ["HELD"] * (racers - 1))
                 self.assertFalse(self.lock_file().exists())
 
-    def test_losing_the_create_after_a_takeover_names_the_winner(self):
+    def test_a_lock_put_in_place_just_after_our_rename_names_the_winner(self):
+        """Another run's file replaces ours right after our rename: LockHeld naming it, its file left alone."""
         dead = self.finished_pid()
         self.write_lock(socket.gethostname(), dead, 0.5, container=False)
         winner = {"host": "winnerhost", "pid": 777, "started": "2026-11-07T12:00:00Z", "container": False}
-        real_open = os.open
-        calls = []
+        steps = []
 
-        def racing_open(path, flags, *args):
-            if path != str(self.lock_file()):
-                return real_open(path, flags, *args)
-            calls.append(path)
-            if len(calls) == 2:
-                write_bytes(path, json.dumps(winner).encode("utf-8"))
-            return real_open(path, flags, *args)
+        def replaced_after_the_rename(step):
+            steps.append(step)
+            if step == "renamed":
+                staged = self.lock_file().parent / "winner-staged"
+                write_bytes(staged, json.dumps(winner).encode("utf-8"))
+                os.replace(str(staged), str(self.lock_file()))
 
         with mock.patch("vidfunnel.record.in_container", return_value=False), \
-                mock.patch("vidfunnel.record.os.open", side_effect=racing_open):
+                mock.patch("vidfunnel.record._takeover_step", side_effect=replaced_after_the_rename):
             with self.assertRaises(LockHeld) as caught:
                 with FolderLock(self.base, warn=self.fail):
                     pass
-        self.assertEqual(len(calls), 2)
+        self.assertIn("renamed", steps)
         self.assertEqual((caught.exception.host, caught.exception.pid), ("winnerhost", 777))
         self.assertIn("got it first", str(caught.exception))
         self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), winner)
+        self.assertEqual(sorted(os.listdir(str(self.lock_file().parent))), ["lock", "lock.takeover"])
+        with held_lock_fds() as descriptors:
+            self.assertEqual(descriptors, ())
 
     @unittest.skipIf(sys.platform == "win32", "flock is POSIX")
     def test_a_takeover_is_judged_under_the_directory_flock(self):
@@ -1759,10 +1770,11 @@ class HeartbeatTests(TempDirCase):
     def replace_lock(self):
         """Put another run's lock at the lock path in one rename, so no look at the path finds it missing.
 
-        A real takeover unlinks the lock and then creates its own, so the path
-        is missing for a moment; a beat polling during that moment says 'gone'
-        and cannot name the new holder. Tests of that sequence unlink and write
-        in two steps on purpose (test_a_holder_whose_lock_is_gone_...).
+        A takeover by this version renames its file over the lock path in the
+        same way. An older vidfunnel unlinks the lock and then creates its own,
+        so the path is missing for a moment; a beat polling during that moment
+        says 'gone' and cannot name the new holder. Tests of that sequence
+        unlink and write in two steps on purpose (test_a_holder_whose_lock_is_gone_...).
         """
         staged = self.base / RECORD_DIR / "replacement-lock.tmp"
         write_bytes(staged, json.dumps(self.WINNER).encode("utf-8"))
@@ -2231,6 +2243,924 @@ class HeartbeatTests(TempDirCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.split(), [str(inode), "held"])
         self.assertEqual(os.stat(str(self.lock_file())).st_ino, inode)
+
+
+# The steps of a takeover at which vidfunnel.record._takeover_step is called, in order (FolderLock._replace).
+TAKEOVER_STEPS = ("marked", "rechecked", "created", "written", "checked", "renamed", "published", "unmarking")
+
+# Why a taker that loses a race may be refused; any other LockHeld in a race is a finding.
+RACE_REFUSALS = ("a takeover is in progress", "got it first", "still holds the lock file's flock", "this run itself")
+
+
+def another_machine_patches(host=None):
+    """Patches under which this process takes locks as a run on another machine of the share would.
+
+    Neither the takeover flock nor the lock's own flock reaches across
+    machines: the guard does nothing and the boot id and machine are not
+    those of the dead lock or of any other taker's judge.
+    """
+    patches = [mock.patch.object(FolderLock, "_takeover_guard", lambda self: contextlib.nullcontext()),
+               mock.patch("vidfunnel.record.boot_id", return_value="taker-boot"),
+               mock.patch("vidfunnel.record.machine_identity", return_value=("taker-machine", "machine-id")),
+               mock.patch("vidfunnel.record.in_container", return_value=False)]
+    if host is not None:
+        patches.append(mock.patch("vidfunnel.record.socket.gethostname", return_value=host))
+    return patches
+
+
+def takeover_race_worker(folder, slow_steps, start, finish, released, results):
+    """One taker of TakeoverTests.test_two_taker_processes_on_one_dead_lock_get_it_once.
+
+    For each round: wait at `start`, try the lock (slowed at slow_steps[round],
+    if any), report, wait at `finish`, release a lock it won, wait at `released`.
+    """
+    import time as clock
+    from vidfunnel.record import FolderLock as Lock, LockHeld as Held
+    current = {"step": None}
+
+    def pause(step):
+        if step == current["step"]:
+            clock.sleep(0.002)
+
+    for patch in another_machine_patches() + [mock.patch("vidfunnel.record._takeover_step", side_effect=pause)]:
+        patch.start()
+    for slow_step in slow_steps:
+        current["step"] = slow_step
+        start.wait(120)
+        lock = None
+        try:
+            lock = Lock(folder, warn=lambda line: None).acquire()
+            results.put(("ACQUIRED", os.getpid(), ""))
+        except Held as held:
+            results.put(("HELD", os.getpid(), str(held)))
+        except BaseException as error:
+            results.put(("ERROR", os.getpid(), repr(error)))
+        finish.wait(120)
+        if lock is not None:
+            lock.release()
+        released.wait(120)
+
+
+# A taker in a process of its own, as a run on another machine. argv: folder, the step to slow down ("none" for
+# none). It prints ACQUIRED once it holds the lock, then holds it until its stdin closes and releases it.
+TAKER_SCRIPT = """
+import contextlib, os, sys, time
+from unittest import mock
+from vidfunnel.record import FolderLock
+folder, slow_step = sys.argv[1], sys.argv[2]
+real_unlink = os.unlink
+
+def pause(step):
+    if step == slow_step:
+        time.sleep(0.2)
+
+def unlink_then_wait(path, *rest, **options):
+    # A takeover never unlinks the lock path; should one do it, the moment the path is empty lasts 0.2 s.
+    real_unlink(path, *rest, **options)
+    if os.path.basename(os.fspath(path)) == "lock":
+        time.sleep(0.2)
+
+for patch in (mock.patch.object(FolderLock, "_takeover_guard", lambda self: contextlib.nullcontext()),
+              mock.patch("vidfunnel.record.boot_id", return_value="taker-boot"),
+              mock.patch("vidfunnel.record.machine_identity", return_value=("taker-machine", "machine-id")),
+              mock.patch("vidfunnel.record.in_container", return_value=False),
+              mock.patch("vidfunnel.record.socket.gethostname", return_value="takerhost"),
+              mock.patch("vidfunnel.record._takeover_step", side_effect=pause),
+              mock.patch("vidfunnel.record.os.unlink", side_effect=unlink_then_wait)):
+    patch.start()
+lock = FolderLock(folder, warn=lambda line: None).acquire()
+print("ACQUIRED", flush=True)
+sys.stdin.read()
+lock.release()
+"""
+
+# A holder that beats every 0.05 s. argv: folder. It prints ACQUIRED once it holds the lock.
+FAST_HOLDER_SCRIPT = """
+import sys, time
+from unittest import mock
+import vidfunnel.record
+mock.patch.object(vidfunnel.record, "HEARTBEAT_SECONDS", 0.05).start()
+mock.patch.object(vidfunnel.record, "HEARTBEAT_POLL_SECONDS", 0.01).start()
+with vidfunnel.record.FolderLock(sys.argv[1], warn=lambda line: None):
+    print("ACQUIRED", flush=True)
+    time.sleep(60)
+"""
+
+
+class TakeoverTests(unittest.TestCase):
+    """A lock judged dead is replaced under the marker 'lock.taking' by a rename (FolderLock._replace)."""
+
+    def setUp(self):
+        # The folder goes last, after the cleanups that release locks in it (tearDown runs before them).
+        self.holder = tempfile.TemporaryDirectory(prefix="vidfunnel-takeover-test-")
+        self.base = Path(self.holder.name)
+        self.addCleanup(self.holder.cleanup)
+        self.addCleanup(vidfunnel.interrupt.draining.clear)
+        self.addCleanup(vidfunnel.interrupt.drain_tally.reset)
+        (self.base / RECORD_DIR).mkdir()
+
+    def lock_file(self):
+        return self.base / RECORD_DIR / LOCK_NAME
+
+    def marker_file(self):
+        return self.base / RECORD_DIR / TAKEOVER_MARKER
+
+    def names(self):
+        return sorted(os.listdir(str(self.base / RECORD_DIR)))
+
+    def wait_until(self, predicate, seconds, message):
+        deadline = time.monotonic() + seconds
+        while not predicate():
+            self.assertLess(time.monotonic(), deadline, message)
+            time.sleep(0.002)
+
+    def apply(self, patches):
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def write_dead_lock(self, number=0, beat_seconds_ago=2 * 3600, started_hours_ago=3.0):
+        """A heartbeat lock of another machine whose beat is silent, put at the lock path in one rename."""
+        started = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=started_hours_ago)
+        content = {"host": "deadhost", "pid": 4242 + number, "started": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   "container": False, "machine": "dead-machine", "machine_source": "machine-id",
+                   "boot": "dead-boot", "flock": True, "device": 1, "heartbeat": {"interval": HEARTBEAT_SECONDS}}
+        staged = self.base / RECORD_DIR / "dead-staged"
+        write_bytes(staged, json.dumps(content).encode("utf-8"))
+        beat = time.time_ns() - int(beat_seconds_ago * 10 ** 9)
+        os.utime(str(staged), ns=(beat, beat))
+        os.replace(str(staged), str(self.lock_file()))
+        return content
+
+    def write_marker(self, seconds_ago, host="markerhost", pid=5150):
+        content = {"host": host, "pid": pid, "token": uuid.uuid4().hex, "started": "2026-11-10T00:00:00Z"}
+        write_bytes(self.marker_file(), json.dumps(content).encode("utf-8"))
+        stamp = time.time_ns() - int(seconds_ago * 10 ** 9)
+        os.utime(str(self.marker_file()), ns=(stamp, stamp))
+        return content
+
+    def snapshot(self, path):
+        status = os.stat(str(path))
+        return status.st_dev, status.st_ino, Path(path).read_bytes()
+
+    def take(self, warnings=None):
+        """Acquire the lock (released at cleanup) or raise LockHeld."""
+        lock = FolderLock(self.base, warn=(warnings.append if warnings is not None else lambda line: None)).acquire()
+        self.addCleanup(lock.release)
+        return lock
+
+    def assert_ours(self, lock):
+        there = os.stat(str(self.lock_file()))
+        ours = os.fstat(lock.handle)
+        self.assertEqual((there.st_dev, there.st_ino), (ours.st_dev, ours.st_ino))
+        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), lock.content)
+
+    def assert_nothing_of_ours(self):
+        with held_lock_fds() as descriptors:
+            self.assertEqual(descriptors, ())
+        with vidfunnel.record._held_locks_guard:
+            self.assertNotIn(os.path.abspath(str(self.base)), vidfunnel.record._folder_beats)
+
+    # ------------------------------------------------------------ two takers
+
+    def race_threads(self, rounds, slow_step=None):
+        """Two threads take over one dead lock per round; one is slowed at `slow_step`; return the outcomes."""
+        def pause(step):
+            if step == slow_step and threading.current_thread().name == "slow-taker":
+                time.sleep(0.002)
+
+        with contextlib.ExitStack() as stack:
+            for patch in another_machine_patches() + [mock.patch("vidfunnel.record._takeover_step", side_effect=pause)]:
+                stack.enter_context(patch)
+            self.race_rounds(rounds, slow_step)
+
+    def race_rounds(self, rounds, slow_step):
+        real_clock = vidfunnel.record._share_clock_ns
+        for round_number in range(rounds):
+            self.write_dead_lock(round_number)
+            judged = threading.Barrier(2, timeout=60)
+            waited = set()
+
+            def clock_after_both_judged(directory):
+                # Both takers have read the dead lock before either goes on, so they meet at the marker.
+                now = real_clock(directory)
+                if threading.current_thread().name not in waited:
+                    waited.add(threading.current_thread().name)
+                    judged.wait()
+                return now
+
+            outcomes = {}
+
+            def taker():
+                try:
+                    outcomes[threading.current_thread().name] = ("ACQUIRED",
+                                                                 FolderLock(self.base, warn=lambda line: None).acquire())
+                except LockHeld as held:
+                    outcomes[threading.current_thread().name] = ("HELD", str(held))
+                except BaseException as error:
+                    outcomes[threading.current_thread().name] = ("ERROR", repr(error))
+
+            with mock.patch("vidfunnel.record._share_clock_ns", side_effect=clock_after_both_judged):
+                threads = [threading.Thread(target=taker, name=name) for name in ("slow-taker", "plain-taker")]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(120)
+            kinds = sorted(kind for kind, _value in outcomes.values())
+            self.assertEqual(kinds, ["ACQUIRED", "HELD"], (round_number, slow_step, outcomes))
+            winner = [value for kind, value in outcomes.values() if kind == "ACQUIRED"][0]
+            loser = [value for kind, value in outcomes.values() if kind == "HELD"][0]
+            self.assertTrue(any(reason in loser for reason in RACE_REFUSALS), loser)
+            self.assert_ours(winner)
+            self.assertEqual(self.names(), [LOCK_NAME], (round_number, slow_step))
+            winner.release()
+            self.assertEqual(self.names(), [])
+
+    def test_two_taker_threads_on_one_dead_lock_get_it_once(self):
+        self.race_threads(300)
+
+    def test_two_taker_threads_get_it_once_with_one_slowed_at_each_step(self):
+        for step in TAKEOVER_STEPS:
+            with self.subTest(step=step):
+                self.race_threads(25, slow_step=step)
+
+    def test_two_taker_processes_on_one_dead_lock_get_it_once(self):
+        """Two processes as two machines (no flock between them); one is slowed at each step in turn."""
+        context = multiprocessing.get_context("spawn")
+        start, finish, released = (context.Barrier(3) for _number in range(3))
+        results = context.Queue()
+        slow = [None] * 200 + [step for step in TAKEOVER_STEPS for _number in range(25)]
+        workers = [context.Process(target=takeover_race_worker,
+                                   args=(str(self.base), steps, start, finish, released, results))
+                   for steps in (slow, [None] * len(slow))]
+        for worker in workers:
+            worker.start()
+
+        def stop_workers():
+            # After the last round the workers leave on their own; a failed round leaves them at a barrier.
+            for worker in workers:
+                worker.join(30)
+            if any(worker.is_alive() for worker in workers):
+                for barrier in (start, finish, released):
+                    barrier.abort()
+            for worker in workers:
+                worker.join(10)
+                if worker.is_alive():
+                    worker.kill()
+                    worker.join(10)
+
+        self.addCleanup(stop_workers)
+        for round_number, slow_step in enumerate(slow):
+            self.write_dead_lock(round_number)
+            start.wait(120)
+            outcomes = [results.get(timeout=120) for _number in range(2)]
+            self.assertEqual(sorted(kind for kind, _pid, _words in outcomes), ["ACQUIRED", "HELD"],
+                             (round_number, slow_step, outcomes))
+            winner = [pid for kind, pid, _words in outcomes if kind == "ACQUIRED"][0]
+            loser = [words for kind, _pid, words in outcomes if kind == "HELD"][0]
+            self.assertTrue(any(reason in loser for reason in RACE_REFUSALS), loser)
+            self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8"))["pid"], winner)
+            self.assertEqual(self.names(), [LOCK_NAME], (round_number, slow_step))
+            finish.wait(120)
+            released.wait(120)
+            self.assertEqual(self.names(), [], (round_number, slow_step))
+
+    # ------------------------------------------------------------ the lock path is never empty
+
+    def test_an_observer_never_finds_the_lock_path_missing_or_incomplete(self):
+        looks = [0]
+        problems = []
+        stop = threading.Event()
+
+        def observe():
+            while not stop.is_set():
+                try:
+                    with open(str(self.lock_file()), "rb") as stream:
+                        data = stream.read()
+                except FileNotFoundError:
+                    problems.append("missing")
+                    continue
+                try:
+                    json.loads(data.decode("utf-8"))
+                except ValueError:
+                    problems.append(data)
+                looks[0] += 1
+
+        def slowed(step):
+            time.sleep(0.001)
+            if step in ("checked", "renamed"):  # the observer looks just before and just after the rename
+                seen = looks[0]
+                self.wait_until(lambda: looks[0] > seen + 1, 30, "the observer stopped looking")
+
+        real_unlink = os.unlink
+
+        def unlink_then_wait(path, *rest, **options):
+            # A takeover never unlinks the lock path; should one do it, the observer gets to look while it is empty.
+            real_unlink(path, *rest, **options)
+            if os.fspath(path) == str(self.lock_file()) and not stop.is_set():  # not the release at the end
+                seen = looks[0] + len(problems)
+                self.wait_until(lambda: looks[0] + len(problems) > seen + 1, 30, "the observer stopped looking")
+
+        self.apply(another_machine_patches() + [mock.patch("vidfunnel.record._takeover_step", side_effect=slowed),
+                                                mock.patch("vidfunnel.record.os.unlink", side_effect=unlink_then_wait)])
+        self.write_dead_lock()
+        observer = threading.Thread(target=observe)
+        observer.start()
+        try:
+            previous = None
+            for round_number in range(200):
+                if previous is not None:
+                    self.write_dead_lock(round_number)  # one rename over our lock: the path stays named
+                    previous.release()  # finds the path names another file and leaves it
+                previous = FolderLock(self.base, warn=lambda line: None).acquire()
+                self.assert_ours(previous)
+        finally:
+            stop.set()
+            observer.join(30)
+        previous.release()  # after the observer has stopped: release empties the path
+        self.assertEqual(problems, [])
+        self.assertGreater(looks[0], 400)
+
+    def test_a_replaced_holder_names_the_new_host_whatever_step_the_taker_is_slow_at(self):
+        from vidfunnel.record import lock_problem
+        script = self.base / "taker.py"
+        script.write_text(TAKER_SCRIPT, encoding="utf-8")
+        environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent))
+        for step in ("none",) + TAKEOVER_STEPS:
+            with self.subTest(step=step):
+                vidfunnel.interrupt.draining.clear()
+                vidfunnel.interrupt.drain_tally.reset()
+                lock = FolderLock(self.base, warn=lambda line: None).acquire()
+                silent = time.time_ns() - 2 * 3600 * 10 ** 9
+                os.utime(str(self.lock_file()), ns=(silent, silent))  # the holder froze two hours ago
+                states = []
+                stop = threading.Event()
+
+                def poll(beat=lock.beat):
+                    while not stop.is_set():
+                        state = vidfunnel.record._lock_state(beat)
+                        if not states or states[-1] != state:  # each change, not each look
+                            states.append(state)
+
+                poller = threading.Thread(target=poll)
+                poller.start()
+                taker = subprocess.Popen([sys.executable, str(script), str(self.base), step], stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, universal_newlines=True, env=environment)
+                self.addCleanup(taker.wait)
+                self.addCleanup(taker.kill)
+                try:
+                    self.assertEqual(taker.stdout.readline(), "ACQUIRED\n")
+                    self.wait_until(lambda: states and states[-1] is not None, 30, "the poll never saw the takeover")
+                finally:
+                    stop.set()
+                    poller.join(30)
+                self.assertEqual(set(states) - {None, ("lost", "its lock file is another run's now")}, set())
+                self.assertIsNone(states[0])
+                lines = []
+                with mock.patch("vidfunnel.record._warn", side_effect=lines.append):
+                    problem = lock_problem(self.base)
+                self.assertIn("was taken over by another run", problem)
+                self.assertEqual(len(lines), 1, lines)
+                self.assertIn("its lock file is another run's now; host 'takerhost' holds it now", lines[0])
+                self.assertNotIn("gone", lines[0])
+                lock.release()
+                taker.stdin.close()
+                self.assertEqual(taker.wait(30), 0)
+                taker.stdout.close()
+                self.assertEqual(self.names(), [])
+
+    # ------------------------------------------------------------ the marker
+
+    def test_a_fresh_marker_is_a_takeover_in_progress(self):
+        self.apply(another_machine_patches())
+        self.write_dead_lock()
+        self.write_marker(10)
+        lock_before = self.snapshot(self.lock_file())
+        marker_before = self.snapshot(self.marker_file())
+        with self.assertRaises(LockHeld) as caught:
+            self.take()
+        message = str(caught.exception)
+        self.assertIn("is being taken over by host 'markerhost' pid 5150: a takeover is in progress", message)
+        self.assertRegex(message, r"its marker '.*lock\.taking' was written 1[0-9] s ago on the share's clock")
+        self.assertEqual((caught.exception.host, caught.exception.pid), ("markerhost", 5150))
+        self.assertEqual(self.snapshot(self.lock_file()), lock_before)
+        self.assertEqual(self.snapshot(self.marker_file()), marker_before)
+        self.assertEqual(self.names(), [LOCK_NAME, TAKEOVER_MARKER])
+        self.assert_nothing_of_ours()
+
+    def test_a_stale_marker_is_cleared_whatever_this_machines_clock_says(self):
+        self.apply(another_machine_patches())
+        for shift_hours in (0, 5, -5):
+            with self.subTest(shift_hours=shift_hours):
+                self.write_dead_lock()
+                self.write_marker(TAKEOVER_MARKER_STALE_SECONDS + 60)
+                clock = ShiftedClock(shift_hours * 3600)
+                warnings = []
+                with clock.patches()[0], clock.patches()[1]:
+                    lock = self.take(warnings)
+                self.assert_ours(lock)
+                self.assertEqual(len(warnings), 2, warnings)
+                self.assertIn("cleared the takeover marker '{}' of host 'markerhost' pid 5150: written 36".format(
+                    self.marker_file()), warnings[0])
+                self.assertIn("s ago on the share's clock, more than 300 s", warnings[0])
+                self.assertIn("taking over lock", warnings[1])
+                self.assertEqual(self.names(), [LOCK_NAME])
+                lock.release()
+
+    def test_a_marker_exactly_at_the_threshold_is_held_and_just_past_it_is_cleared(self):
+        self.apply(another_machine_patches())
+        for past_ns, cleared in ((0, False), (10 ** 6, True)):
+            with self.subTest(past_ns=past_ns):
+                self.write_dead_lock()
+                self.write_marker(0)
+                stamp = os.stat(str(self.marker_file())).st_mtime_ns
+                share_now = stamp + TAKEOVER_MARKER_STALE_SECONDS * 10 ** 9 + past_ns
+                warnings = []
+                with mock.patch("vidfunnel.record._share_clock_ns", return_value=share_now):
+                    if cleared:
+                        lock = self.take(warnings)
+                        self.assertIn("written 300 s ago on the share's clock, more than 300 s", warnings[0])
+                        self.assertEqual(self.names(), [LOCK_NAME])
+                        lock.release()
+                    else:
+                        with self.assertRaises(LockHeld) as caught:
+                            self.take(warnings)
+                        self.assertIn("was written 300 s ago on the share's clock", str(caught.exception))
+                        self.assertEqual(self.names(), [LOCK_NAME, TAKEOVER_MARKER])
+                        os.unlink(str(self.marker_file()))
+
+    def test_without_a_probe_file_a_marker_is_judged_on_this_machines_clock(self):
+        self.apply(another_machine_patches())
+        refused = mock.patch("vidfunnel.record._share_clock_ns", side_effect=PermissionError(13, "Permission denied"))
+        self.apply([refused])
+        # Without the share's clock the lock itself is judged by the 24 h rule: it is 30 h old and silent as long.
+        self.write_dead_lock(beat_seconds_ago=30 * 3600, started_hours_ago=30)
+        self.write_marker(TAKEOVER_MARKER_STALE_SECONDS + 60)
+        behind = ShiftedClock(-600)  # this machine's clock is ten minutes behind: the marker looks young
+        with behind.patches()[0], behind.patches()[1]:
+            with self.assertRaises(LockHeld) as caught:
+                self.take()
+        self.assertIn("on this machine's clock (no probe file could be created)", str(caught.exception))
+        self.assertEqual(self.names(), [LOCK_NAME, TAKEOVER_MARKER])
+        warnings = []
+        lock = self.take(warnings)
+        self.assertIn("cleared the takeover marker", warnings[0])
+        self.assertIn("ago on this machine's clock (no probe file could be created), more than 300 s", warnings[0])
+        self.assert_ours(lock)
+        self.assertEqual(self.names(), [LOCK_NAME])
+
+    def two_takers(self, first, second):
+        """Run first() on a thread named 'first' and second() on one named 'second'; their outcomes by name."""
+        outcomes = {}
+
+        def run(work):
+            try:
+                outcomes[threading.current_thread().name] = ("ACQUIRED", work())
+            except LockHeld as held:
+                outcomes[threading.current_thread().name] = ("HELD", str(held))
+            except BaseException as error:
+                outcomes[threading.current_thread().name] = ("ERROR", repr(error))
+
+        threads = [threading.Thread(target=run, args=(work,), name=name)
+                   for work, name in ((first, "first"), (second, "second"))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
+        return outcomes
+
+    def stale_marker_race(self, ordering):
+        """Two takers judge one stale marker; `ordering` patches who moves it when; returns their outcomes."""
+        self.apply(another_machine_patches())
+        self.write_dead_lock()
+        self.write_marker(TAKEOVER_MARKER_STALE_SECONDS + 60)
+        both_judged = threading.Barrier(2, timeout=30)
+        real_judge = FolderLock._judge_marker
+        judged_once = set()
+
+        def judge_then_meet(lock, path):
+            found = real_judge(lock, path)
+            if threading.current_thread().name not in judged_once:
+                judged_once.add(threading.current_thread().name)
+                both_judged.wait()
+            return found
+
+        self.apply([mock.patch.object(FolderLock, "_judge_marker", judge_then_meet)] + ordering)
+        def acquire():
+            return FolderLock(self.base, warn=lambda line: None).acquire()
+
+        outcomes = self.two_takers(acquire, acquire)
+        for kind, value in outcomes.values():
+            if kind == "ACQUIRED":
+                self.addCleanup(value.release)
+        return outcomes
+
+    def test_two_takers_clearing_one_stale_marker_one_proceeds(self):
+        """The first moves the marker aside and the second's rename finds nothing; whichever creates the fresh marker
+        first proceeds, the other is refused."""
+        first_moved = threading.Event()
+        second_tried = threading.Event()
+        real_move = FolderLock._move_marker_aside
+
+        def move(lock, *arguments):
+            if threading.current_thread().name == "second":
+                self.assertTrue(first_moved.wait(30))
+                try:
+                    return real_move(lock, *arguments)
+                finally:
+                    second_tried.set()
+            return real_move(lock, *arguments)
+
+        def step(name):
+            if name == "moved-aside" and threading.current_thread().name == "first":
+                first_moved.set()
+                self.assertTrue(second_tried.wait(30))
+
+        outcomes = self.stale_marker_race([mock.patch.object(FolderLock, "_move_marker_aside", move),
+                                           mock.patch("vidfunnel.record._takeover_step", side_effect=step)])
+        self.assertEqual(sorted(kind for kind, _value in outcomes.values()), ["ACQUIRED", "HELD"], outcomes)
+        winner = [value for kind, value in outcomes.values() if kind == "ACQUIRED"][0]
+        loser = [value for kind, value in outcomes.values() if kind == "HELD"][0]
+        self.assertTrue(any(reason in loser for reason in RACE_REFUSALS), outcomes)
+        self.assert_ours(winner)
+        self.assertEqual(self.names(), [LOCK_NAME])
+
+    def test_a_fresh_marker_moved_aside_by_a_late_clearer_stops_both(self):
+        """The rare case: the second clearer moves the first's new marker; neither touches the lock."""
+        first_marked = threading.Event()
+        second_done = threading.Event()
+        real_move = FolderLock._move_marker_aside
+
+        def move(lock, *arguments):
+            if threading.current_thread().name == "second":
+                self.assertTrue(first_marked.wait(30))
+                try:
+                    return real_move(lock, *arguments)
+                finally:
+                    second_done.set()
+            return real_move(lock, *arguments)
+
+        def step(name):
+            if name == "marked" and threading.current_thread().name == "first":
+                first_marked.set()
+                self.assertTrue(second_done.wait(30))
+
+        outcomes = self.stale_marker_race([mock.patch.object(FolderLock, "_move_marker_aside", move),
+                                           mock.patch("vidfunnel.record._takeover_step", side_effect=step)])
+        self.assertEqual(outcomes["second"][0], "HELD", outcomes)
+        self.assertIn("was replaced while this run cleared it as stale", outcomes["second"][1])
+        self.assertEqual(outcomes["first"][0], "HELD", outcomes)
+        self.assertIn("is no longer at its path", outcomes["first"][1])
+        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8"))["host"], "deadhost")
+        left = [name for name in self.names() if name.startswith(MARKER_ASIDE_PREFIX)]
+        self.assertEqual(len(left), 1, self.names())
+        self.assertIn(left[0], outcomes["second"][1])
+        self.assertEqual(self.names(), sorted([LOCK_NAME] + left))
+
+    def test_a_moved_aside_marker_swept_away_before_it_is_read_lets_the_takeover_go_on(self):
+        """Another taker's sweep removes our moved-aside stale marker between our stat and our read of it."""
+        self.apply(another_machine_patches())
+        self.write_dead_lock()
+        self.write_marker(TAKEOVER_MARKER_STALE_SECONDS + 60)
+        real_read = vidfunnel.record._read_json
+        swept = []
+
+        def swept_first(path):
+            if os.path.basename(os.fspath(path)).startswith(MARKER_ASIDE_PREFIX):
+                os.unlink(os.fspath(path))
+                swept.append(path)
+            return real_read(path)
+
+        warnings = []
+        with mock.patch("vidfunnel.record._read_json", side_effect=swept_first):
+            lock = self.take(warnings)
+        self.assertEqual(len(swept), 1)
+        self.assert_ours(lock)
+        self.assertEqual(self.names(), [LOCK_NAME])
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("taking over lock", warnings[0])
+
+    def test_a_marker_replaced_before_the_rename_stops_the_taker(self):
+        self.apply(another_machine_patches())
+        self.write_dead_lock()
+        lock_before = self.snapshot(self.lock_file())
+        foreign = {"host": "foreignhost", "pid": 31337, "token": uuid.uuid4().hex, "started": "2026-11-10T00:00:00Z"}
+
+        def replace_marker(step):
+            if step == "written":
+                staged = self.base / RECORD_DIR / "foreign-staged"
+                write_bytes(staged, json.dumps(foreign).encode("utf-8"))
+                os.replace(str(staged), str(self.marker_file()))
+
+        with mock.patch("vidfunnel.record._takeover_step", side_effect=replace_marker):
+            with self.assertRaises(LockHeld) as caught:
+                self.take()
+        self.assertIn("this run's takeover marker '{}' is no longer at its path".format(self.marker_file()),
+                      str(caught.exception))
+        self.assertEqual(self.snapshot(self.lock_file()), lock_before)
+        self.assertEqual(json.loads(self.marker_file().read_text(encoding="utf-8")), foreign)
+        self.assertEqual(self.names(), [LOCK_NAME, TAKEOVER_MARKER])
+        self.assert_nothing_of_ours()
+
+    def test_a_beat_while_the_taker_holds_the_marker_refuses_and_the_holder_beats_on(self):
+        script = self.base / "holder.py"
+        script.write_text(FAST_HOLDER_SCRIPT, encoding="utf-8")
+        holder = subprocess.Popen([sys.executable, str(script), str(self.base)], stdout=subprocess.PIPE,
+                                  universal_newlines=True,
+                                  env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent)))
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline(), "ACQUIRED\n")
+        before = os.stat(str(self.lock_file()))
+        content = self.lock_file().read_bytes()
+        read_at = []
+
+        def share_clock_two_hours_on(directory):
+            read_at.append(os.stat(str(self.lock_file())).st_mtime_ns)
+            return read_at[-1] + 2 * 3600 * 10 ** 9  # the judge takes the holder for silent
+
+        def beat_lands(step):
+            if step == "marked":
+                self.wait_until(lambda: os.stat(str(self.lock_file())).st_mtime_ns > read_at[0], 30,
+                                "the holder did not beat")
+
+        self.apply(another_machine_patches())
+        with mock.patch("vidfunnel.record._share_clock_ns", side_effect=share_clock_two_hours_on), \
+                mock.patch("vidfunnel.record._takeover_step", side_effect=beat_lands):
+            with self.assertRaises(LockHeld) as caught:
+                self.take()
+        self.assertIn("its holder beat while the lock was being judged; not taken over", str(caught.exception))
+        self.assertEqual(self.names(), [LOCK_NAME])
+        after = os.stat(str(self.lock_file()))
+        self.assertEqual((after.st_dev, after.st_ino), (before.st_dev, before.st_ino))
+        self.assertEqual(self.lock_file().read_bytes(), content)
+        beaten = after.st_mtime_ns
+        self.wait_until(lambda: os.stat(str(self.lock_file())).st_mtime_ns > beaten, 30, "the holder stopped beating")
+        self.assertIsNone(holder.poll())
+        self.assert_nothing_of_ours()
+
+    # ------------------------------------------------------------ failures
+
+    def test_a_failure_at_any_step_leaves_the_lock_and_no_file_of_ours(self):
+        self.apply(another_machine_patches())
+        real_open, real_write, real_fsync, real_replace = os.open, os.write, os.fsync, os.replace
+        failure = OSError(errno.EIO, "Input/output error")
+        cases = ("marker create", "marker write", "marker fsync", "temporary create", "temporary write",
+                 "temporary fsync", "flock", "rename", "interrupt")
+        for case in cases:
+            with self.subTest(case=case):
+                self.write_dead_lock()
+                lock_before = self.snapshot(self.lock_file())
+                kinds = {}
+                opened = []
+
+                def kind_of(path):
+                    name = os.path.basename(os.fspath(path))
+                    if name == TAKEOVER_MARKER:
+                        return "marker"
+                    if name.startswith(NEW_LOCK_PREFIX):
+                        return "temporary"
+                    return None
+
+                def failing_open(path, flags, *rest):
+                    kind = kind_of(path)
+                    if case == "{} create".format(kind):
+                        raise failure
+                    handle = real_open(path, flags, *rest)
+                    if kind is not None:
+                        kinds[handle] = kind
+                        opened.append(handle)
+                    return handle
+
+                def failing_write(handle, data):
+                    if case == "{} write".format(kinds.get(handle)):
+                        raise failure
+                    return real_write(handle, data)
+
+                def failing_fsync(handle):
+                    if case == "{} fsync".format(kinds.get(handle)):
+                        raise failure
+                    return real_fsync(handle)
+
+                def failing_replace(source, target):
+                    if case == "rename" and kind_of(source) == "temporary":
+                        raise failure
+                    return real_replace(source, target)
+
+                def failing_flock(handle):
+                    raise failure
+
+                def interrupted(step):
+                    if case == "interrupt" and step == "written":
+                        raise KeyboardInterrupt
+
+                patches = [mock.patch("vidfunnel.record.os.open", side_effect=failing_open),
+                           mock.patch("vidfunnel.record.os.write", side_effect=failing_write),
+                           mock.patch("vidfunnel.record.os.fsync", side_effect=failing_fsync),
+                           mock.patch("vidfunnel.record.os.replace", side_effect=failing_replace),
+                           mock.patch("vidfunnel.record._takeover_step", side_effect=interrupted)]
+                if case == "flock":
+                    patches.append(mock.patch("vidfunnel.record._take_flock", side_effect=failing_flock))
+                with contextlib.ExitStack() as stack:
+                    for patch in patches:
+                        stack.enter_context(patch)
+                    expected = KeyboardInterrupt if case == "interrupt" else OSError
+                    with self.assertRaises(expected) as caught:
+                        self.take()
+                if expected is OSError:
+                    self.assertIs(caught.exception, failure)
+                self.assertEqual(self.snapshot(self.lock_file()), lock_before)
+                self.assertEqual(self.names(), [LOCK_NAME])
+                self.assert_nothing_of_ours()
+                for handle in opened:
+                    with self.assertRaises(OSError, msg="descriptor {} left open".format(kinds[handle])):
+                        os.fstat(handle)
+
+    def test_a_marker_that_cannot_be_removed_is_left_with_a_warning_and_the_lock_is_ours(self):
+        self.apply(another_machine_patches())
+        self.write_dead_lock()
+        real_unlink = os.unlink
+
+        def refusing_unlink(path, *rest, **options):
+            if os.fspath(path) == str(self.marker_file()):
+                raise OSError(errno.EIO, "Input/output error")
+            return real_unlink(path, *rest, **options)
+
+        warnings = []
+        with mock.patch("vidfunnel.record.os.unlink", side_effect=refusing_unlink):
+            lock = self.take(warnings)
+        self.assert_ours(lock)
+        self.assertEqual(len(warnings), 2, warnings)
+        self.assertIn("cannot remove the takeover marker '{}': [Errno 5] Input/output error; a marker older than "
+                      "300 s is cleared by the next takeover".format(self.marker_file()), warnings[0])
+        self.assertIn("taking over lock", warnings[1])
+        self.assertEqual(self.names(), [LOCK_NAME, TAKEOVER_MARKER])
+
+    def test_a_temporary_lock_removed_before_the_rename_is_lock_held(self):
+        """Another run took a stalled taker's file for a leftover: the rename finds nothing and changes nothing."""
+        self.apply(another_machine_patches())
+        self.write_dead_lock()
+        lock_before = self.snapshot(self.lock_file())
+
+        def remove_ours(step):
+            if step == "checked":
+                for name in self.names():
+                    if name.startswith(NEW_LOCK_PREFIX):
+                        os.unlink(str(self.base / RECORD_DIR / name))
+
+        with mock.patch("vidfunnel.record._takeover_step", side_effect=remove_ours):
+            with self.assertRaises(LockHeld) as caught:
+                self.take()
+        self.assertIn("was removed before it could be put in place", str(caught.exception))
+        self.assertEqual(self.snapshot(self.lock_file()), lock_before)
+        self.assertEqual(self.names(), [LOCK_NAME])
+        self.assert_nothing_of_ours()
+
+    # ------------------------------------------------------------ after a takeover
+
+    @unittest.skipIf(not Path("/proc/sys/kernel/random/boot_id").exists(), "the flock rule needs a kernel boot id")
+    def test_a_lock_taken_over_behaves_like_any_other(self):
+        from vidfunnel.ffmpeg import run
+        from vidfunnel.record import lock_problem
+        self.apply([mock.patch("vidfunnel.record.in_container", return_value=False),
+                    mock.patch.object(vidfunnel.record, "HEARTBEAT_SECONDS", 0.02),
+                    mock.patch.object(vidfunnel.record, "HEARTBEAT_POLL_SECONDS", 0.01)])
+        self.write_dead_lock()
+        warnings = []
+        lock = self.take(warnings)
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assert_ours(lock)
+        content = json.loads(self.lock_file().read_text(encoding="utf-8"))
+        self.assertIs(content["flock"], True)
+        self.assertEqual(content["device"], os.stat(str(self.lock_file())).st_dev)
+        self.assertEqual(content["boot"], Path("/proc/sys/kernel/random/boot_id").read_text().strip())
+        with held_lock_fds() as descriptors:
+            self.assertEqual(descriptors, (lock.handle,))
+        self.assertIsNone(lock_problem(self.base))
+        stamp = os.stat(str(self.lock_file())).st_mtime_ns
+        self.wait_until(lambda: lock.beat.count >= 3, 30, "the new holder does not beat")
+        self.wait_until(lambda: os.stat(str(self.lock_file())).st_mtime_ns > stamp, 30, "no beat moved the mtime")
+        judge = ("import sys; from unittest import mock; from vidfunnel.record import FolderLock, LockHeld\n"
+                 "mock.patch('vidfunnel.record.in_container', return_value=False).start()\n"
+                 "try:\n"
+                 "    FolderLock(sys.argv[1], warn=lambda line: None).acquire()\n"
+                 "    print('ACQUIRED')\n"
+                 "except LockHeld as held:\n"
+                 "    print('HELD', held)\n")
+        completed = subprocess.run([sys.executable, "-c", judge, str(self.base)], capture_output=True,
+                                   universal_newlines=True, timeout=60,
+                                   env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent)))
+        self.assertIn("HELD", completed.stdout, completed.stderr)
+        self.assertIn("still holds the lock file's flock", completed.stdout)
+        child = ("import fcntl, os, sys\n"
+                 "print(os.fstat(int(sys.argv[1])).st_ino)\n")
+        completed = run([sys.executable, "-c", child, str(lock.handle)], check=False)
+        self.assertEqual(completed.stdout.split(), [str(os.stat(str(self.lock_file())).st_ino)], completed.stderr)
+        self.assertIsNone(lock_problem(self.base))
+        lock.release()
+        self.assertEqual(self.names(), [vidfunnel.record.TAKEOVER_FILE])
+        self.assert_nothing_of_ours()
+
+    def test_leftovers_older_than_the_threshold_are_removed_and_never_read_as_records(self):
+        from vidfunnel.plan import recorded_claims
+        from vidfunnel.report import _folder_records
+        self.apply(another_machine_patches())
+        source = write_bytes(self.base / "clip.avi", b"video")
+        save_record(source, new_record(source, self.base))
+        leftovers = {}
+        for prefix in (NEW_LOCK_PREFIX, MARKER_ASIDE_PREFIX):
+            for age in (TAKEOVER_MARKER_STALE_SECONDS + 120, TAKEOVER_MARKER_STALE_SECONDS - 120):
+                name = prefix + uuid.uuid4().hex
+                path = write_bytes(self.base / RECORD_DIR / name, json.dumps({"host": "goner"}).encode("utf-8"))
+                stamp = time.time_ns() - age * 10 ** 9
+                os.utime(str(path), ns=(stamp, stamp))
+                leftovers[name] = age
+        young = sorted(name for name, age in leftovers.items() if age < TAKEOVER_MARKER_STALE_SECONDS)
+
+        def records_seen():
+            return ([record["id"] for _folder, record in iter_records(self.base)],
+                    [record["id"] for record in _folder_records(self.base)],
+                    recorded_claims(self.base, "clip.mp4", "other.avi"))
+
+        expected = ([load_record(source)["id"]], [load_record(source)["id"]], [])
+        self.assertEqual(records_seen(), expected)
+        self.write_dead_lock()
+        lock = self.take()
+        self.assertEqual(self.names(), sorted([LOCK_NAME, "clip.avi.json"] + young))
+        self.assertEqual(records_seen(), expected)
+        lock.release()
+
+    # ------------------------------------------------------------ an older vidfunnel's takeover
+
+    OLD_TAKER = {"host": "oldhost", "pid": 2020, "started": "2026-11-01T00:00:00Z", "container": False}
+
+    def old_style_takeover(self, create=True):
+        """What a vidfunnel before 20261110 does once it has judged the lock dead: unlink, then O_EXCL create."""
+        try:
+            os.unlink(str(self.lock_file()))
+        except FileNotFoundError:
+            pass
+        if create:
+            handle = os.open(str(self.lock_file()), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(json.dumps(self.OLD_TAKER))
+
+    def take_with_old_taker_at(self, at_step, create=True):
+        def old_taker(step):
+            if step == at_step:
+                self.old_style_takeover(create)
+
+        self.apply(another_machine_patches())
+        self.write_dead_lock()
+        with mock.patch("vidfunnel.record._takeover_step", side_effect=old_taker):
+            return self.take()
+
+    def test_an_old_style_takeover_while_we_hold_the_marker_wins_before_our_recheck(self):
+        with self.assertRaises(LockHeld) as caught:
+            self.take_with_old_taker_at("marked")
+        self.assertEqual(caught.exception.host, "oldhost")
+        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), self.OLD_TAKER)
+        self.assertEqual(self.names(), [LOCK_NAME])
+        self.assert_nothing_of_ours()
+
+    def test_an_old_style_unlink_at_our_last_check_is_lock_held_and_the_path_stays_free(self):
+        def old_taker(step):
+            if step == "written":
+                self.old_style_takeover(create=False)
+
+        self.apply(another_machine_patches())
+        self.write_dead_lock()
+        with mock.patch("vidfunnel.record._takeover_step", side_effect=old_taker):
+            with self.assertRaises(LockHeld) as caught:
+                self.take()
+        self.assertIn("its lock file '{}' was removed by another run while this run was taking it over".format(
+            self.lock_file()), str(caught.exception))
+        self.assertEqual(self.names(), [])
+        self.assert_nothing_of_ours()
+
+    def test_an_old_style_unlink_after_our_last_check_lets_our_rename_create_the_lock(self):
+        lock = self.take_with_old_taker_at("checked", create=False)
+        self.assert_ours(lock)
+        with self.assertRaises(FileExistsError):  # the older taker's create that follows its unlink
+            os.open(str(self.lock_file()), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        self.assertEqual(self.names(), [LOCK_NAME])
+
+    def test_an_old_style_takeover_after_our_last_check_is_replaced_by_our_rename(self):
+        """The window that remains: the older taker's new lock is renamed over and it learns of that only
+        through a heartbeat of its own (vidfunnel 20261109.4 and later)."""
+        lock = self.take_with_old_taker_at("checked")
+        self.assert_ours(lock)
+        self.assertEqual(self.names(), [LOCK_NAME])
+
+    def test_an_old_style_takeover_just_after_our_rename_is_lock_held_and_left_alone(self):
+        with self.assertRaises(LockHeld) as caught:
+            self.take_with_old_taker_at("renamed")
+        self.assertEqual(caught.exception.host, "oldhost")
+        self.assertIn("got it first", str(caught.exception))
+        self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), self.OLD_TAKER)
+        self.assertEqual(self.names(), [LOCK_NAME])
+        self.assert_nothing_of_ours()
 
 
 class BandTests(unittest.TestCase):
