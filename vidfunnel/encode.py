@@ -71,11 +71,16 @@ otherwise kept, with the flag 'fit-capped'. The refit command is rendered
 like convert's, with the same checks; the CRF it raises is the one the
 existing output was made with (refit_base_crf).
 
-Before anything runs, planned records whose output names meet in one
-folder (output.name or output.interim_name, compared case-insensitively)
-are all refused: both source names are printed, neither record is
-touched, and they are counted as 'collision' in the summary. A folder
-whose lock is held, or cannot be created (a read-only folder), is skipped;
+A folder's lock is taken when its first item that needs one starts and
+released when its last item has ended (vidfunnel.turns); with --jobs N at
+most N folders are held at once. A record that is already converted, its
+output unchanged, is reported without a lock, so a finished folder is
+never locked. When a folder is entered, under its lock and on the records
+as they are on disk then, planned records whose output names meet in it
+(output.name or output.interim_name, compared case-insensitively) are all
+refused: both source names are printed, neither record is touched, and
+they are counted as 'collision' in the summary. A folder whose lock is
+held, or cannot be created (a read-only folder), is skipped for the run;
 the second kind and any collision make run() exit with EXIT_ERROR.
 
 The record is saved after every change of state, so an interrupted run
@@ -85,7 +90,7 @@ whose output still matches its fingerprint (content only, the time is not
 compared) is reported as already converted.
 """
 
-VERSION = "20261109.4"
+VERSION = "20261110"
 
 import math
 import os
@@ -107,10 +112,9 @@ from vidfunnel.interrupt import Interrupted, child_interrupted, drain_after_item
 from vidfunnel.interrupt import check as check_interrupted
 from vidfunnel.progress import Progress, StageSummary, ffmpeg_progress_callback, item_tag, say, tagged
 from vidfunnel.stopfile import forget_item, raise_if_stopped_now, remember_item
+from vidfunnel.turns import DRAINING, HELD, FolderTurns, not_started
 from vidfunnel.record import (
     RECORD_DIR,
-    FolderLock,
-    LockHeld,
     LockLost,
     RecordError,
     add_flag,
@@ -668,6 +672,7 @@ def _convert_one(tools, key, record, options, progress, stream, quiet, verbose, 
     if verbose:
         say(shlex.join(argv), stream)
 
+    ensure_lock(folder)  # a run whose lock was taken must not unlink the new holder's part file
     removed, problem = _clear_leftover(temp)
     if problem is not None:
         say("skipping '{}': {}".format(label, problem), stream)
@@ -1107,6 +1112,11 @@ def refit_one(tools, source, record, options, progress=None, position=None, tota
         say(shlex.join(plan["argv"]), stream)
     temp = plan["part"]
     output_path = plan["output_path"]
+    try:
+        ensure_lock(folder)  # a run whose lock was taken must not unlink the new holder's part file
+    except LockLost as lost:
+        say("skipping '{}': {}".format(label, lost), stream)
+        return "skipped", str(lost)
     removed, problem = _clear_leftover(temp)  # before the record is touched: a skip leaves it as it was
     if problem is not None:
         say("skipping '{}': {}".format(label, problem), stream)
@@ -1329,33 +1339,14 @@ def refit_paths(tools, paths, options, progress=None):
         if reason is None:
             selected.append((key, folder))
         else:
-            skipped(reason)
+            skipped(reason)  # no lock: nothing is written for a record that is not selected
 
-    locks = []
-    runnable = []
-    locked_folders = {}
+    # No lock is taken here: each folder's lock is taken when its first item starts and released
+    # after its last one (vidfunnel.turns), so the folders not being worked on stay free for other hosts.
+    runnable = _folder_order(selected)
+    total = len(runnable)
+    turns = FolderTurns(_item_counts(runnable), lambda message: say(message, out), lock_errors=summary.lock_errors)
     try:
-        for key, folder in selected:
-            name = str(folder)
-            if name not in locked_folders:
-                lock = FolderLock(folder, warn=lambda message: say(message, out))
-                try:
-                    lock.acquire()
-                    locks.append(lock)
-                    locked_folders[name] = True
-                except LockHeld as error:
-                    say("skipping folder '{}': {}".format(folder, error), out)
-                    locked_folders[name] = False
-                except OSError as error:
-                    say("skipping folder '{}': cannot take its lock: {}".format(folder, error), out)
-                    locked_folders[name] = False
-                    summary.lock_errors.append(name)
-            if locked_folders[name]:
-                runnable.append(key)
-            else:
-                skipped("folder locked")
-        total = len(runnable)
-
         def work(position, key):
             tag = item_tag("refit", position, total)
             try:
@@ -1368,30 +1359,47 @@ def refit_paths(tools, paths, options, progress=None):
                 return "failed", None
             return refit_one(tools, key, record, options, shared, position, total)
 
+        def item(position, key, folder):
+            """(outcome, reason), or None when the run drained before the folder was entered (not started)."""
+            try:
+                turn = turns.enter(folder)
+                if turn == DRAINING:
+                    return None
+                if turn != HELD:
+                    return "skipped", "folder locked"
+                return work(position, key)
+            finally:
+                turns.leave(folder)
+
         results = []
         if jobs == 1:
-            for position, key in enumerate(runnable, 1):
-                if drain_before_next(len(runnable) - position + 1, Path(key).parent):
+            for position, (key, folder) in enumerate(runnable, 1):
+                if drain_before_next(len(runnable) - position + 1, folder):
                     break
-                results.append(work(position, key))
+                result = item(position, key, folder)
+                if result is None:
+                    drain_before_next(len(runnable) - position + 1)  # draining: counts this item and the rest left
+                    break
+                results.append(result)
                 drain_after_item()
         else:
             results = [None] * len(runnable)
 
             def refit_done(index, value):
+                if value is None:
+                    not_started()
                 results[index] = value
 
-            run_pool(jobs, [lambda position=position, key=key: work(position, key)
-                            for position, key in enumerate(runnable, 1)], refit_done,
-                     folders=[Path(key).parent for key in runnable])
+            run_pool(jobs, [lambda position=position, key=key, folder=folder: item(position, key, folder)
+                            for position, (key, folder) in enumerate(runnable, 1)], refit_done,
+                     folders=[folder for _key, folder in runnable])
         for outcome, reason in [result for result in results if result is not None]:  # None: not started (drain)
             if outcome == "skipped":
                 skipped(reason)
             else:
                 summary.add(outcome)
     finally:
-        for lock in locks:
-            lock.release()
+        turns.close()
     if summary.skip_reasons:
         say("skipped: {}".format(", ".join("{} {}".format(count, reason)
                                            for reason, count in sorted(summary.skip_reasons.items()))), out)
@@ -1497,6 +1505,40 @@ def _dry_run(tools, entries, options, stream):
             say("  then par2 create -r{} -n1 for '{}'".format(redundancy, output_path.name), stream)
 
 
+def _folder_order(items):
+    """[(key, folder)] with each folder's items together, folders in order of first appearance, items in order."""
+    by_folder = {}
+    for key, folder in items:
+        by_folder.setdefault(str(folder), []).append((key, folder))
+    return [item for members in by_folder.values() for item in members]
+
+
+def _item_counts(items):
+    """{folder name: number of items} of [(key, folder)]."""
+    counts = {}
+    for _key, folder in items:
+        counts[str(folder)] = counts.get(str(folder), 0) + 1
+    return counts
+
+
+def _finished_record(key, folder):
+    """The record when convert would only report it as already converted (its output still matches), else None.
+
+    The same first checks as _conversion (plain names, then skip_reason),
+    read without a lock and writing nothing; a record that cannot be read
+    or judged here is None, and the item then runs under the folder's lock.
+    """
+    try:
+        record = load_record(key)
+        if record is None or record_name_problem(record) is not None:
+            return None
+        if skip_reason(record, output_path_for(record, folder)) == "already converted":
+            return record
+    except (RecordError, ValueError, TypeError, AttributeError, KeyError):
+        return None
+    return None
+
+
 def _shared_outputs(runnable, stream):
     """(kept, refused): runnable [(key, folder)] without the planned records whose output names meet.
 
@@ -1582,34 +1624,24 @@ def convert_paths(tools, paths, options, progress=None):
         say("convert: dry run, {} record(s) shown; nothing written".format(len(wanted)), out)
         return summary
 
-    locks = []
-    runnable = []
-    locked_folders = {}
-    try:
-        for key, folder, record in wanted:
-            name = str(folder)
-            if name not in locked_folders:
-                lock = FolderLock(folder, warn=lambda message: say(message, out))
-                try:
-                    lock.acquire()
-                    locks.append(lock)
-                    locked_folders[name] = True
-                except LockHeld as error:
-                    say("skipping folder '{}': {}".format(folder, error), out)
-                    locked_folders[name] = False
-                except OSError as error:
-                    say("skipping folder '{}': cannot take its lock: {}".format(folder, error), out)
-                    locked_folders[name] = False
-                    summary.lock_errors.append(name)
-            if locked_folders[name]:
-                runnable.append((key, folder))
-            else:
-                summary.add("skipped")
-        runnable, collided = _shared_outputs(runnable, out)
-        if collided:
-            summary.add("collision", collided)
-        total = len(runnable)
+    # No lock is taken here: each folder's lock is taken when its first item that needs one starts and
+    # released after its last item (vidfunnel.turns). The output-name check runs then, under that lock.
+    runnable = _folder_order([(key, folder) for key, folder, _record in wanted])
+    total = len(runnable)
+    collided = set()
+    members_of = {}
+    for key, folder in runnable:
+        members_of.setdefault(str(folder), []).append((key, folder))
 
+    def check_outputs(folder):
+        members = members_of.get(str(folder), [])
+        kept, _count = _shared_outputs(members, out)
+        kept_keys = set(str(key) for key, _member_folder in kept)
+        collided.update(str(key) for key, _member_folder in members if str(key) not in kept_keys)
+
+    turns = FolderTurns(_item_counts(runnable), lambda message: say(message, out), on_enter=check_outputs,
+                        lock_errors=summary.lock_errors)
+    try:
         def work(position, key):
             tag = item_tag("convert", position, total)
             try:
@@ -1630,19 +1662,48 @@ def convert_paths(tools, paths, options, progress=None):
                 return "skipped"
             return "failed"
 
+        def item(position, key, folder):
+            """The item's outcome, or None when the run drained before the folder was entered (not started)."""
+            try:
+                finished = _finished_record(key, folder)
+                if finished is not None:
+                    # Already converted, output unchanged: reported without a lock, as nothing is written.
+                    say("skipping '{}': already converted".format(_label(finished)),
+                        tagged(out, item_tag("convert", position, total)))
+                    return "skipped"
+                turn = turns.enter(folder)
+                if turn == DRAINING:
+                    return None
+                if turn != HELD:
+                    return "skipped"
+                if str(key) in collided:
+                    return "collision"
+                return work(position, key)
+            finally:
+                turns.leave(folder)
+
+        def done(_index, outcome):
+            if outcome is None:
+                not_started()
+            else:
+                summary.add(outcome)
+
         if jobs == 1:
             for position, (key, folder) in enumerate(runnable, 1):
                 if drain_before_next(len(runnable) - position + 1, folder):
                     break
-                summary.add(work(position, key))
+                outcome = item(position, key, folder)
+                if outcome is None:
+                    drain_before_next(len(runnable) - position + 1)  # draining: counts this item and the rest left
+                    break
+                summary.add(outcome)
                 drain_after_item()
         else:
-            run_pool(jobs, [lambda position=position, key=key: work(position, key)
-                            for position, (key, _folder) in enumerate(runnable, 1)],
-                     lambda _index, outcome: summary.add(outcome), folders=[folder for _key, folder in runnable])
+            run_pool(jobs, [lambda position=position, key=key, folder=folder: item(position, key, folder)
+                            for position, (key, folder) in enumerate(runnable, 1)],
+                     done, folders=[folder for _key, folder in runnable])
     finally:
-        for lock in locks:
-            lock.release()
+        turns.close()
     say(summary.format("'{}/' under each folder".format(RECORD_DIR)), out)
     return summary
 

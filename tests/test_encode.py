@@ -8,7 +8,7 @@ ends at 'converted' or 'verified' depends on whether vidfunnel.verify is
 present, so both are accepted.
 """
 
-VERSION = "20261109.4"
+VERSION = "20261110"
 
 import argparse
 import contextlib
@@ -30,7 +30,9 @@ import unittest.mock
 from pathlib import Path
 
 import vidfunnel
+import vidfunnel.interrupt
 import vidfunnel.record as record_module
+import vidfunnel.turns
 from vidfunnel import encode
 from vidfunnel.encode import (
     REFIT_DENOISE,
@@ -1401,6 +1403,35 @@ class ConvertRunTest(unittest.TestCase):
         self.assert_nothing_written_after_the_takeover(seen, summary, text, "could not be checked")
         self.assertIn("Input/output error", text)
 
+    def test_a_leftover_part_file_is_not_removed_once_the_lock_was_taken(self):
+        """Host B took the folder and is writing this record's part file: the old holder leaves it alone."""
+        record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
+        leftover = part_path(self.root / "h264_high_mkv_aac.mp4", record["id"])
+        leftover.write_bytes(b"PARTIAL OUTPUT OF HOST B, STILL BEING WRITTEN")
+        record_bytes = record_path(self.root / REMUX_SOURCE).read_bytes()
+        self.quiet_lost_lock()
+        lock_file = self.root / ".vidfunnel" / "lock"
+        real_change = encode.source_change
+
+        def checked_then_host_b(*arguments, **keywords):
+            result = real_change(*arguments, **keywords)
+            os.unlink(str(lock_file))
+            lock_file.write_text(json.dumps({"host": "hostb", "pid": 4242, "started": "2026-11-09T12:00:00Z",
+                                             "heartbeat": {"interval": 300}}), encoding="utf-8")
+            return result
+
+        progress = quiet()
+        with unittest.mock.patch("vidfunnel.encode.source_change", side_effect=checked_then_host_b), \
+                unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=AssertionError("ffmpeg started")):
+            summary = convert_paths(TOOLS, [str(self.root)], convert_options(), progress)
+        text = progress.stream.getvalue()
+        self.assertEqual(leftover.read_bytes(), b"PARTIAL OUTPUT OF HOST B, STILL BEING WRITTEN", text)
+        self.assertEqual(record_path(self.root / REMUX_SOURCE).read_bytes(), record_bytes)
+        self.assertNotIn("removed a stale", text)
+        self.assertEqual(summary.counts.get("skipped"), 1, text)
+        self.assertIn("skipping 'h264_high_mkv_aac.mkv': the lock of folder '{}' was taken over by another "
+                      "run".format(self.root), text)
+
     def test_a_held_lock_converts_as_before(self):
         self.plan(REMUX_SOURCE)
         progress = quiet()
@@ -2095,6 +2126,37 @@ class RefitRunTest(unittest.TestCase):
         self.assertIn("skipping '{}': the lock of folder '{}' was taken over by another run".format(
             REFIT_SOURCE, self.root), text)
         self.assertTrue(vidfunnel.interrupt.draining.is_set())
+
+    def test_a_refit_leftover_part_file_is_not_removed_once_the_lock_was_taken(self):
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
+        output = self.root / REFIT_OUTPUT
+        output_bytes = output.read_bytes()
+        record_bytes = record_path(self.root / REFIT_SOURCE).read_bytes()
+        leftover = part_path(output, load_record(self.root / REFIT_SOURCE)["id"])
+        leftover.write_bytes(b"PARTIAL REFIT OF HOST B, STILL BEING WRITTEN")
+        self.addCleanup(vidfunnel.interrupt.draining.clear)
+        self.addCleanup(vidfunnel.interrupt.drain_tally.reset)
+        lock_file = self.root / ".vidfunnel" / "lock"
+        real_plan = encode.refit_plan
+
+        def planned_then_host_b(*arguments, **keywords):
+            result = real_plan(*arguments, **keywords)
+            os.unlink(str(lock_file))
+            lock_file.write_text(json.dumps({"host": "hostb", "pid": 4242, "started": "2026-11-09T12:00:00Z",
+                                             "heartbeat": {"interval": 300}}), encoding="utf-8")
+            return result
+
+        with unittest.mock.patch("vidfunnel.encode.refit_plan", side_effect=planned_then_host_b), \
+                unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=AssertionError("ffmpeg started")), \
+                unittest.mock.patch("vidfunnel.record._warn"):
+            summary, text = self.refit()
+        self.assertEqual(leftover.read_bytes(), b"PARTIAL REFIT OF HOST B, STILL BEING WRITTEN", text)
+        self.assertEqual(output.read_bytes(), output_bytes)
+        self.assertEqual(record_path(self.root / REFIT_SOURCE).read_bytes(), record_bytes)
+        self.assertNotIn("removed a stale", text)
+        self.assertIn("skipping '{}': the lock of folder '{}' was taken over by another run".format(
+            REFIT_SOURCE, self.root), text)
+        self.assertEqual(summary.counts["refitted"] + summary.counts["kept"] + summary.counts["failed"], 0, text)
 
     def test_larger_reencode_is_refitted_replaced_and_verified(self):
         records = self.plan_and_convert(REFIT_SOURCE, REENCODE_SOURCE, reencode_video=True)
@@ -3060,6 +3122,529 @@ class NowStopFileAfterEncodeTest(unittest.TestCase):
         self.assertNotIn("refit", load_record(key).get("stages") or {})
         self.assertEqual(sha256_of(output), before)
         self.assertEqual([name for name in os.listdir(str(self.root)) if name.endswith(".part")], [])
+
+
+# --- folder locks taken on demand (vidfunnel.turns) -------------------------------------------
+
+POLL_DEADLINE_SECONDS = 60.0
+
+
+def lock_file_of(folder):
+    return Path(folder) / ".vidfunnel" / "lock"
+
+
+def foreign_live_lock(folder):
+    """A lock of another machine whose holder beat just now; another run must skip the folder."""
+    import datetime
+    path = lock_file_of(folder)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    started = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path.write_text(json.dumps({"host": "elsewhere-host", "pid": 4242, "started": started, "container": False,
+                                "machine": "elsewhere-machine", "machine_source": "machine-id",
+                                "boot": "elsewhere-boot", "flock": False,
+                                "heartbeat": {"interval": record_module.HEARTBEAT_SECONDS}}), encoding="utf-8")
+    return path
+
+
+def wait_for(condition, deadline=POLL_DEADLINE_SECONDS):
+    """Poll `condition` until it is true; False only when the generous deadline passes first."""
+    import time
+    ends = time.monotonic() + deadline
+    while time.monotonic() < ends:
+        if condition():
+            return True
+        time.sleep(0.01)
+    return condition()
+
+
+class LockFileSampler(object):
+    """A thread that looks at the folders' lock files every millisecond and notes which folders it saw one in."""
+
+    def __init__(self, folders):
+        import threading
+        self.folders = [Path(folder) for folder in folders]
+        self.seen = set()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.watch, daemon=True)
+
+    def watch(self):
+        while not self.stop.is_set():
+            self.seen.update(folder.name for folder in self.folders if lock_file_of(folder).exists())
+            self.stop.wait(0.001)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_error):
+        self.stop.set()
+        self.thread.join(POLL_DEADLINE_SECONDS)
+        return False
+
+
+class OnDemandLockCase(unittest.TestCase):
+    """convert and convert --refit over hand-written records, the item's work replaced by a stub; no ffmpeg."""
+
+    def setUp(self):
+        import threading
+        import vidfunnel.interrupt
+        import vidfunnel.stopfile
+        for flag in (vidfunnel.interrupt.interrupted, vidfunnel.interrupt.draining):
+            flag.clear()
+            self.addCleanup(flag.clear)
+        vidfunnel.interrupt.drain_tally.reset()
+        self.addCleanup(vidfunnel.interrupt.drain_tally.reset)
+        vidfunnel.stopfile.reset()
+        self.addCleanup(vidfunnel.stopfile.reset)
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "library"
+        self.root.mkdir()
+        self.guard = threading.Lock()
+        self.events = []
+        self.started_items = []
+        self.during = {}          # source stem -> callable(key) run inside the stub, before its save
+        self.item_delay = 0.0     # seconds slept at the start of each item, before its folder is entered
+        self.acquire_delay = 0.0  # seconds slept inside each FolderLock.acquire
+
+    def tally(self):
+        import vidfunnel.interrupt
+        tally = vidfunnel.interrupt.drain_tally
+        return tally.seen, tally.finished, tally.left
+
+    def write_record(self, folder_name, stem, kind="planned", output_name=None):
+        folder = self.root / folder_name
+        folder.mkdir(exist_ok=True)
+        source = folder / (stem + ".avi")
+        source.write_bytes(("source of " + stem + " ").encode() * 64)
+        record = new_record(source)
+        record["output"]["name"] = output_name or stem + ".mp4"
+        if kind == "planned":
+            record["action"] = "remux"
+            set_status(record, "planned")
+        elif kind == "finished":
+            output = folder / record["output"]["name"]
+            output.write_bytes(("output of " + stem + " ").encode() * 32)
+            record["action"] = "remux"
+            record["output"]["fingerprint"] = cheap_fingerprint(output)
+            set_status(record, "converted")
+        elif kind == "refit":
+            output = folder / record["output"]["name"]
+            output.write_bytes(("larger output of " + stem + " ").encode() * 96)
+            record["action"] = "reencode"
+            record["flags"] = ["output-larger"]
+            record["output"]["fingerprint"] = cheap_fingerprint(output)
+            set_status(record, "converted")
+        save_record(source, record)
+        return source
+
+    def library(self, layout, kind="planned"):
+        """layout: [(folder name, [stems])]; returns {stem: source path}."""
+        return {stem: self.write_record(folder_name, stem, kind) for folder_name, stems in layout
+                for stem in stems}
+
+    def record_bytes(self, sources):
+        return {stem: record_path(source).read_bytes() for stem, source in sources.items()}
+
+    def log(self, *event):
+        import threading
+        with self.guard:
+            self.events.append(event + (threading.get_ident(),))
+
+    def held_here(self, folder):
+        try:
+            return json.loads(lock_file_of(folder).read_text(encoding="utf-8")).get("pid") == os.getpid()
+        except (OSError, ValueError):
+            return False
+
+    def item_work(self, key, record, refit):
+        """The stub's work: note the start and whether this run holds the folder, run `during`, save, note the end."""
+        key = Path(key)
+        folder = key.parent
+        self.started_items.append(key.stem)
+        self.log("start", folder.name, key.stem, self.held_here(folder))
+        if key.stem in self.during:
+            self.during[key.stem](key)
+        try:
+            encode.ensure_lock(folder)  # what the real item does before each write
+        except record_module.LockLost as lost:
+            self.log("end", folder.name, key.stem, False)
+            return ("skipped", str(lost)) if refit else {"outcome": "skipped", "skipped": str(lost)}
+        stage_name = "refit" if refit else "convert"
+        record.setdefault("stages", {})[stage_name] = {"outcome": "stand-in"}
+        set_status(record, "converted")
+        save_record(key, record)
+        self.log("end", folder.name, key.stem, True)
+        return ("refitted", None) if refit else {"outcome": "ok"}
+
+    def patches(self, refit):
+        import threading
+        import time
+        case = self
+        real_finished = encode._finished_record
+
+        class LoggedLock(record_module.FolderLock):
+            def acquire(self):
+                case.log("acquiring", Path(self.folder).name)
+                if case.acquire_delay:
+                    time.sleep(case.acquire_delay)
+                return super().acquire()
+
+            def release(self):
+                super().release()
+                case.log("released", Path(self.folder).name)
+
+        def finished(key, folder):
+            if case.item_delay:
+                time.sleep(case.item_delay)
+            return real_finished(key, folder)
+
+        def convert_stand_in(tools, key, record, options, progress=None, position=None, total=None):
+            return case.item_work(key, record, refit=False)
+
+        def refit_stand_in(tools, key, record, options, progress=None, position=None, total=None):
+            return case.item_work(key, record, refit=True)
+
+        return [unittest.mock.patch("vidfunnel.turns.FolderLock", LoggedLock),
+                unittest.mock.patch("vidfunnel.encode._finished_record", side_effect=finished),
+                unittest.mock.patch("vidfunnel.encode.convert_one", side_effect=convert_stand_in),
+                unittest.mock.patch("vidfunnel.encode.refit_one", side_effect=refit_stand_in),
+                unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=AssertionError("ffmpeg started")),
+                unittest.mock.patch("vidfunnel.record._warn")]
+
+    def run_convert(self, jobs=1, refit=False):
+        progress = quiet()
+        with contextlib.ExitStack() as stack:
+            for patch in self.patches(refit):
+                stack.enter_context(patch)
+            summary = convert_paths(None, [str(self.root)], convert_options(jobs=jobs, refit=refit), progress)
+        return summary, progress.stream.getvalue()
+
+    def acquired(self):
+        return [event[1] for event in self.events if event[0] == "acquiring"]
+
+    def assert_every_item_held_its_folder(self):
+        starts = [event for event in self.events if event[0] == "start"]
+        self.assertTrue(starts)
+        self.assertEqual([event for event in starts if not event[3]], [], "an item ran without its folder's lock")
+
+    def assert_released_after_its_last_item(self, folder_name):
+        """Released once, after every item of the folder ended, by a thread whose last step was one of its items.
+
+        Which item is the folder's last is decided when each item leaves, after the stand-in's 'end' is logged,
+        so the release may come from a thread other than the one that logged the last 'end'; but the releasing
+        thread does nothing between ending its own item of the folder and the release.
+        """
+        releases = [index for index, event in enumerate(self.events)
+                    if event[0] == "released" and event[1] == folder_name]
+        self.assertEqual(len(releases), 1, self.events)
+        release = releases[0]
+        ends = [index for index, event in enumerate(self.events) if event[0] == "end" and event[1] == folder_name]
+        self.assertTrue(ends, folder_name)
+        self.assertLess(ends[-1], release, "released before the folder's last item ended")
+        thread = self.events[release][-1]
+        before = [event for event in self.events[:release] if event[-1] == thread]
+        self.assertTrue(before, self.events)
+        self.assertEqual(before[-1][:2], ("end", folder_name), self.events)
+
+
+class OnDemandConvertTest(OnDemandLockCase):
+
+    THREE = [("first", ["harbour"]), ("second", ["meadow", "orchard"]), ("third", ["valley"])]
+
+    def check_three_folders_without_jobs(self, refit):
+        sources = self.library(self.THREE, kind="refit" if refit else "planned")
+        seen = {}
+
+        def look(key):
+            seen[key.stem] = {name: lock_file_of(self.root / name).exists() for name in ("first", "second", "third")}
+
+        self.during = {"meadow": look, "orchard": look}
+        summary, text = self.run_convert(refit=refit)
+        for stem in ("meadow", "orchard"):
+            self.assertEqual(seen[stem], {"first": False, "second": True, "third": False}, text)
+        for name in ("first", "second", "third"):
+            self.assertFalse(lock_file_of(self.root / name).exists(), name)
+        self.assertEqual(self.acquired(), ["first", "second", "third"])
+        self.assert_every_item_held_its_folder()
+        self.assertEqual(summary.counts["refitted" if refit else "converted"], 4, text)
+        for stem in sources:
+            self.assertEqual(load_record(sources[stem])["status"], "converted")
+
+    def test_three_folders_without_jobs_hold_one_lock_at_a_time(self):
+        self.check_three_folders_without_jobs(refit=False)
+
+    def test_refit_three_folders_without_jobs_hold_one_lock_at_a_time(self):
+        self.check_three_folders_without_jobs(refit=True)
+
+    def check_two_jobs(self, refit):
+        layout = [("first", ["harbour"]), ("second", ["meadow", "orchard", "prairie"]), ("third", ["valley"])]
+        for item_delay, acquire_delay in ((0.0, 0.0), (0.05, 0.05)):
+            with self.subTest(item_delay=item_delay, acquire_delay=acquire_delay):
+                for name in ("first", "second", "third"):
+                    shutil.rmtree(str(self.root / name), ignore_errors=True)
+                self.events.clear()
+                self.library(layout, kind="refit" if refit else "planned")
+                self.item_delay, self.acquire_delay = item_delay, acquire_delay
+                summary, text = self.run_convert(jobs=2, refit=refit)
+                self.assertNotIn("locked by this run itself", text)
+                self.assertNotIn("skipping folder", text)
+                self.assertEqual(summary.counts["refitted" if refit else "converted"], 5, text)
+                self.assertEqual(sorted(self.acquired()), ["first", "second", "third"])
+                # Logged in one order under one lock, 'acquiring' before FolderLock.acquire creates the file and
+                # 'released' after release() has removed it: each span covers its lock file's whole life, so
+                # the most spans open at once bounds the lock files that existed at once. (Looking at the files
+                # one after another cannot: a file seen early and another seen later need not have coexisted.)
+                held = 0
+                most = 0
+                for event in self.events:
+                    if event[0] == "acquiring":
+                        held += 1
+                        most = max(most, held)
+                    elif event[0] == "released":
+                        held -= 1
+                self.assertLessEqual(most, 2, self.events)
+                self.assert_every_item_held_its_folder()
+                for name in ("first", "second", "third"):
+                    self.assert_released_after_its_last_item(name)
+                    self.assertFalse(lock_file_of(self.root / name).exists(), name)
+
+    def test_two_jobs_hold_at_most_two_folders_and_free_each_after_its_last_item(self):
+        self.check_two_jobs(refit=False)
+
+    def test_refit_two_jobs_hold_at_most_two_folders_and_free_each_after_its_last_item(self):
+        self.check_two_jobs(refit=True)
+
+    def check_a_folder_held_elsewhere(self, refit):
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                for name in ("first", "second", "third"):
+                    shutil.rmtree(str(self.root / name), ignore_errors=True)
+                self.events.clear()
+                self.started_items.clear()
+                sources = self.library(self.THREE, kind="refit" if refit else "planned")
+                foreign = foreign_live_lock(self.root / "second")
+                foreign_bytes = foreign.read_bytes()
+                held_records = self.record_bytes({stem: sources[stem] for stem in ("meadow", "orchard")})
+                summary, text = self.run_convert(jobs=jobs, refit=refit)
+                self.assertEqual(text.count("skipping folder '{}': ".format(self.root / "second")), 1, text)
+                self.assertIn("elsewhere-host", text)
+                self.assertEqual(self.record_bytes({stem: sources[stem] for stem in ("meadow", "orchard")}),
+                                 held_records)
+                self.assertEqual(foreign.read_bytes(), foreign_bytes)
+                self.assertEqual(sorted(self.started_items), ["harbour", "valley"])
+                if refit:
+                    self.assertEqual((summary.counts["refitted"], summary.counts["skipped"]), (2, 2), text)
+                    self.assertEqual(summary.skip_reasons, {"folder locked": 2})
+                else:
+                    self.assertEqual((summary.counts["converted"], summary.counts["skipped"]), (2, 2), text)
+                self.assertEqual(summary.lock_errors, [])
+                self.assertFalse(lock_file_of(self.root / "first").exists())
+                self.assertFalse(lock_file_of(self.root / "third").exists())
+
+    def test_a_folder_another_machine_holds_is_skipped_and_left_as_it_was(self):
+        self.check_a_folder_held_elsewhere(refit=False)
+
+    def test_refit_skips_a_folder_another_machine_holds(self):
+        self.check_a_folder_held_elsewhere(refit=True)
+
+    def test_a_finished_folder_is_never_locked_and_reports_as_before(self):
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                for name in ("summit", "valley"):
+                    shutil.rmtree(str(self.root / name), ignore_errors=True)
+                self.events.clear()
+                finished = {stem: self.write_record("summit", stem, "finished") for stem in ("glacier", "ridge")}
+                finished["lagoon"] = self.write_record("valley", "lagoon", "finished")
+                planned = self.write_record("valley", "meadow")
+                finished_bytes = self.record_bytes(finished)
+                with LockFileSampler([self.root / "summit", self.root / "valley"]) as sampler:
+                    summary, text = self.run_convert(jobs=jobs)
+                self.assertNotIn("summit", self.acquired())
+                self.assertNotIn("summit", sampler.seen, "the finished folder's lock file appeared")
+                self.assertEqual(self.acquired(), ["valley"], "the mixed folder was not locked")
+                for position, stem in ((1, "glacier"), (2, "ridge"), (3, "lagoon")):
+                    self.assertIn("[convert {}/4] skipping '{}.avi': already converted\n".format(position, stem),
+                                  text)
+                self.assertEqual((summary.counts["skipped"], summary.counts["converted"]), (3, 1), text)
+                self.assertEqual(self.record_bytes(finished), finished_bytes)
+                self.assertEqual(load_record(planned)["status"], "converted")
+                self.assert_every_item_held_its_folder()
+
+    def test_output_names_are_judged_under_the_lock_on_the_records_as_they_are_then(self):
+        real_shared = encode._shared_outputs
+        judged = []
+
+        def shared(runnable, stream):
+            judged.append([(Path(folder).name, self.held_here(folder)) for _key, folder in runnable])
+            return real_shared(runnable, stream)
+
+        cases = (("made to meet after collection", "dusk.mp4", "dawn.mp4", 2),
+                 ("parted after collection", "dawn.mp4", "dusk.mp4", 0))
+        for words, collected_name, turn_name, collisions in cases:
+            with self.subTest(words):
+                for name in ("first", "second"):
+                    shutil.rmtree(str(self.root / name), ignore_errors=True)
+                judged.clear()
+                self.started_items.clear()
+                self.write_record("first", "harbour")
+                dawn = self.write_record("second", "dawn")
+                dusk = self.write_record("second", "dusk", output_name=collected_name)
+
+                def rename_dusk(_key, name=turn_name):
+                    record = load_record(dusk)
+                    record["output"]["name"] = name
+                    record_module._write_json_atomic(record_path(dusk), record)
+
+                self.during = {"harbour": rename_dusk}
+                with unittest.mock.patch("vidfunnel.encode._shared_outputs", side_effect=shared):
+                    summary, text = self.run_convert()
+                self.assertEqual(summary.counts.get("collision", 0), collisions, text)
+                self.assertTrue(all(held for members in judged for _name, held in members), judged)
+                if collisions:
+                    self.assertEqual(self.started_items, ["harbour"])
+                    self.assertIn("refusing 'dawn.avi' and 'dusk.avi' in '{}'".format(self.root / "second"), text)
+                    self.assertEqual(load_record(dawn)["status"], "planned")
+                else:
+                    self.assertEqual(self.started_items, ["harbour", "dawn", "dusk"])
+                    self.assertNotIn("refusing", text)
+
+    def test_two_planned_records_with_one_output_name_are_refused_under_the_lock(self):
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                shutil.rmtree(str(self.root / "second"), ignore_errors=True)
+                self.started_items.clear()
+                sources = {"dawn": self.write_record("second", "dawn", output_name="evening.mp4"),
+                           "dusk": self.write_record("second", "dusk", output_name="evening.mp4")}
+                before = self.record_bytes(sources)
+                summary, text = self.run_convert(jobs=jobs)
+                self.assertEqual(summary.counts.get("collision"), 2, text)
+                self.assertEqual(self.started_items, [])
+                self.assertEqual(self.record_bytes(sources), before)
+
+    def check_a_drain_during_the_first_folder(self, refit):
+        import vidfunnel.interrupt
+        layout = [("first", ["harbour", "jetty"]), ("second", ["meadow", "orchard"]), ("third", ["valley"])]
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                for name in ("first", "second", "third"):
+                    shutil.rmtree(str(self.root / name), ignore_errors=True)
+                vidfunnel.interrupt.draining.clear()
+                vidfunnel.interrupt.drain_tally.reset()
+                self.events.clear()
+                self.started_items.clear()
+                self.library(layout, kind="refit" if refit else "planned")
+                # jetty, on the other worker with --jobs 2, ends only once the drain has begun, so no worker can
+                # take the second folder's first item before it.
+                self.during = {"harbour": lambda _key: vidfunnel.interrupt.draining.set(),
+                               "jetty": lambda _key: self.assertTrue(
+                                   wait_for(vidfunnel.interrupt.draining.is_set), "the drain never began")}
+                summary, text = self.run_convert(jobs=jobs, refit=refit)
+                self.assertEqual(self.acquired(), ["first"])
+                self.assertFalse(any(lock_file_of(self.root / name).exists() for name in ("first", "second", "third")))
+                seen, _finished, left = self.tally()
+                self.assertTrue(seen)
+                self.assertNotIn("meadow", self.started_items)
+                self.assertEqual(left, 5 - len(self.started_items), self.started_items)
+                self.assertEqual(summary.counts["refitted" if refit else "converted"], len(self.started_items), text)
+
+    def test_a_drain_during_the_first_folder_locks_no_further_folder(self):
+        self.check_a_drain_during_the_first_folder(refit=False)
+
+    def test_refit_a_drain_during_the_first_folder_locks_no_further_folder(self):
+        self.check_a_drain_during_the_first_folder(refit=True)
+
+    def check_a_drain_as_an_item_starts(self, refit):
+        """The drain begins after the item was handed out and before its folder is entered: no lock, counted left."""
+        import vidfunnel.interrupt
+        layout = [("first", ["harbour"]), ("second", ["meadow"]), ("third", ["valley"])]
+        real_enter = vidfunnel.turns.FolderTurns.enter
+
+        def enter(turns, folder):
+            if Path(folder).name == "second":
+                vidfunnel.interrupt.draining.set()
+            return real_enter(turns, folder)
+
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                for name in ("first", "second", "third"):
+                    shutil.rmtree(str(self.root / name), ignore_errors=True)
+                vidfunnel.interrupt.draining.clear()
+                vidfunnel.interrupt.drain_tally.reset()
+                self.events.clear()
+                self.started_items.clear()
+                self.library(layout, kind="refit" if refit else "planned")
+                with unittest.mock.patch.object(vidfunnel.turns.FolderTurns, "enter", enter):
+                    summary, text = self.run_convert(jobs=jobs, refit=refit)
+                self.assertNotIn("second", self.acquired())
+                self.assertNotIn("meadow", self.started_items)
+                done = summary.counts["refitted" if refit else "converted"]
+                seen, finished, left = self.tally()
+                self.assertTrue(seen)
+                self.assertEqual(done, len(self.started_items), text)
+                self.assertEqual(left, 3 - len(self.started_items), (jobs, self.started_items, self.tally()))
+                self.assertGreaterEqual(finished, 0)
+
+    def test_a_drain_as_an_item_starts_takes_no_new_lock_and_counts_it_left(self):
+        self.check_a_drain_as_an_item_starts(refit=False)
+
+    def test_refit_a_drain_as_an_item_starts_takes_no_new_lock_and_counts_it_left(self):
+        self.check_a_drain_as_an_item_starts(refit=True)
+
+    def check_a_lost_lock_in_the_first_folder(self, refit):
+        import vidfunnel.interrupt
+        layout = [("first", ["harbour", "jetty"]), ("second", ["meadow"])]
+        sources = self.library(layout, kind="refit" if refit else "planned")
+
+        def taken_over(key):
+            lock = lock_file_of(key.parent)
+            os.unlink(str(lock))
+            foreign_live_lock(key.parent)
+
+        self.during = {"harbour": taken_over}
+        jetty_bytes = record_path(sources["jetty"]).read_bytes()
+        harbour_bytes = record_path(sources["harbour"]).read_bytes()
+        summary, text = self.run_convert(refit=refit)
+        self.assertTrue(vidfunnel.interrupt.draining.is_set())
+        self.assertEqual(self.acquired(), ["first"])
+        self.assertEqual(self.started_items, ["harbour"])
+        self.assertEqual(record_path(sources["harbour"]).read_bytes(), harbour_bytes)
+        self.assertEqual(record_path(sources["jetty"]).read_bytes(), jetty_bytes)
+        self.assertIn("elsewhere-host", lock_file_of(self.root / "first").read_text(encoding="utf-8"),
+                      "the new holder's lock was removed")
+        self.assertFalse(lock_file_of(self.root / "second").exists())
+        self.assertEqual(self.tally(), (True, 1, 2), "harbour was in progress when the drain began; jetty and meadow "
+                         "never started")
+        self.assertEqual(summary.counts["skipped"], 1, text)
+
+    def test_a_lost_lock_in_the_first_folder_drains_and_locks_no_further_folder(self):
+        self.check_a_lost_lock_in_the_first_folder(refit=False)
+
+    def test_refit_a_lost_lock_in_the_first_folder_drains_and_locks_no_further_folder(self):
+        self.check_a_lost_lock_in_the_first_folder(refit=True)
+
+    def test_a_stop_file_in_the_second_folder_only_lets_the_first_complete(self):
+        import vidfunnel.stopfile
+        layout = [("first", ["harbour", "jetty"]), ("second", ["meadow", "orchard"]), ("third", ["valley"])]
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                for name in ("first", "second", "third"):
+                    shutil.rmtree(str(self.root / name), ignore_errors=True)
+                import vidfunnel.interrupt
+                vidfunnel.interrupt.draining.clear()
+                vidfunnel.interrupt.drain_tally.reset()
+                vidfunnel.stopfile.reset()
+                self.events.clear()
+                self.started_items.clear()
+                self.library(layout)
+                record_module._write_json_atomic(vidfunnel.stopfile.stop_path(str(self.root / "second")),
+                                                 {"host": "elsewhere", "requested": None, "mode": "drain"})
+                with unittest.mock.patch("sys.stderr", io.StringIO()):
+                    summary, text = self.run_convert(jobs=jobs)
+                self.assertEqual(sorted(self.started_items), ["harbour", "jetty"])
+                self.assertEqual(self.acquired(), ["first"])
+                self.assertEqual(summary.counts["converted"], 2, text)
+                self.assertEqual(self.tally()[2], 3)
 
 
 class LineStreamPipeTest(unittest.TestCase):

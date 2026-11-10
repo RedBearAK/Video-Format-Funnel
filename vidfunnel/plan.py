@@ -57,7 +57,7 @@ analyze_input(), which runs the same passes with an input-argument list and
 returns the same dict shape, built from analyze's own pure rules.
 """
 
-VERSION = "20261109.4"
+VERSION = "20261110"
 
 import hashlib
 import json
@@ -131,6 +131,7 @@ from vidfunnel.record import (
     save_record,
     set_status,
 )
+from vidfunnel.turns import DRAINING, HELD, FolderTurns, not_started
 
 SOURCE_EXTENSIONS = {
     "avi", "flv", "swf", "wmv", "asf", "mpg", "mpeg", "mpe", "m2v", "vob", "mov", "qt", "mkv", "webm", "mp4",
@@ -1952,10 +1953,14 @@ def _output_name_key(work):
 
 def _plan_parallel(tools, options, progress, stream, summary, capabilities, folders, by_folder, siblings, total,
                    jobs):
-    """The items of every locked folder through a pool of `jobs` threads; returns the rows in list order.
+    """The items of every folder through a pool of `jobs` threads; returns the rows in list order.
 
     One task per item, except that items with the same output name in one
-    folder share a task and run one after another in list order. A
+    folder share a task and run one after another in list order. A folder's
+    lock is taken when its first group starts (vidfunnel.turns: one
+    acquisition per folder, the others wait for it), so a folder no group
+    has reached yet stays free for other hosts; a folder another run holds
+    is skipped and its groups are counted skipped without running. A
     folder's file is updated and its lock released on this thread as soon as
     its last group has returned, so a finished folder is open to convert
     while the others are still planned.
@@ -1968,32 +1973,32 @@ def _plan_parallel(tools, options, progress, stream, summary, capabilities, fold
     interrupted item leaves its record as it was; groups not yet started are
     not started, and the folders still open keep their folder file unchanged.
     """
-    folder_locks = {}
     groups = {}
     order = []
     position = 0
+    for folder in folders:
+        for work, found in by_folder[folder]:
+            position += 1
+            key = _output_name_key(work)
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append((folder, work, found, position))
+    record_locks = {folder: threading.Lock() for folder in folders}
+    outstanding = {}
+    for key in order:
+        folder = groups[key][0][0]
+        outstanding[folder] = outstanding.get(folder, 0) + 1
+    turns = FolderTurns(outstanding, lambda message: say(message, stream), lock_errors=summary.lock_errors)
     try:
-        for folder in folders:
-            entries = by_folder[folder]
-            lock = _take_folder_lock(folder, entries, summary, stream)
-            if lock is None:
-                position += len(entries)
-                continue
-            folder_locks[folder] = lock
-            for work, found in entries:
-                position += 1
-                key = _output_name_key(work)
-                if key not in groups:
-                    groups[key] = []
-                    order.append(key)
-                groups[key].append((folder, work, found, position))
-        record_locks = {folder: threading.Lock() for folder in folder_locks}
-        outstanding = {}
-        for key in order:
-            folder = groups[key][0][0]
-            outstanding[folder] = outstanding.get(folder, 0) + 1
-
         def plan_group(members):
+            """[(number, (outcome, record))], or None when the run drained before the folder was entered."""
+            folder = members[0][0]
+            turn = turns.enter(folder)
+            if turn == DRAINING:
+                return None
+            if turn != HELD:  # held by another run, or no lock file can be created: said once by turns.enter
+                return [(number, ("skipped", None)) for _folder, _work, _found, number in members]
             results = []
             for folder, work, found, number in members:
                 results.append((number, _plan_entry(tools, work, found, options, siblings.get(folder, []),
@@ -2004,12 +2009,16 @@ def _plan_parallel(tools, options, progress, stream, summary, capabilities, fold
         results = []
 
         def group_done(index, group_results):
-            results.extend(group_results)
-            folder = groups[order[index]][0][0]
-            outstanding[folder] -= 1
-            if outstanding[folder] == 0:
-                _update_folder_file(folder, [work for work, _found in by_folder[folder]])
-                folder_locks.pop(folder).release()
+            members = groups[order[index]]
+            if group_results is None:
+                not_started(len(members))
+            else:
+                results.extend(group_results)
+            folder = members[0][0]
+            # After the folder's last group, its file is updated under its lock (only a folder this run
+            # held), then the lock is released.
+            turns.leave(folder, last=lambda held: _update_folder_file(held, [work for work, _found
+                                                                             in by_folder[folder]]))
 
         run_pool(jobs, [lambda members=groups[key]: plan_group(members) for key in order], group_done,
                  sizes=[len(groups[key]) for key in order], folders=[groups[key][0][0] for key in order])
@@ -2020,8 +2029,7 @@ def _plan_parallel(tools, options, progress, stream, summary, capabilities, fold
                 rows.append(_table_row(outcome, record))
         return rows
     finally:
-        for lock in folder_locks.values():
-            lock.release()
+        turns.close()
 
 
 def _update_folder_file(folder, works):

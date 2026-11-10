@@ -43,7 +43,7 @@ stop file: its folder is forgotten for vidfunnel.stopfile.check_now
 moved, is never cut off by one and the item is not left half done.
 """
 
-VERSION = "20261109.4"
+VERSION = "20261110"
 
 import contextlib
 import os
@@ -836,6 +836,13 @@ def run(args):
                 problems.append(str(error))
                 position += len(members)
                 continue
+            except OSError as error:  # the lock file cannot be created (a read-only folder)
+                _error("skipping {} file(s): cannot take the lock of folder '{}': {}".format(
+                    len(members), folder, error))
+                summary.add("skipped (locked)", len(members))
+                problems.append(str(error))
+                position += len(members)
+                continue
             try:
                 for member_number, candidate in enumerate(members):
                     if drain_before_next(len(members) - member_number + later, folder):
@@ -860,6 +867,13 @@ def run(args):
                     stack.enter_context(FolderLock(folder))
                 except LockHeld as error:
                     _error("skipping {} file(s): {}".format(len(members), error))
+                    summary.add("skipped (locked)", len(members))
+                    problems.append(str(error))
+                    position += len(members)
+                    continue
+                except OSError as error:  # the lock file cannot be created (a read-only folder)
+                    _error("skipping {} file(s): cannot take the lock of folder '{}': {}".format(
+                        len(members), folder, error))
                     summary.add("skipped (locked)", len(members))
                     problems.append(str(error))
                     position += len(members)

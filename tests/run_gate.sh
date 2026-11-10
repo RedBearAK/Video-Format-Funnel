@@ -11,7 +11,7 @@
 # Logs go to a temporary folder that is removed when every module passes and kept
 # (its path printed) otherwise. Exit status 0 only when every module passed.
 
-VERSION="20261109.1"
+VERSION="20261110"
 
 set -u
 unset CDPATH
@@ -26,6 +26,7 @@ test_retire         SIGUSR1 and stop files to a process group with a sleeping pa
 test_verify         SIGUSR1 and stop files to a process group with a sleeping ffmpeg stand-in
 test_stopfile       installs and restores the process's signal handlers
 test_podman_wrapper SIGINT and SIGHUP to process groups, polled deadlines and stop delays
+test_shared_library two convert processes share one library through folder locks and gate files
 "
 
 jobs="${VIDFUNNEL_GATE_JOBS:-4}"

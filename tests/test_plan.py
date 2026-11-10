@@ -7,7 +7,7 @@ fixture folder itself is never planned) and skip with a message when
 ffmpeg or the fixtures are missing.
 """
 
-VERSION = "20261109.4"
+VERSION = "20261110"
 
 import contextlib
 import copy
@@ -960,6 +960,100 @@ class PlanRunTest(unittest.TestCase):
         self.assertEqual(sorted(by_name), ["h264_high_mkv_aac.mkv", "movie.avi", "movie.mkv", "xvid_avi_mp3.avi"])
         self.assertEqual(by_name["movie.avi"][0], by_name["movie.mkv"][0])
         self.assertGreaterEqual(by_name["movie.mkv"][1] - by_name["movie.avi"][1], 0.3)
+
+    def test_jobs_lock_a_folder_when_its_first_group_starts_and_skip_a_held_one(self):
+        import datetime
+        from unittest import mock
+        import vidfunnel.plan
+        import vidfunnel.record
+        import vidfunnel.turns
+        from vidfunnel.record import new_record
+        names = ("first", "second", "third")
+        for folder, stem in (("first", "harbour"), ("first", "jetty"), ("second", "meadow"), ("third", "valley")):
+            (self.root / folder).mkdir(exist_ok=True)
+            self.copy_fixture("xvid_avi_mp3.avi", "{}/{}.avi".format(folder, stem))
+        held_record = new_record(self.root / "second" / "meadow.avi")
+        save_record(self.root / "second" / "meadow.avi", held_record)
+        held_bytes = record_path(self.root / "second" / "meadow.avi").read_bytes()
+        foreign = self.root / "second" / ".vidfunnel" / "lock"
+        started = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        foreign.write_text(json.dumps({"host": "elsewhere-host", "pid": 4242, "started": started, "container": False,
+                                       "machine": "elsewhere-machine", "machine_source": "machine-id",
+                                       "boot": "elsewhere-boot", "flock": False,
+                                       "heartbeat": {"interval": vidfunnel.record.HEARTBEAT_SECONDS}}),
+                           encoding="utf-8")
+        foreign_bytes = foreign.read_bytes()
+
+        def lock_of(name):
+            return self.root / name / ".vidfunnel" / "lock"
+
+        def ours(name):
+            try:
+                return json.loads(lock_of(name).read_text(encoding="utf-8")).get("pid") == os.getpid()
+            except (OSError, ValueError):
+                return False
+
+        entered = []
+        real_enter = vidfunnel.turns.FolderTurns.enter
+
+        def enter(turns, folder):
+            entered.append(Path(folder).name)
+            return real_enter(turns, folder)
+
+        both_first = threading.Barrier(2, timeout=60)
+        both_looked = threading.Barrier(2, timeout=60)
+        seen_in_first = []
+        planned = []
+
+        def fake_entry(tools, work, found, options, folder_sources, capabilities, progress, stream, position, total,
+                       record_lock=None):
+            folder = work.source.parent.name
+            planned.append(work.source.name)
+            if folder == "first":
+                both_first.wait()  # both workers are in the first folder: no other folder's group has started
+                seen_in_first.append({name: ours(name) for name in names})
+                both_looked.wait()  # neither group ends, so no worker moves on, before both have looked
+            return "failed", None
+
+        updated = []
+        real_update = vidfunnel.plan._update_folder_file
+
+        def update(folder, works):
+            updated.append((Path(folder).name, ours(Path(folder).name)))
+            return real_update(folder, works)
+
+        stop = threading.Event()
+        strays = []
+
+        def sample():
+            while not stop.is_set():
+                present = [name for name in names if name != "second" and lock_of(name).exists()]
+                after = set(entered)
+                strays.extend(name for name in present if name not in after)
+                stop.wait(0.001)
+
+        sampler = threading.Thread(target=sample, daemon=True)
+        progress = quiet()
+        with mock.patch("vidfunnel.plan._plan_entry", side_effect=fake_entry), \
+                mock.patch("vidfunnel.plan._update_folder_file", side_effect=update), \
+                mock.patch.object(vidfunnel.turns.FolderTurns, "enter", enter):
+            sampler.start()
+            try:
+                summary = plan_paths(TOOLS, [str(self.root)], make_options(jobs=2), progress=progress)
+            finally:
+                stop.set()
+                sampler.join(60)
+        text = progress.stream.getvalue()
+        self.assertEqual(seen_in_first, [{"first": True, "second": False, "third": False}] * 2, text)
+        self.assertEqual(strays, [], "a lock file appeared before any group of its folder started")
+        self.assertEqual(sorted(planned), ["harbour.avi", "jetty.avi", "valley.avi"])
+        self.assertEqual(text.count("skipping folder '{}': ".format(self.root / "second")), 1, text)
+        self.assertEqual(sorted(updated), [("first", True), ("third", True)])
+        self.assertFalse((self.root / "second" / ".vidfunnel" / "folder.json").exists())
+        self.assertEqual(record_path(self.root / "second" / "meadow.avi").read_bytes(), held_bytes)
+        self.assertEqual(foreign.read_bytes(), foreign_bytes)
+        self.assertEqual((summary.counts["skipped"], summary.counts["failed"]), (1, 3), text)
+        self.assertFalse(lock_of("first").exists() or lock_of("third").exists())
 
     def test_read_only_folder_is_skipped_without_a_traceback(self):
         if hasattr(os, "geteuid") and os.geteuid() == 0:

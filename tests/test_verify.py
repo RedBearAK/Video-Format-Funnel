@@ -10,7 +10,7 @@ streams, which is what verify checks. They skip with a message when ffmpeg
 or the fixtures are missing.
 """
 
-VERSION = "20261109.3"
+VERSION = "20261110"
 
 import argparse
 import contextlib
@@ -672,6 +672,45 @@ class VerifyDrainTests(StopCase):
             with self.assertRaises(KeyboardInterrupt):
                 self.verify_drained_in(None)
         self.assertTrue(vidfunnel.stopfile.stopped_now)
+
+
+class VerifyLockFileErrorTests(StopCase):
+    """A folder whose lock file cannot be created is skipped with its reason; hand-written records, no ffmpeg."""
+
+    LAYOUT = VerifyDrainTests.LAYOUT
+    setUp = VerifyDrainTests.setUp
+
+    def test_a_folder_whose_lock_file_cannot_be_created_is_skipped_and_the_next_verified(self):
+        import vidfunnel.verify as verify_module
+        verified = []
+        real_lock = verify_module.FolderLock
+
+        def lock(folder, *rest, **options):
+            made = real_lock(folder, *rest, **options)
+            if Path(folder).name == "first":
+                def refuse():
+                    raise PermissionError(13, "Permission denied", str(made.path))
+                made.acquire = refuse
+            return made
+
+        def verify_one(tools, key, record, options, progress=None):
+            verified.append(Path(key).stem)
+            return dict(record, status="verified", score=95)
+
+        stream = io.StringIO()
+        args = argparse.Namespace(paths=[str(self.root)], ffmpeg=None, quiet=True, verbose=False, log=None,
+                                  yes=False, ssim_check=False, ssim_threshold=0.97, samples=None, stream=stream)
+        with unittest.mock.patch("vidfunnel.deps.require", return_value=None), \
+                unittest.mock.patch.object(verify_module, "FolderLock", side_effect=lock), \
+                unittest.mock.patch.object(verify_module, "verify_record", side_effect=verify_one):
+            code = run(args)
+        text = stream.getvalue()
+        self.assertEqual(verified, ["meadow", "orchard", "valley"], text)
+        self.assertIn("skipping folder '{}': cannot take its lock: [Errno 13] Permission denied".format(
+            self.root / "first"), text)
+        self.assertNotIn("Traceback", text)
+        self.assertRegex(text, r"\b1 skipped\b")
+        self.assertEqual(code, 1, "a folder that could not be locked is an error, as in plan and convert")
 
 
 def _set_at(record, path, value):

@@ -1,6 +1,6 @@
 """Tests for vidfunnel.retire: every guard, quarantine, interim rename, destroy confirmation, run."""
 
-VERSION = "20261109.4"
+VERSION = "20261110"
 
 import argparse
 import hashlib
@@ -1201,6 +1201,41 @@ class RetireDrainTests(StopCase):
                 run(self.namespace())
         self.assertEqual(finished, ["harbour"])
         self.assertTrue(vidfunnel.stopfile.stopped_now)
+
+
+class RetireLockFileErrorTests(StopCase):
+    """A folder whose lock file cannot be created is skipped with its reason, in both modes."""
+
+    LAYOUT = RetireDrainTests.LAYOUT
+    setUp = RetireDrainTests.setUp
+    namespace = RetireDrainTests.namespace
+
+    def test_a_folder_whose_lock_file_cannot_be_created_is_skipped_and_the_next_retired(self):
+        for arguments in ((), ("--destroy-originals-now",)):
+            with self.subTest(arguments=arguments):
+                started = []
+                real_lock = retire.FolderLock
+
+                def lock(folder, *rest, **options):
+                    made = real_lock(folder, *rest, **options)
+                    if Path(folder).name == "first":
+                        def refuse():
+                            raise PermissionError(13, "Permission denied", str(made.path))
+                        made.acquire = refuse
+                    return made
+
+                def retire_candidate(candidate, *rest, **options):
+                    started.append(Path(candidate.name).stem)
+
+                errors = io.StringIO()
+                with mock.patch.object(retire, "FolderLock", side_effect=lock), \
+                        mock.patch.object(retire, "_retire_candidate", side_effect=retire_candidate), \
+                        mock.patch.object(sys, "stdout", io.StringIO()), mock.patch.object(sys, "stderr", errors):
+                    code = run(self.namespace(*arguments))
+                self.assertEqual(started, ["meadow", "orchard", "valley"], errors.getvalue())
+                self.assertIn("retire: skipping 1 file(s): cannot take the lock of folder '{}': [Errno 13] "
+                              "Permission denied".format(self.root / "first"), errors.getvalue())
+                self.assertEqual(code, 1)
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

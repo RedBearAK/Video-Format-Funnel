@@ -39,6 +39,9 @@ gone is skipped, so verify never overwrites a later stage. Before each folder
 and each record it asks vidfunnel.interrupt.drain_before_next, which also
 looks for a stop file above the folder: on a drain (SIGUSR1, 'stop-all') no
 further record starts, and a 'now' stop file stops the run as Ctrl+C would.
+A folder whose lock another run holds, or whose lock file cannot be created
+(a read-only folder), is skipped with the reason; the second kind makes the
+run exit with EXIT_ERROR.
 
 The score is 100 minus the penalties the record carried before any verify
 (the analysis, and plan's own VOB/DVD penalties) minus this run's
@@ -62,7 +65,7 @@ checks them (plan.record_value_problem), in verify_record before any file
 is read, and a record that fails is refused the same way.
 """
 
-VERSION = "20261109.4"
+VERSION = "20261110"
 
 import json
 import os
@@ -774,7 +777,8 @@ def _records_under(path, stream):
 
 
 def run(args):
-    """`vidfunnel verify`: EXIT_OK, EXIT_ERROR when any record failed, EXIT_USAGE, EXIT_DEPS."""
+    """`vidfunnel verify`: EXIT_OK, EXIT_ERROR when any record failed or a folder's lock file could not be
+    created, EXIT_USAGE, EXIT_DEPS."""
     from vidfunnel.cli import EXIT_DEPS, EXIT_ERROR, EXIT_OK, EXIT_USAGE, paths_or_current_directory
     from vidfunnel.deps import DependencyError, require
     paths_or_current_directory(args, "verify")
@@ -816,6 +820,7 @@ def run(args):
     total = sum(len(wanted_in[folder]) for folder in order)
     position = 0
     drained = False
+    lock_errors = []
     for folder_number, folder in enumerate(order):
         records = by_folder[folder]
         wanted = wanted_in[folder]
@@ -828,8 +833,10 @@ def run(args):
         if drain_before_next(len(wanted) + later, folder):
             break
         first_position = position
+        entered = False  # an OSError once the lock is held is not the lock's
         try:
             with FolderLock(folder, warn=lambda message: say(message, stream)):
+                entered = True
                 for item_number, collected in enumerate(wanted):
                     if drain_before_next(len(wanted) - item_number + later, folder):
                         drained = True
@@ -885,9 +892,16 @@ def run(args):
             say("skipping folder '{}': {}".format(folder, error), stream)
             summary.add("skipped", len(wanted))
             position = first_position + len(wanted)
+        except OSError as error:
+            if entered:
+                raise
+            say("skipping folder '{}': cannot take its lock: {}".format(folder, error), stream)
+            summary.add("skipped", len(wanted))
+            lock_errors.append(folder)
+            position = first_position + len(wanted)
         if drained:
             break
     say(summary.format("'{}/' under each folder".format(RECORD_DIR)), stream)
-    return EXIT_ERROR if summary.counts.get("failed") else EXIT_OK
+    return EXIT_ERROR if summary.counts.get("failed") or lock_errors else EXIT_OK
 
 # End of File #
