@@ -7,7 +7,7 @@ checks its folder lock (vidfunnel.record.ensure_lock), writes a stand-in
 output and saves a convert stage. No ffmpeg runs.
 """
 
-VERSION = "20261110"
+VERSION = "20261110.1"
 
 import os
 import subprocess
@@ -17,7 +17,8 @@ import time
 import unittest
 from pathlib import Path
 
-from vidfunnel.record import load_record, new_record, save_record, set_status
+import vidfunnel.record
+from vidfunnel.record import load_record, machine_identity, new_record, save_record, set_status
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEADLINE_SECONDS = 180.0
@@ -136,7 +137,8 @@ class TwoRunsOneLibraryTest(unittest.TestCase):
         return self.library / folder / ".vidfunnel" / "lock"
 
     def two_runs(self, poses, judged_by):
-        """`judged_by`: words of the reason the second run gives for skipping the first run's folder."""
+        """`judged_by`: words of the reason the second run gives for skipping the first run's folder; a
+        '{first_pid}' in it stands for the first run's pid."""
         first = self.start("first", poses[0])
         self.assertTrue(wait_for(lambda: self.markers_of(first.pid) == ["harbour--dawn"]
                                  and self.lock_of("harbour").exists()),
@@ -171,7 +173,7 @@ class TwoRunsOneLibraryTest(unittest.TestCase):
         self.assertIn("skipping folder '{}': ".format(self.library / "harbour"), second_text)
         self.assertIn("skipping folder '{}': ".format(self.library / "meadow"), first_text)
         skip_line = [line for line in second_text.splitlines() if line.startswith("skipping folder")][0]
-        self.assertIn(judged_by, skip_line)
+        self.assertIn(judged_by.format(first_pid=first.pid), skip_line)
         for text in (first_text, second_text):
             self.assertNotIn("taking over", text)
             self.assertNotIn("Traceback", text)
@@ -181,7 +183,16 @@ class TwoRunsOneLibraryTest(unittest.TestCase):
             self.assertFalse(self.lock_of(folder).exists(), folder)
 
     def test_two_runs_on_this_machine_share_the_library_folder_by_folder(self):
-        self.two_runs(("-", "-"), "still holds the lock file's flock on this machine")
+        """The flock rule judges the first run's lock only where the lock records a kernel boot id (Linux).
+        macOS has none, so there the lock is judged by its pid, running on this machine, and its heartbeat (CI
+        run 42840627946); with no machine identity either (a random uuid.getnode), by its heartbeat alone."""
+        if vidfunnel.record.fcntl is not None and vidfunnel.record.boot_id() is not None:
+            judged_by = "still holds the lock file's flock on this machine"
+        elif machine_identity()[0] is not None:
+            judged_by = "its pid {first_pid} is running here and its holder last beat"
+        else:
+            judged_by = "its holder last beat"
+        self.two_runs(("-", "-"), judged_by)
 
     def test_two_runs_posing_as_two_machines_share_the_library_folder_by_folder(self):
         self.two_runs(("lighthouse", "windmill"), "its holder last beat")

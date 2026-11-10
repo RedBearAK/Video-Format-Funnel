@@ -1,6 +1,6 @@
 """Tests for vidfunnel.record: paths, atomic saves, fingerprints, hashes, stages, lock."""
 
-VERSION = "20261110.1"
+VERSION = "20261110.2"
 
 import contextlib
 import datetime
@@ -3609,12 +3609,44 @@ class TakeoverTests(unittest.TestCase):
             return self.take()
 
     def test_an_old_style_takeover_while_we_hold_the_marker_wins_before_our_recheck(self):
+        """On tmpfs and btrfs the older taker's file gets a new inode number; on ext4 it may get the dead
+        lock's, which the next test brings about on any file system."""
         with self.assertRaises(LockHeld) as caught:
             self.take_with_old_taker_at("marked")
         self.assertEqual(caught.exception.host, "oldhost")
         self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), self.OLD_TAKER)
         self.assertEqual(self.names(), [LOCK_NAME])
         self.assert_nothing_of_ours()
+
+    def test_an_old_style_takeover_under_the_dead_locks_inode_number_names_the_older_taker(self):
+        """ext4 may hand the inode number the older taker's unlink frees to the file its create makes (CI run
+        42840627946 met this). Writing the older taker's lock into the dead lock's own inode gives the re-checks
+        the same view on any file system: the judged device and inode, another mtime, size and content. That is
+        another run's lock, not a beat of the dead holder, at both re-checks (after the marker; before the
+        rename)."""
+        self.apply(another_machine_patches())
+        for at_step in ("marked", "written"):
+            with self.subTest(step=at_step):
+                self.write_dead_lock()
+                judged = os.stat(str(self.lock_file()))
+
+                def old_taker_on_the_same_inode(step, at_step=at_step):
+                    if step == at_step:
+                        handle = os.open(str(self.lock_file()), os.O_WRONLY | os.O_TRUNC)
+                        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                            stream.write(json.dumps(self.OLD_TAKER))
+
+                with mock.patch("vidfunnel.record._takeover_step", side_effect=old_taker_on_the_same_inode):
+                    with self.assertRaises(LockHeld) as caught:
+                        self.take()
+                after = os.stat(str(self.lock_file()))
+                self.assertEqual((after.st_dev, after.st_ino), (judged.st_dev, judged.st_ino))
+                self.assertEqual(caught.exception.host, "oldhost")
+                self.assertIn("it took the lock over at the same time and got it first", str(caught.exception))
+                self.assertNotIn("its holder beat", str(caught.exception))
+                self.assertEqual(json.loads(self.lock_file().read_text(encoding="utf-8")), self.OLD_TAKER)
+                self.assertEqual(self.names(), [LOCK_NAME])
+                self.assert_nothing_of_ours()
 
     def test_an_old_style_unlink_at_our_last_check_is_lock_held_and_the_path_stays_free(self):
         def old_taker(step):

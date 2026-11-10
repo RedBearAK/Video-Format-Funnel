@@ -6,7 +6,7 @@ per source file, named after the full source file name including its extension
 Records are the authority; every write is atomic (temp file, then os.replace).
 """
 
-VERSION = "20261110.1"
+VERSION = "20261110.2"
 
 import contextlib
 import datetime
@@ -1568,12 +1568,18 @@ class FolderLock:
     def _recheck(self, judged, holder, age):
         """LockHeld unless the lock file is still the one judged dead (inode, mtime, size and content).
 
-        A file with the same inode whose mtime moved, when the lock says its
-        holder beats, means the holder beat meanwhile and is alive.
+        A file with the same inode and the same content whose mtime moved,
+        when the lock says its holder beats, means the holder beat meanwhile
+        and is alive. Other content under the same inode number is another
+        run's new file: a file system may hand a freed inode number to the
+        next file created (ext4 does), so an older vidfunnel's unlink and
+        create can leave one.
         """
         current = self._identity()
-        if current != judged or self._holder()[0] != holder:
-            if current is not None and current[:2] == judged[:2] and _claims_heartbeat(holder):
+        holder_now = self._holder()[0]
+        if current != judged or holder_now != holder:
+            if (current is not None and current[:2] == judged[:2] and holder_now == holder
+                    and _claims_heartbeat(holder)):
                 raise self._held(holder, age, "its holder beat while the lock was being judged; not taken over")
             raise self._lost_race()
 
