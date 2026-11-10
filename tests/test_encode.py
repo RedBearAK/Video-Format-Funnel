@@ -8,7 +8,7 @@ ends at 'converted' or 'verified' depends on whether vidfunnel.verify is
 present, so both are accepted.
 """
 
-VERSION = "20261110.1"
+VERSION = "20261110.2"
 
 import argparse
 import contextlib
@@ -136,7 +136,7 @@ class NameTest(unittest.TestCase):
 
     def test_is_part_of_takes_this_records_part_names_and_nothing_looser(self):
         ours = (".movie.mp4.0f2b6c1e.0123456789ab.part",   # an attempt's name
-                ".movie.mp4.0f2b6c1e.part")                # the one name of versions before 20261110.1
+                ".movie.mp4.0f2b6c1e.part")                # the one name of vidfunnel before 20261110.3
         look_alikes = (".movie.mp4.a91c44d0.0123456789ab.part",   # another record
                        ".movie.mp4.a91c44d0.part",
                        ".movie.mp4.0f2b6c1e.notes.part",           # a user's file
@@ -1286,7 +1286,7 @@ class ConvertRunTest(unittest.TestCase):
         record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
         id8 = record["id"][:8]
         other_id = SECOND_RECORD_ID if not record["id"].startswith(SECOND_RECORD_ID[:8]) else FIRST_RECORD_ID
-        stale = [".h264_high_mkv_aac.mp4.{}.part".format(id8),                  # before 20261110.1
+        stale = [".h264_high_mkv_aac.mp4.{}.part".format(id8),                  # vidfunnel before 20261110.3
                  ".h264_high_mkv_aac.mp4.{}.0123456789ab.part".format(id8),     # earlier attempts
                  ".h264_high_mkv_aac.mp4.{}.fedcba987654.part".format(id8)]
         kept = [".h264_high_mkv_aac.mp4.{}.part".format(other_id[:8]),          # another record's
@@ -1339,11 +1339,16 @@ class ConvertRunTest(unittest.TestCase):
             writer.wait(20)
             return completed
 
+        progress = quiet()
         with unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=encode_beside_the_orphan):
-            stage = self.convert(REMUX_SOURCE, record)
+            stage = convert_one(TOOLS, self.root / REMUX_SOURCE, record, convert_options(), progress=progress)
         self.assertEqual(stage["outcome"], "ok", stage)
         self.assertEqual(writer.returncode, 0)
         self.assertFalse(seen["existed"], "the leftover part file was still there when ffmpeg started")
+        # The leftover's name is gone (the orphan went on writing into a file without one), and a line says so.
+        self.assertFalse(leftover.exists(), "the leftover part file was not removed")
+        self.assertIn("removed a stale '{}' from an earlier run".format(leftover.name), progress.stream.getvalue())
+        self.assertEqual(self.leftover_parts(), [])
         self.assertNotEqual(seen["inode"], leftover_inode)
         output = self.root / "h264_high_mkv_aac.mp4"
         self.assertEqual(output.stat().st_ino, seen["inode"])
@@ -1376,17 +1381,18 @@ class ConvertRunTest(unittest.TestCase):
         self.assertIn("skipping 'h264_high_mkv_aac.mkv': cannot remove the part file", progress.stream.getvalue())
 
     def taken_over_after_the_encode(self, fail=False, silent_stat=False):
-        """run_tool for convert_paths: A's ffmpeg runs, then host B takes the folder and starts the same record.
+        """run_tool for convert_paths: host B takes the folder over and starts the same record while A encodes.
 
-        B replaces the lock file, clears A's part file as a leftover and writes its own partial output into a
-        part file of its own attempt. Returns (patch, seen); seen gets A's part path ('own'), B's part path and
-        bytes (without silent_stat) and the record's bytes as B left them.
+        Without silent_stat, B replaces the lock file as A's encoder starts, clears the record's leftovers (A's
+        encoder has not opened its part file yet, so there are none) and writes its own partial output into a
+        part file of its own attempt; then A's ffmpeg writes A's own part file, which only A can then remove.
+        Returns (patch, seen); seen gets A's part path ('own') and whether it was there when A's encoder
+        ended, B's part path and bytes (without silent_stat) and the record's bytes as B left them.
         """
         seen = {}
         lock_file = self.root / ".vidfunnel" / "lock"
 
-        def encode_then_host_b(argv, *rest, **values):
-            completed = ffmpeg_run(argv, *rest, **values)
+        def host_b_then_encode(argv, *rest, **values):
             own = Path(argv[-1])
             seen["own"] = own
             if silent_stat:
@@ -1397,16 +1403,18 @@ class ConvertRunTest(unittest.TestCase):
                                                  "heartbeat": {"interval": 300}}), encoding="utf-8")
                 output = self.root / "h264_high_mkv_aac.mp4"
                 record_id = load_record(self.root / REMUX_SOURCE)["id"]
-                self.assertEqual(encode._clear_leftovers(output, record_id), ([own.name], None))
+                self.assertEqual(encode._clear_leftovers(output, record_id), ([], None))
                 part = part_path(output, record_id)
                 part.write_bytes(b"PARTIAL OUTPUT OF HOST B, STILL BEING WRITTEN")
                 seen.update(part=part, part_bytes=part.read_bytes())
+            completed = ffmpeg_run(argv, *rest, **values)
+            seen["own_written"] = own.is_file()
             seen["record_bytes"] = record_path(self.root / REMUX_SOURCE).read_bytes()
             if fail:
                 raise FfmpegError("ffmpeg failed after the takeover", argv=argv, returncode=1, stderr="simulated")
             return completed
 
-        return unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=encode_then_host_b), seen
+        return unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=host_b_then_encode), seen
 
     def quiet_lost_lock(self):
         self.addCleanup(vidfunnel.interrupt.draining.clear)
@@ -1423,6 +1431,7 @@ class ConvertRunTest(unittest.TestCase):
         if "part" in seen:
             self.assertNotEqual(seen["part"], seen["own"])
             self.assertEqual(seen["part"].read_bytes(), seen["part_bytes"], "the new holder's part file was touched")
+        self.assertTrue(seen["own_written"], "A's encoder wrote no part file of its own")
         self.assertFalse(seen["own"].exists(), "the old holder's own part file was left behind")
         self.assertEqual(record_path(self.root / REMUX_SOURCE).read_bytes(), seen["record_bytes"])
         self.assertEqual(summary.counts.get("skipped"), 1, text)
@@ -1827,7 +1836,10 @@ class ConvertRunTest(unittest.TestCase):
         self.assertEqual(code, 0, text)
         self.assertIn("-c:v copy", text)
         record = load_record(self.root / REMUX_SOURCE)
-        self.assertRegex(text, attempt_part_pattern(self.root / "h264_high_mkv_aac.mp4", record["id"]))
+        # The form of the part path, with '<token>' for the token the real run draws: quoted, and the same each time.
+        shown = self.root / ".h264_high_mkv_aac.mp4.{}.<token>.part".format(record["id"][:8])
+        self.assertIn(" " + shlex.quote(str(shown)) + "\n", text)
+        self.assertEqual(self.run_command(dry_run=True), (code, text))
         self.assertEqual(listing(self.root), before)
         self.assertEqual(record_path(self.root / REMUX_SOURCE).read_bytes(), record_bytes)
 
@@ -1949,6 +1961,33 @@ class ConvertRunTest(unittest.TestCase):
         saved = load_record(self.root / SUBTITLE_SOURCE)
         self.assertEqual(saved["stages"]["convert"]["sidecars_written"], ["h264_mkv_srt_subtitles.srt"])
         self.assertEqual(saved["stages"]["convert"]["sidecar_argvs"][0][0], TOOLS.ffmpeg)
+
+    def test_stale_sidecar_part_files_are_removed_with_a_line_each_and_look_alikes_kept(self):
+        record = self.subtitle_record()
+        sidecar = "h264_mkv_srt_subtitles.srt"
+        self.assertEqual([Path(entry["path"]).name for entry in record["stages"]["plan"]["sidecars"]], [sidecar])
+        id8 = record["id"][:8]
+        other_id = SECOND_RECORD_ID if not record["id"].startswith(SECOND_RECORD_ID[:8]) else FIRST_RECORD_ID
+        stale = [".{}.{}.part".format(sidecar, id8),                     # vidfunnel before 20261110.3
+                 ".{}.{}.0123456789ab.part".format(sidecar, id8)]        # an earlier attempt
+        kept = [".{}.{}.0123456789ab.part".format(sidecar, other_id[:8]),  # another record's
+                ".{}.{}.notes.part".format(sidecar, id8),                 # a user's file
+                ".{}.{}.0123456789AB.part".format(sidecar, id8),          # wrong alphabet
+                ".{}.{}.0123456789a.part".format(sidecar, id8)]           # token too short
+        for name in stale + kept:
+            (self.root / name).write_bytes(name.encode("utf-8"))
+        progress = quiet()
+        stage = convert_one(TOOLS, self.root / SUBTITLE_SOURCE, record, convert_options(), progress=progress)
+        self.assertEqual(stage["outcome"], "ok", stage)
+        self.assertEqual(stage["sidecars_written"], [sidecar])
+        text = progress.stream.getvalue()
+        for name in stale:
+            self.assertFalse((self.root / name).exists(), name)
+            self.assertIn("removed a stale '{}' from an earlier run".format(name), text)
+        for name in kept:
+            self.assertEqual((self.root / name).read_bytes(), name.encode("utf-8"), name)
+            self.assertNotIn("'{}'".format(name), text)
+        self.assertEqual(sorted(self.leftover_parts()), sorted(kept))
 
     def test_every_line_of_an_item_carries_its_counter_tag(self):
         record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
@@ -2650,6 +2689,10 @@ class RefitRunTest(unittest.TestCase):
         self.assertIn("-crf 19", text)
         self.assertIn("-vf hqdn3d=2:1:2:3,setparams=", text)
         self.assertIn("would refit '{}'".format(REFIT_SOURCE), text)
+        record = load_record(self.root / REFIT_SOURCE)
+        shown = self.root / ".{}.{}.<token>.part".format(REFIT_OUTPUT, record["id"][:8])
+        self.assertIn(" " + shlex.quote(str(shown)) + "\n", text)
+        self.assertEqual(self.refit(dry_run=True)[1], text)
         self.assertEqual(listing(self.root), before)
         self.assertEqual(record_path(self.root / REFIT_SOURCE).read_bytes(), record_bytes)
 
@@ -3109,11 +3152,15 @@ class Par2AttemptTest(unittest.TestCase):
                 ".meadow.mp4.0123456789ab.par2", "harbour.mp4.0123456789ab.par2"]
         for name in stale + kept:
             (self.folder / name).write_bytes(name.encode("utf-8"))
-        files = write_par2(self.output, 5, progress=quiet())
+        progress = quiet()
+        files = write_par2(self.output, 5, progress=progress)
+        text = progress.stream.getvalue()
         for name in stale:
             self.assertFalse((self.folder / name).exists(), name)
+            self.assertIn("removed a stale '{}' from an earlier run".format(name), text)
         for name in kept:
             self.assertEqual((self.folder / name).read_bytes(), name.encode("utf-8"), name)
+            self.assertNotIn("'{}'".format(name), text)
         names = [path.name for path in files]
         self.assertEqual(names[0], "harbour.mp4.par2")
         self.assertEqual(len(names), 2, names)
@@ -3122,6 +3169,33 @@ class Par2AttemptTest(unittest.TestCase):
         check = subprocess.run(["par2", "verify", "-q", "harbour.mp4.par2"], stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, universal_newlines=True, cwd=str(self.folder))
         self.assertEqual(check.returncode, 0, check.stdout)
+
+
+    def test_a_folder_that_cannot_be_listed_after_par2_is_reported_and_the_attempts_index_removed(self):
+        attempt_index = re.compile(r"\.harbour\.mp4\.[0-9a-f]{12}\.par2")
+        attempt_volume = re.compile(r"\.harbour\.mp4\.[0-9a-f]{12}\.vol[0-9]+\+[0-9]+\.par2")
+        real_listdir = os.listdir
+
+        def unlistable_once_par2_has_written(path="."):
+            # The folder lists until par2 has written this attempt's index; from then on the share refuses.
+            names = real_listdir(path)
+            if os.fspath(path) == str(self.folder) and any(attempt_index.fullmatch(name) for name in names):
+                raise PermissionError(errno.EACCES, "Permission denied", os.fspath(path))
+            return names
+
+        progress = quiet()
+        with unittest.mock.patch("vidfunnel.encode.os.listdir", side_effect=unlistable_once_par2_has_written):
+            with self.assertRaises(OSError) as caught:
+                write_par2(self.output, 5, progress=progress)
+        problem = "cannot list '{}' for PAR2 files (Permission denied)".format(self.folder)
+        self.assertEqual(str(caught.exception), problem)
+        names = os.listdir(str(self.folder))
+        self.assertEqual([name for name in names if attempt_index.fullmatch(name)], [],
+                         "the attempt's index file, whose name is known, was left behind")
+        self.assertEqual(len([name for name in names if attempt_volume.fullmatch(name)]), 1, names)
+        self.assertNotIn("harbour.mp4.par2", names)
+        self.assertIn("{}; a PAR2 volume file of this attempt may stay hidden until the next PAR2 written for "
+                      "'harbour.mp4' removes it".format(problem), progress.stream.getvalue())
 
 
 class LeftoverPartTest(unittest.TestCase):

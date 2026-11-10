@@ -18,7 +18,15 @@ What it does (HANDOFF.md section 9, "Multi-host soak"):
   machine: its own host name (socket.gethostname), machine identity and
   boot id (vidfunnel.record.machine_identity and boot_id), so the
   cross-machine rules (heartbeat, takeover) decide and not the flock of the
-  same kernel. The heartbeat constants are shortened in each host (beat
+  same kernel. Separate machines share no kernel and so no takeover flock:
+  each host's FolderLock._takeover_guard holds none (it reports None, as on
+  a file system that refuses flock), so the marker '.vidfunnel/lock.taking'
+  alone arbitrates between hosts that take one dead lock over at once;
+  --shared-takeover-flock keeps the one kernel's flock on
+  '.vidfunnel/lock.takeover', for comparison. The same-machine rule that
+  clears a dead taker's marker at once needs that flock and an equal boot
+  and machine id, so it cannot fire between simulated hosts (a check says
+  so). The heartbeat constants are shortened in each host (beat
   every --beat s, stale after --stale s; a takeover-marker age constant
   named TAKEOVER*_SECONDS, when the tree has one, is set to --marker-stale).
 - Each host runs real ffmpeg through a small wrapper of its own (its path,
@@ -46,6 +54,18 @@ Scenarios (each with N hosts, N from --hosts):
              part file; its encode's result is discarded.
   staggered  hosts start --stagger s apart; the first one to finish is run
              again while the others still work.
+  race       the first host runs alone and gets SIGKILL while it encodes in
+             the first folder it holds; once its lock is stale, all the
+             other hosts start convert, and each waits at its first lock
+             attempt (the dead lock's folder) for one common instant, so
+             they all try to take the dead lock over at once. Exactly one must acquire the
+             folder, each other one must print a skip line for it (naming
+             the holder, or the takeover in progress), and a further pass of
+             the survivors then finds everything done.
+
+--work DIR must be an empty folder or one this script made (it writes the
+marker '.vidfunnel-soak-work' into it); after a passing run without --keep
+it is deleted, and only when it carries that marker.
 
 Checks after each scenario: one host per folder at a time (lock holds and
 encodes), every write inside a lock its host held, no two encodes holding one
@@ -59,8 +79,9 @@ plain) that two hosts really encoded in different folders at the same time.
 Internal modes: '--as-host NAME ... -- VIDFUNNEL-ARGS' runs one vidfunnel
 command posing as host NAME (the soak starts these itself; PYTHONPATH must
 name the repo root). --sabotage-locks (hidden) makes the second host's
-FolderLock.acquire succeed without creating a lock: the negative control,
-which must make the soak report FAIL. --hold-before-open moves the wrapper's
+FolderLock.acquire succeed without creating a lock, in every scenario and
+every run of that host: the negative control, which must make the soak
+report FAIL. --hold-before-open moves the wrapper's
 wait to before the part file is made and ffmpeg starts, so a freeze lands in
 the window between convert's part-file cleanup and the encoder's own open of
 the part file (a probe of that window, not part of the default run);
@@ -68,9 +89,10 @@ the part file (a probe of that window, not part of the default run);
 its own encode of the frozen host's file.
 """
 
-VERSION = "20261110.1"
+VERSION = "20261110.2"
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -92,8 +114,11 @@ CLIP_WORDS = ("amber", "basil", "coral", "dune", "ember", "fennel", "garnet", "h
               "kestrel", "lichen", "maple", "nettle", "otter", "pebble", "quartz", "reed", "sorrel", "tansy",
               "umber", "violet", "wren", "yarrow", "zinnia", "acorn", "bramble", "clover", "daisy", "elm")
 FOLDER_SIZES = (4, 3, 2, 1, 3, 2)   # clips per folder, repeated for more folders
-SCENARIOS = ("plain", "kill", "freeze", "staggered")
+SCENARIOS = ("plain", "kill", "freeze", "staggered", "race")
 MARKER = ".vidfunnel-soak-library"
+WORK_MARKER = ".vidfunnel-soak-work"
+RACE_LEAD_SECONDS = 5.0   # the race's hosts start this long before their common start, to import and scan first
+RACE_LATE_SECONDS = 0.1   # a racer that reaches the common start later than this has missed it
 RECORD_DIR = ".vidfunnel"
 POLL_SECONDS = 0.05
 STILL_WAITING_EVERY = 10.0
@@ -333,7 +358,17 @@ def host_main(options, vidfunnel_args):
     def folder_of(lock):
         return os.path.abspath(os.fspath(lock.folder))
 
+    race = {"waiting": options.start_at is not None}
+
     def acquire(self):
+        if race["waiting"]:
+            # The race's common start, at this host's first lock attempt: every racer has imported, scanned and
+            # judged its first item by now, and all of them judge the dead lock from one instant on.
+            race["waiting"] = False
+            wait = (options.start_at - time.time_ns()) / 1e9
+            if wait > 0:
+                time.sleep(wait)
+            events.write("race-start", folder=folder_of(self), late=(time.time_ns() - options.start_at) / 1e9)
         if options.sabotage:
             # The negative control: report the lock as taken without creating it.
             events.write("lock-acquired", folder=folder_of(self))
@@ -361,8 +396,22 @@ def host_main(options, vidfunnel_args):
 
     lock_class.acquire = acquire
     lock_class.release = release
+    if not options.shared_takeover_flock:
+        if not hasattr(lock_class, "_takeover_guard"):
+            sys.stderr.write("soak_hosts: vidfunnel.record.FolderLock has no _takeover_guard to give each simulated "
+                             "machine a kernel of its own; use --shared-takeover-flock\n")
+            return 2
+
+        @contextlib.contextmanager
+        def own_kernel_takeover_guard(self):
+            # Real machines do not share a kernel, so no takeover flock is shared between them: as on a file system
+            # that refuses flock, the guard holds none, and the marker 'lock.taking' alone arbitrates.
+            yield None
+
+        lock_class._takeover_guard = own_kernel_takeover_guard
     install_write_audit(events, options.watch)
-    events.write("host-start", argv=vidfunnel_args, pose=pose, settings=settings, sabotage=bool(options.sabotage))
+    events.write("host-start", argv=vidfunnel_args, pose=pose, settings=settings, sabotage=bool(options.sabotage),
+                 takeover_flock="shared" if options.shared_takeover_flock else "none", start_at=options.start_at)
     code = "exception"
     try:
         code = vidfunnel_main(vidfunnel_args)
@@ -372,6 +421,39 @@ def host_main(options, vidfunnel_args):
 
 
 # ---------------------------------------------------------------- driver helpers
+
+def prepare_work(path):
+    """The work folder: a new temporary one, or `path` when it is empty or one this script made (WORK_MARKER).
+
+    The marker is written into it, and only a folder that has it is removed after a passing run (remove_work),
+    so a folder named by mistake is refused before anything is written in it, and never deleted.
+    """
+    if path:
+        work = os.path.abspath(path)
+        if os.path.lexists(work) and not os.path.isdir(work):
+            raise SystemExit("soak_hosts: --work '{}' is not a folder".format(work))
+        if os.path.isdir(work) and os.listdir(work) and not os.path.isfile(os.path.join(work, WORK_MARKER)):
+            raise SystemExit("soak_hosts: --work '{}' is not empty and has no '{}' marker: refusing to use it (the "
+                             "soak deletes its work folder after a passing run, so it only works in an empty folder "
+                             "or one it made itself)".format(work, WORK_MARKER))
+        os.makedirs(work, exist_ok=True)
+    else:
+        work = tempfile.mkdtemp(prefix="vidfunnel-soak.")
+    marker = os.path.join(work, WORK_MARKER)
+    if not os.path.isfile(marker):
+        with open(marker, "w", encoding="utf-8") as stream:
+            stream.write("made by vidfunnel tests/soak_hosts.py {}; everything in this folder may be deleted "
+                         "by it\n".format(VERSION))
+    return work
+
+
+def remove_work(work):
+    """Delete the work folder, only when it carries this script's marker."""
+    if not os.path.isfile(os.path.join(work, WORK_MARKER)):
+        say("work folder '{}' kept: it has no '{}' marker".format(work, WORK_MARKER))
+        return
+    shutil.rmtree(work, ignore_errors=True)
+
 
 class ScenarioError(Exception):
     """A scenario could not be carried out (a deadline passed, a setup condition never came)."""
@@ -439,7 +521,8 @@ def folder_of_path(path):
     return parent
 
 
-# A convert part file: '.NAME.<id8>.<token>.part' (one per attempt, 20261110.1 on) or '.NAME.<id8>.part' (before).
+# A convert part file: '.NAME.<id8>.<token>.part' (one per attempt, vidfunnel 20261110.3 on) or '.NAME.<id8>.part'
+# (before).
 PART_NAME = re.compile(r"(\..+\.[0-9a-f]{8})(?:\.[0-9a-f]{12})?\.part")
 
 
@@ -514,11 +597,7 @@ class Soak(object):
         self.real_ffprobe = shutil.which("ffprobe", path=os.path.dirname(self.real_ffmpeg)) or shutil.which("ffprobe")
         if not self.real_ffprobe:
             raise SystemExit("soak_hosts: ffprobe was not found next to '{}' nor on PATH".format(self.real_ffmpeg))
-        if options.work:
-            self.work = os.path.abspath(options.work)
-            os.makedirs(self.work, exist_ok=True)
-        else:
-            self.work = tempfile.mkdtemp(prefix="vidfunnel-soak.")
+        self.work = prepare_work(options.work)
         self.area = os.path.abspath(options.library) if options.library else os.path.join(self.work, "libraries")
         self.cache = os.path.join(self.work, "cache")
         self.live = []        # every HostRun not yet known to be over, for the cleanup
@@ -598,7 +677,10 @@ class Soak(object):
             return os.path.basename(directory)
         return None
 
-    def start_host(self, scene, host, vidfunnel_args, sabotage=False):
+    def start_host(self, scene, host, vidfunnel_args, start_at=None):
+        # The negative control sabotages the second host of a scenario in every one of its runs.
+        sabotage = bool(self.options.sabotage_locks and scene.scenario in SCENARIOS and len(scene.hosts) > 1
+                        and host == scene.hosts[1])
         count = sum(1 for run in scene.runs if run.host == host) + 1
         label = "{} #{}".format(host, count)
         log_path = os.path.join(scene.logs, "{}-{}.log".format(host, count))
@@ -611,6 +693,10 @@ class Soak(object):
             command += ["--set", item]
         if sabotage:
             command.append("--sabotage")
+        if self.options.shared_takeover_flock:
+            command.append("--shared-takeover-flock")
+        if start_at is not None:
+            command += ["--start-at", str(start_at)]
         command += ["--", "--ffmpeg", wrapper] + list(vidfunnel_args)
         environment = dict(os.environ)
         environment["PYTHONPATH"] = REPO_ROOT
@@ -733,9 +819,7 @@ class Soak(object):
         return scene
 
     def scenario_plain(self, scene):
-        runs = [self.start_host(scene, host, scene.convert_args(),
-                                sabotage=self.options.sabotage_locks and index == 1)
-                for index, host in enumerate(scene.hosts)]
+        runs = [self.start_host(scene, host, scene.convert_args()) for host in scene.hosts]
         self.wait_runs(scene, runs, "every host to finish")
 
     def _encode_in_flight(self, scene, run):
@@ -793,6 +877,32 @@ class Soak(object):
         say("    the survivors run convert again")
         second = self._survivors_pass(scene, survivors)
         self.wait_runs(scene, second, "the surviving hosts' second pass")
+
+    def scenario_race(self, scene):
+        """The first host alone, killed while it encodes in the first folder it holds; once that lock is stale, all
+        the others start convert at one instant, so each of them tries to take the dead lock over at once."""
+        survivors = scene.hosts[1:]
+        victim = self.start_host(scene, scene.hosts[0], scene.convert_args())
+        folder, event = self._encode_in_flight(scene, victim)
+        say("    SIGKILL to the process group of {} while it encodes '{}' in '{}'".format(
+            victim.label, os.path.basename(event["output"]), short(folder, scene.library)))
+        scene.victim, scene.victim_folder, scene.victim_encode = victim, folder, event["pid"]
+        victim.stopped_ns = self.signal_group(scene, victim, signal.SIGKILL)
+        victim.killed = True
+        self.wait_until(lambda: victim.poll() is not None and not group_alive(victim.pid),
+                        "the process group of {} to die".format(victim.label))
+        victim.gone_ns = time.time_ns()
+        self._wait_stale(scene, folder, victim)
+        start_at = time.time_ns() + int(RACE_LEAD_SECONDS * 1e9)
+        say("    {} start convert and wait at their first lock attempt until {:.0f} s from now, then race for the dead "
+            "lock of '{}'".format(
+            ", ".join(survivors), RACE_LEAD_SECONDS, short(folder, scene.library)))
+        scene.race_runs = [self.start_host(scene, host, scene.convert_args(), start_at=start_at) for host in survivors]
+        scene.race_start_ns = start_at
+        self.wait_runs(scene, scene.race_runs, "the racing hosts to finish")
+        say("    the survivors run convert again (a further pass)")
+        further = self._survivors_pass(scene, survivors)
+        self.wait_runs(scene, further, "the survivors' further pass")
 
     def scenario_freeze(self, scene):
         survivors = scene.hosts[1:]
@@ -917,6 +1027,8 @@ class Scene(object):
         self.victim_encode = None
         self.rerun = None
         self.rerun_overlapped = []
+        self.race_runs = []
+        self.race_start_ns = None
         self.verify_run = None
         self.elapsed = 0.0
         self._driver_log = None
@@ -1018,6 +1130,10 @@ class Scene(object):
                 self.fail("{} ended with exit code {} (expected {}); last lines of '{}':\n{}".format(
                     run.label, run.code, " or ".join(str(code) for code in expected), run.log_path,
                     _tail(text, 12)))
+            if "by a takeover on this machine since its last boot" in text:
+                self.fail("{} cleared a takeover marker as written on its own machine, but every simulated host "
+                          "poses as a machine of its own; log '{}':\n{}".format(
+                              run.label, run.log_path, _around(text, "by a takeover on this machine")))
             for line in text.splitlines():
                 if "taking over" in line and "lock" in line:
                     takeover_lines.append((run, line.strip()))
@@ -1299,6 +1415,8 @@ class Scene(object):
                     self.notes.append("the frozen encode exited {} after the SIGCONT with status {}".format(
                         "{:.3f} s".format((frozen[0]["end"] - victim.continued_ns) / 1e9)
                         if victim.continued_ns else "?", frozen[0]["exit"].get("status")))
+            if self.scenario == "race":
+                self.check_race(events, taken, label, stamp)
         elif takeover_lines:
             self.fail("{} takeover(s) in a scenario where every host stayed alive (a live lock judged stale?):\n"
                       "      {}".format(len(takeover_lines), "\n      ".join(line for _run, line in takeover_lines)))
@@ -1332,6 +1450,76 @@ class Scene(object):
             if group_alive(run.pid):
                 self.fail("the process group of {} (pid {}) still has a process after the scenario".format(
                     run.label, run.pid))
+
+    def check_race(self, events, taken, label, stamp):
+        """The race: every racer first tried the dead lock's folder, exactly one took it, the others skipped it."""
+        library = self.library
+        folder = self.victim_folder
+        racers = {run.pid: run for run in self.race_runs}
+        if len(taken) != 1:
+            self.fail("race: {} takeover line(s) of '{}', not one:\n      {}".format(
+                len(taken), short(folder, library), "\n      ".join(taken)))
+        starts = {}
+        first = {}
+        for event in events:
+            pid = event.get("pid")
+            if pid not in racers:
+                continue
+            if event.get("kind") == "race-start":
+                starts[pid] = event
+            elif event.get("kind") in ("lock-acquired", "lock-refused", "lock-error") and pid not in first:
+                first[pid] = event
+        late = [(racers[pid].label, event.get("late")) for pid, event in starts.items()
+                if event.get("late") is None or event["late"] > RACE_LATE_SECONDS]
+        if late or len(starts) != len(racers):
+            self.fail("race: the racers did not all reach the common start at their first lock attempt ({} of {} "
+                      "did; late: {})".format(
+                len(starts), len(racers), late))
+        winners = []
+        for pid, run in sorted(racers.items(), key=lambda item: item[1].label):
+            event = first.get(pid)
+            if event is None or event.get("folder") != folder:
+                self.fail("race: {}'s first lock attempt was {}, not the dead lock's folder '{}'".format(
+                    run.label, "none" if event is None else "of '{}'".format(short(event.get("folder"), library)),
+                    short(folder, library)))
+                continue
+            if event["kind"] == "lock-acquired":
+                winners.append(run)
+                continue
+            if event["kind"] != "lock-refused":
+                self.fail("race: {} could not judge the lock of '{}': {}".format(run.label, short(folder, library),
+                                                                               event.get("reason")))
+        if len(winners) != 1:
+            self.fail("race: {} racer(s) acquired '{}' ({}), not exactly one".format(
+                len(winners), short(folder, library), ", ".join(run.label for run in winners) or "none"))
+        winner = self.pose(winners[0].host) if len(winners) == 1 else None
+        skip_start = "skipping folder '{}'".format(folder)
+        reasons = []
+        for pid, run in sorted(racers.items(), key=lambda item: item[1].label):
+            if run in winners or (first.get(pid) or {}).get("kind") != "lock-refused":
+                continue
+            lines = [line.strip() for line in run.output().splitlines() if line.strip().startswith(skip_start)]
+            if not lines:
+                self.fail("race: {} was refused the lock of '{}' but printed no skip line for it".format(
+                    run.label, short(folder, library)))
+                continue
+            line = lines[0]
+            reason = line[len(skip_start):]
+            # Held: the reason names the winner's host. In progress: the marker of another taker, or a check that
+            # failed because another run was taking over ('taken over once it has been silent' does not count).
+            held = bool(winner) and "locked by host '{}'".format(winner) in reason
+            in_progress = any(word in reason for word in ("being taken over", "takeover", "taking over"))
+            if not (held or in_progress):
+                self.fail("race: {}'s skip line names neither the holder {} nor a takeover in progress: {}".format(
+                    run.label, winner, line))
+            reasons.append("held" if held else "in progress")
+            self.notes.append("race: {} at {}: {}".format(run.label, stamp(first[pid]["t"]),
+                                                          line.replace(library, "<library>")[:300]))
+        times = [first[pid]["t"] for pid in first if pid in racers]
+        self.counts["race"] = "{} racer(s), winner {}, refusals {}, first lock events within {:.1f} ms".format(
+            len(racers), winners[0].label if len(winners) == 1 else "?",
+            ", ".join(reasons) or "none", (max(times) - min(times)) / 1e6 if times else float("nan"))
+        self.notes.append("race: " + self.counts["race"])
 
     def summary(self):
         verdict = "FAIL" if self.failures else "PASS"
@@ -1386,6 +1574,8 @@ def parse_arguments(argv):
         parser.add_argument("--marker-stale", type=float, default=4.0)
         parser.add_argument("--set", action="append", metavar="NAME=SECONDS")
         parser.add_argument("--sabotage", action="store_true")
+        parser.add_argument("--shared-takeover-flock", action="store_true")
+        parser.add_argument("--start-at", type=int, metavar="NS")
         return parser.parse_args(own), vidfunnel_args
     parser = argparse.ArgumentParser(
         prog="soak_hosts.py",
@@ -1426,6 +1616,9 @@ def parse_arguments(argv):
     parser.add_argument("--resume-after-cleanup", action="store_true",
                         help="in 'freeze', send SIGCONT only once the host that took the folder over has started "
                              "its own encode of the frozen host's file (after its part-file cleanup)")
+    parser.add_argument("--shared-takeover-flock", action="store_true",
+                        help="let the simulated machines share the takeover flock of their one kernel, for comparison "
+                             "(by default each holds none, as separate machines share none)")
     parser.add_argument("--sabotage-locks", action="store_true", help=argparse.SUPPRESS)
     options = parser.parse_args(argv)
     try:
@@ -1459,6 +1652,10 @@ def main(argv=None):
                                                                               soak.area))
     say("hosts beat every {} s, a silent lock is stale after {} s, encodes are held {} s, convert --jobs {}".format(
         options.beat, options.stale, options.delay, options.jobs))
+    say("takeover flock: {}".format("shared by every simulated machine (one kernel)" if options.shared_takeover_flock
+                                    else "none (each simulated machine on a kernel of its own)"))
+    if options.sabotage_locks:
+        say("locks sabotaged: the second host of every scenario takes no lock (the negative control; must FAIL)")
     load_before = os.getloadavg()
     say("load average at the start: {:.2f} {:.2f} {:.2f} on {} CPUs".format(*(load_before + (os.cpu_count(),))))
     started = time.monotonic()
@@ -1499,7 +1696,7 @@ def main(argv=None):
         if options.library:
             say("libraries kept: '{}'".format(soak.area))
     else:
-        shutil.rmtree(soak.work, ignore_errors=True)
+        remove_work(soak.work)
         if options.library:
             for name in ("template", "runs"):
                 shutil.rmtree(os.path.join(soak.area, name), ignore_errors=True)

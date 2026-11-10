@@ -20,8 +20,8 @@ folder (part_path), so two records can never write the same part file, and
 the token, drawn fresh for each attempt, keeps two attempts on one record
 apart too: an encoder that opens its output after its run lost the folder
 to another host writes a file of its own. Before an attempt starts, the
-part files of earlier attempts on the record (is_part_of, the form before
-20261110.1 included) are removed under the lock; on the way out the
+part files of earlier attempts on the record (is_part_of, the one name
+per record of vidfunnel before 20261110.3 included) are removed under the lock; on the way out the
 attempt removes its own, also after a lost lock. PAR2 is written the same
 way under attempt names and renamed (write_par2). On success the part file is renamed into place
 (the interim '<stem>.vidfunnel.mp4' name when the source is itself an MP4,
@@ -99,7 +99,7 @@ whose output still matches its fingerprint (content only, the time is not
 compared) is reported as already converted.
 """
 
-VERSION = "20261110.1"
+VERSION = "20261110.2"
 
 import math
 import os
@@ -145,6 +145,7 @@ from vidfunnel.record import (
 
 PART_SUFFIX = ".part"
 PART_TOKEN_DIGITS = 12               # each attempt's token in its part file names: 12 lowercase hex digits
+PART_TOKEN_SHOWN = "<token>"         # what --dry-run shows in place of the token, which the real run draws
 _LOWER_HEX = frozenset("0123456789abcdef")
 PAR2_SUFFIX = ".par2"
 _PAR2_VOLUME = re.compile(r"\.vol[0-9]+\+[0-9]+\.par2")
@@ -211,12 +212,23 @@ def part_path(output_path, record_id, token=None):
     return output_path.parent / ("." + output_path.name + "." + _id8(record_id) + "." + token + PART_SUFFIX)
 
 
+def shown_part_path(output_path, record_id):
+    """The part path as --dry-run shows it: '.<name>.<id8>.<token>.part' with the literal '<token>'. Pure.
+
+    The real run draws the token when the attempt starts (part_path), so a
+    dry run shows the form, and two dry runs print the same text.
+    """
+    output_path = Path(output_path)
+    return output_path.parent / ("." + output_path.name + "." + _id8(record_id) + "." + PART_TOKEN_SHOWN + PART_SUFFIX)
+
+
 def is_part_of(name, output_name, record_id):
     """True when the file name `name` is a part file of this record for `output_name`. Pure.
 
     Exactly '.<output_name>.<id8>.<token>.part' with a token of
     PART_TOKEN_DIGITS lowercase hex digits, or '.<output_name>.<id8>.part',
-    the one name per record of the versions before 20261110.1. Nothing
+    the one name per record of vidfunnel before 20261110.3 (the package
+    version). Nothing
     looser: another record's part (another id), a user's
     '.<output_name>.<id8>.notes.part' or a token of another length or
     alphabet is not ours to remove.
@@ -508,7 +520,7 @@ def _clear_leftovers(output_path, record_id):
     """Unlink the part files of this record for output_path left by earlier attempts: (names removed, reason or None).
 
     The part files are the names is_part_of accepts, of any attempt and of
-    the versions before 20261110.1. Unlinked, never truncated: a writer
+    vidfunnel before 20261110.3. Unlinked, never truncated: a writer
     still holding one (an encoder orphaned by a vidfunnel killed outright,
     whose folder another machine has since taken over) keeps an unnamed
     file, and the new attempt writes a name of its own. When the folder
@@ -555,24 +567,29 @@ def write_par2(output_path, redundancy, progress=None):
     """par2create -r N -n 1 -q next to the output; returns the PAR2 files written. Raises OSError on failure.
 
     Stale PAR2 files of the same name, and the PAR2 files of earlier
-    attempts (_par2_attempt_files), are removed first. par2 writes under
-    names of this attempt, '.<name>.<token>.par2' and its volume file, and
-    they are renamed to '<name>.par2' and '<name>.vol*.par2' only after
-    par2 succeeded and the folder's lock is still this run's (ensure_lock;
+    attempts (_par2_attempt_files, one 'removed a stale' line each), are
+    removed first; a folder that cannot be listed raises OSError naming it
+    and the error, also after par2 has run. par2 writes under names of
+    this attempt, '.<name>.<token>.par2' and its volume file, and they are
+    renamed to '<name>.par2' and '<name>.vol*.par2' only after par2
+    succeeded and the folder's lock is still this run's (ensure_lock;
     LockLost otherwise). A par2 started by a run that has lost the lock
     meanwhile therefore writes files no other run uses, and they are
-    removed on the way out, as on a failure or an interrupt. An
-    elapsed-time line runs while par2 works, since it reports no
-    measurable progress. par2 inherits the folder locks' descriptors, as
-    vidfunnel.ffmpeg.run's children do.
+    removed on the way out, as on a failure or an interrupt
+    (_remove_par2_attempt). An elapsed-time line runs while par2 works,
+    since it reports no measurable progress. par2 inherits the folder
+    locks' descriptors, as vidfunnel.ffmpeg.run's children do.
     """
     stream, quiet, _verbose = _stream_of(progress)
     output_path = Path(output_path)
     par2 = shutil.which("par2")
     if par2 is None:
         raise OSError("'par2' is not on PATH")
-    for stale in _par2_files(output_path) + _par2_attempt_files(output_path):
+    for stale in _par2_files(output_path):
         _remove(stale)
+    for stale in _par2_attempt_files(output_path):
+        if _remove(stale):
+            say("  removed a stale '{}' from an earlier run".format(stale.name), stream)
     index_name = output_path.name + PAR2_SUFFIX
     token = new_token()
     attempt_stem = "." + output_path.name + "." + token
@@ -621,8 +638,7 @@ def write_par2(output_path, redundancy, progress=None):
             files.append(final)
         return sorted(files)
     finally:
-        for path in _par2_attempt_files(output_path, token):
-            _remove_own(path, stream)
+        _remove_par2_attempt(output_path, token, stream)
 
 
 def _par2_files(output_path):
@@ -643,14 +659,16 @@ def _par2_attempt_files(output_path, token=None):
     """The PAR2 files a write_par2 attempt writes before its rename, of attempt `token` or of any attempt.
 
     Exactly '.<name>.<token>.par2' and '.<name>.<token>.vol<N>+<M>.par2',
-    the token PART_TOKEN_DIGITS lowercase hex digits; nothing looser.
+    the token PART_TOKEN_DIGITS lowercase hex digits; nothing looser. A
+    folder that cannot be listed raises OSError naming the folder and the
+    error, so that a listing that fails is never taken for "no files".
     """
     output_path = Path(output_path)
     found = []
     try:
         names = sorted(os.listdir(str(output_path.parent)))
-    except OSError:
-        return found
+    except OSError as error:
+        raise OSError("cannot list '{}' for PAR2 files ({})".format(output_path.parent, error.strerror or error))
     stem = "." + output_path.name + "."
     for name in names:
         if not name.startswith(stem):
@@ -665,11 +683,32 @@ def _par2_attempt_files(output_path, token=None):
     return found
 
 
+def _remove_par2_attempt(output_path, token, stream):
+    """On the way out of write_par2: remove the files of attempt `token` still there. Prints, never raises.
+
+    When the folder cannot be listed, the attempt's index file, whose name
+    is known, is removed directly, and a line names the folder, the error
+    and what may stay behind: the volume file, whose name par2 chooses,
+    until the next PAR2 written for the output removes it.
+    """
+    output_path = Path(output_path)
+    try:
+        leftovers = _par2_attempt_files(output_path, token)
+    except OSError as error:
+        _remove_own(output_path.parent / ("." + output_path.name + "." + token + PAR2_SUFFIX), stream)
+        say("  {}; a PAR2 volume file of this attempt may stay hidden until the next PAR2 written for '{}' "
+            "removes it".format(error, output_path.name), stream)
+        return
+    for path in leftovers:
+        _remove_own(path, stream)
+
+
 def _write_sidecars(sidecars, record_id, stream, verbose, folder=None):
     """Run each rendered sidecar argv to its own part file and rename; (names written, [error dicts], argvs run).
 
     With `folder`, LockLost before the part files left by earlier attempts
-    are cleared and before each rename. Each sidecar writes a part name of
+    are cleared (one 'removed a stale' line each, as for the main part
+    file) and before each rename. Each sidecar writes a part name of
     its own attempt (part_path), which is removed on the way out whatever
     happened, also once the folder's lock is found taken.
     """
@@ -692,7 +731,9 @@ def _write_sidecars(sidecars, record_id, stream, verbose, folder=None):
             say("  " + shlex.join(argv), stream)
         if folder is not None:
             ensure_lock(folder)
-        _removed, problem = _clear_leftovers(final, record_id)
+        removed, problem = _clear_leftovers(final, record_id)
+        for name in removed:
+            say("  removed a stale '{}' from an earlier run".format(name), stream)
         if problem is not None:
             errors.append({"path": final.name, "error": problem})
             say("  sidecar '{}' failed: {}".format(final.name, problem), stream)
@@ -1417,7 +1458,9 @@ def _refit_dry_run(tools, entries, stream):
         shown += 1
         say("[refit {}/{}] would refit '{}': {}".format(position, total, _label(record), _refit_words(plan)), stream)
         say("  {}".format(plan["denoise_reason"]), stream)
-        say(shlex.join(plan["argv"]), stream)
+        argv = list(plan["argv"])
+        argv[-1] = str(shown_part_path(plan["output_path"], record.get("id")))  # the token is drawn at the run
+        say(shlex.join(argv), stream)
         say("  then, if smaller than the existing output and it passes the checks, rename over '{}'".format(
             plan["output_path"]), stream)
     return shown
@@ -1618,7 +1661,7 @@ def _dry_run(tools, entries, options, stream):
             continue
         plan = record["stages"]["plan"]
         argv = list(rendered["argv"])
-        argv[-1] = str(part_path(output_path, record.get("id")))
+        argv[-1] = str(shown_part_path(output_path, record.get("id")))  # the token is drawn at the run
         say("[convert {}/{}] would {} '{}' -> '{}'".format(position, total, ACTION_WORDS[record["action"]],
                                                           _label(record), output_path.name), stream)
         say(shlex.join(argv), stream)
