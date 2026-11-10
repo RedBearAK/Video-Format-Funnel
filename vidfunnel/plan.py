@@ -57,7 +57,7 @@ analyze_input(), which runs the same passes with an input-argument list and
 returns the same dict shape, built from analyze's own pure rules.
 """
 
-VERSION = "20261109.1"
+VERSION = "20261109.2"
 
 import hashlib
 import json
@@ -1489,6 +1489,10 @@ def _check_names(record):
     _output_name("output.name", output.get("name"))
     if output.get("interim_name") is not None:
         _output_name("output.interim_name", output["interim_name"])
+    for key in ("sidecars", "interim_sidecars"):
+        field = "output." + key
+        for position, name in enumerate(_sequence(field, output.get(key))):
+            _plain_name("{}[{}]".format(field, position), name)
 
 
 def _analysis_result(analysis, name):
@@ -1506,12 +1510,8 @@ def _check_values(record):
     _flag("stages.plan.plain_mp4", plan.get("plain_mp4"), optional=False)
     _flag("stages.plan.mark_outputs", plan.get("mark_outputs"))
     _whole("stages.plan.par2", plan.get("par2"), 1, optional=True)
-    output = record["output"]
-    for field, names in (("stages.plan.sidecars_skipped", plan.get("sidecars_skipped")),
-                         ("output.sidecars", output.get("sidecars")),
-                         ("output.interim_sidecars", output.get("interim_sidecars"))):
-        for position, name in enumerate(_sequence(field, names)):
-            _plain_name("{}[{}]".format(field, position), name)
+    for position, name in enumerate(_sequence("stages.plan.sidecars_skipped", plan.get("sidecars_skipped"))):
+        _plain_name("stages.plan.sidecars_skipped[{}]".format(position), name)
 
     probe = _mapping("stages.probe", stages.get("probe"), optional=False)
     video = _mapping("stages.probe.video", probe.get("video"), optional=False)
@@ -1597,7 +1597,8 @@ def record_name_problem(record):
     """None when every file name the record gives is a plain name in its folder, else the reason naming the field.
 
     source.name, the VOB members, source.fingerprint_of of a DVD title,
-    output.name and output.interim_name (both ending in '.mp4').
+    output.name and output.interim_name (both ending in '.mp4'), and the
+    sidecar names in output.sidecars and output.interim_sidecars.
     """
     try:
         _check_names(record)

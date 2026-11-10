@@ -10,7 +10,7 @@ streams, which is what verify checks. They skip with a message when ffmpeg
 or the fixtures are missing.
 """
 
-VERSION = "20261109"
+VERSION = "20261109.2"
 
 import argparse
 import contextlib
@@ -18,6 +18,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -625,6 +626,221 @@ class VerifyDrainTests(StopCase):
             with self.assertRaises(KeyboardInterrupt):
                 self.verify_drained_in(None)
         self.assertTrue(vidfunnel.stopfile.stopped_now)
+
+
+def _set_at(record, path, value):
+    target = record
+    for step in path[:-1]:
+        target = target[step]
+    target[path[-1]] = value
+
+
+# Each entry: (field the reason names, [(path, value)]). The names point at 'elsewhere', a folder beside the
+# record's, where a decoy source, output and record wait; or the record cannot be keyed or read at all.
+REFUSED_NAMES = [
+    ("source.name", [(["source", "name"], "../elsewhere/secret.avi")]),
+    ("source.name", [(["source", "name"], "ABSOLUTE")]),
+    ("source.name", [(["source", "name"], "..")]),
+    ("source.name", [(["source", "name"], "")]),
+    ("source.members", [(["source", "kind"], "vob-group"),
+                        (["source", "members"], [{"name": "meadow.avi"}, {"name": "../elsewhere/secret.avi"}])]),
+    ("source.members", [(["source", "kind"], "vob-group"), (["source", "members"], "meadow.avi")]),
+    ("output.name", [(["output", "name"], "../elsewhere/secret.mp4")]),
+    ("output.interim_name", [(["output", "interim_name"], "../elsewhere/secret.vidfunnel.mp4")]),
+    ("output.sidecars", [(["output", "sidecars"], ["../elsewhere/secret.srt"])]),
+    ("output", [(["output"], "meadow.mp4")]),
+    ("stages", [(["stages"], "probe")]),
+]
+
+
+class VerifyRefusesNamesTest(unittest.TestCase):
+    """A record whose names are not plain names in its folder is not verified and nothing it names is read.
+
+    Hand-written records; the hash, fingerprint, ffprobe and ffmpeg calls verify makes are replaced by
+    recorders (the hash and fingerprint still run on the file), so no ffmpeg is needed. 'harbour' is a good
+    record in the same folder, 'meadow' the edited one, and 'elsewhere' a folder beside it with a decoy
+    source, outputs and a converted record of its own named 'secret'.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        top = Path(self.temporary.name)
+        self.folder = top / "library"
+        self.elsewhere = top / "elsewhere"
+        self.good_key = self.write_record(self.folder, "harbour")
+        self.edited_key = self.write_record(self.folder, "meadow")
+        self.decoy_key = self.write_record(self.elsewhere, "secret")
+        for name in ("secret.vidfunnel.mp4", "secret.srt"):
+            (self.elsewhere / name).write_bytes(b"decoy " * 64)
+        self.calls = []
+
+    def write_record(self, folder, stem):
+        from vidfunnel.record import new_record
+        folder.mkdir(exist_ok=True)
+        source = folder / (stem + ".avi")
+        source.write_bytes(b"hand-written source " * 64)
+        (folder / (stem + ".mp4")).write_bytes(b"hand-written output " * 64)
+        record = new_record(source)
+        record["source"].update(kind="file", sha256="0123456789abcdef" + "0" * 48)
+        record["output"]["name"] = stem + ".mp4"
+        record["stages"] = {"probe": {"format": {"duration": 5.0},
+                                      "video": {"index": 0, "fps": 25.0, "duration": 5.0}}}
+        set_status(record, "converted")
+        save_record(source, record)
+        return source
+
+    def edit(self, changes):
+        record = load_record(self.edited_key)
+        for path, value in changes:
+            _set_at(record, path, str(self.elsewhere / "secret.avi") if value == "ABSOLUTE" else value)
+        save_record(self.edited_key, record)
+        return record
+
+    def file_bytes(self):
+        from vidfunnel.record import record_path
+        return {key.stem: record_path(key).read_bytes() for key in (self.good_key, self.edited_key, self.decoy_key)}
+
+    @contextlib.contextmanager
+    def recorders(self):
+        """Replace verify's file and tool calls with recorders; the hash and fingerprint still run."""
+        import vidfunnel.verify as verify_module
+        calls = self.calls
+        real_hash, real_fingerprint = verify_module.sha256_file, verify_module.cheap_fingerprint
+
+        def hashed(path, progress=None):
+            calls.append(("sha256", str(path)))
+            return real_hash(path)
+
+        def fingerprinted(path):
+            calls.append(("fingerprint", str(path)))
+            return real_fingerprint(path)
+
+        def probed(tools, path, *rest):
+            calls.append(("ffprobe", str(path)))
+            return {"format": {"duration": 5.0, "tags": {}}, "video": {"index": 0, "fps": 25.0, "duration": 5.0},
+                    "audio": [], "subtitles": [], "streams": [{"type": "video"}]}
+
+        def decoded(tools, path, progress=None, total_seconds=None):
+            calls.append(("decode", str(path)))
+            return {"returncode": 0, "classes": [], "ignored": [], "reason": "clean", "penalties": [], "flags": [],
+                    "frames_decoded": 125}
+
+        def counted(tools, path, index, progress=None):
+            calls.append(("count", str(path)))
+            return 125
+
+        def ffmpeg(argv, check=True):
+            calls.append(("ffmpeg", " ".join(str(part) for part in argv)))
+            return types.SimpleNamespace(returncode=0, stderr="SSIM Y:0.990000 ")
+
+        with unittest.mock.patch.object(verify_module, "sha256_file", hashed), \
+                unittest.mock.patch.object(verify_module, "cheap_fingerprint", fingerprinted), \
+                unittest.mock.patch.object(verify_module, "probe_file", probed), \
+                unittest.mock.patch.object(verify_module, "decode_output", decoded), \
+                unittest.mock.patch.object(verify_module, "count_frames", counted), \
+                unittest.mock.patch.object(verify_module, "run_tool", ffmpeg):
+            yield calls
+
+    def run_verify(self):
+        args = argparse.Namespace(paths=[str(self.folder)], ffmpeg=None, quiet=True, verbose=False, log=None,
+                                  yes=False, ssim_check=True, ssim_threshold=0.97, samples=1, stream=io.StringIO())
+        tools = types.SimpleNamespace(ffmpeg="ffmpeg-stand-in", ffprobe="ffprobe-stand-in")
+        with unittest.mock.patch("vidfunnel.deps.require", return_value=tools), self.recorders():
+            run(args)
+        return args.stream.getvalue()
+
+    def assert_only_the_good_record_was_read(self, text):
+        self.assertTrue(self.calls, text)
+        for what, target in self.calls:
+            self.assertNotIn("meadow", target, (what, text))
+            self.assertNotIn("secret", target, (what, text))
+            self.assertNotIn(str(self.elsewhere), target, (what, text))
+        self.assertIn(("decode", str(self.folder / "harbour.mp4")), self.calls)
+        self.assertEqual(load_record(self.good_key)["status"], "verified", text)
+
+    def test_run_refuses_each_shape_and_verifies_the_good_record(self):
+        for field, changes in REFUSED_NAMES:
+            with self.subTest(field=field, changes=changes):
+                self.setUp()
+                self.edit(changes)
+                before = self.file_bytes()
+                text = self.run_verify()
+                self.assertRegex(text, r"skipping a record in '{}': {}(\[[0-9]+\](\.name)?)? is ".format(
+                    re.escape(str(self.folder)), re.escape(field)))
+                self.assertIn("1 skipped", text)
+                after = self.file_bytes()
+                self.assertEqual(after["meadow"], before["meadow"], "the edited record was written")
+                self.assertEqual(after["secret"], before["secret"], "another folder's record was written")
+                self.assert_only_the_good_record_was_read(text)
+
+    def test_verify_record_refuses_each_shape_before_reading(self):
+        import copy
+        from vidfunnel.verify import RecordRefused
+        options = types.SimpleNamespace(ssim_check=True, ssim_threshold=0.97, samples=1)
+        for field, changes in REFUSED_NAMES:
+            with self.subTest(field=field, changes=changes):
+                self.setUp()
+                record = self.edit(changes)
+                kept = copy.deepcopy(record)
+                before = self.file_bytes()
+                with self.recorders(), self.assertRaises(RecordRefused) as caught:
+                    verify_record(None, self.edited_key, record, options, quiet())
+                self.assertIsInstance(caught.exception, ValueError)
+                self.assertRegex(str(caught.exception), r"{}(\[[0-9]+\](\.name)?)? is ".format(re.escape(field)))
+                self.assertEqual(record, kept)
+                self.assertEqual(self.file_bytes(), before)
+                self.assertEqual(self.calls, [])
+
+    def test_a_record_edited_after_collection_is_skipped_under_the_lock(self):
+        # The seam: FolderLock is wrapped so that, after run() has collected the records and before it takes
+        # the folder's lock, the edited record's output name gains a directory part on disk.
+        import vidfunnel.verify as verify_module
+        from vidfunnel.record import FolderLock
+        test = self
+
+        class EditFirst(FolderLock):
+            def __enter__(self):
+                test.edit([(["output", "name"], "../elsewhere/secret.mp4")])
+                test.before = test.file_bytes()
+                return super().__enter__()
+
+        with unittest.mock.patch.object(verify_module, "FolderLock", EditFirst):
+            text = self.run_verify()
+        self.assertIn("skipping 'meadow.avi': record of 'meadow.avi' is refused: output.name is "
+                      "'../elsewhere/secret.mp4'", text)
+        self.assertIn("1 skipped", text)
+        after = self.file_bytes()
+        self.assertEqual(after["meadow"], self.before["meadow"])
+        self.assertEqual(after["secret"], self.before["secret"])
+        self.assert_only_the_good_record_was_read(text)
+
+    def test_a_file_path_beside_an_edited_record_verifies_its_own_record(self):
+        # Given a file, run() matches the names of each record in its folder; an edited record's output that is
+        # not an object, or a source name that is a list, must not stop that.
+        self.edit([(["output"], "meadow.mp4"), (["source", "name"], ["meadow.avi"])])
+        before = self.file_bytes()
+        args = argparse.Namespace(paths=[str(self.folder / "harbour.mp4")], ffmpeg=None, quiet=True, verbose=False,
+                                  log=None, yes=False, ssim_check=False, ssim_threshold=0.97, samples=None,
+                                  stream=io.StringIO())
+        tools = types.SimpleNamespace(ffmpeg="ffmpeg-stand-in", ffprobe="ffprobe-stand-in")
+        with unittest.mock.patch("vidfunnel.deps.require", return_value=tools), self.recorders():
+            run(args)
+        text = args.stream.getvalue()
+        self.assertEqual(self.file_bytes()["meadow"], before["meadow"])
+        self.assert_only_the_good_record_was_read(text)
+
+    def test_members_of_a_record_that_is_not_a_vob_group_are_not_read(self):
+        # Only a VOB group's members are checked by name, so only a VOB group's members are inputs.
+        self.edit([(["source", "members"], [{"name": "../elsewhere/secret.avi"}])])
+        text = self.run_verify()
+        self.assertNotIn("skipping", text)
+        for what, target in self.calls:
+            self.assertNotIn("secret", target, (what, text))
+        self.assertIn(("count", str(self.folder / "meadow.avi")), self.calls)
+        self.assertTrue(any(what == "ffmpeg" and str(self.folder / "meadow.avi") in target
+                            for what, target in self.calls), self.calls)
+        self.assertEqual(load_record(self.edited_key)["status"], "verified", text)
 
 
 STOP_FIXTURES = (REMUX_FIXTURE, MP4_FIXTURE, SUBTITLE_FIXTURE)

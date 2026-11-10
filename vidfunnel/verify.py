@@ -49,9 +49,17 @@ stages.verify_history. Status 'verified' when the checks ran, penalties or not
 (the band of the score says what it means); 'failed' when the output is
 missing, cannot be probed, does not decode at all (non-zero exit and no
 decoded frame), or changed while it was verified.
+
+Every name a record gives (source.name, the VOB members, output.name and
+interim_name, the sidecar names) is checked with plan.record_name_problem,
+as convert checks it, before anything the record names is read: `run`
+leaves a record whose names are not plain names in its folder out when it
+collects the records, so it is never keyed, loaded or saved, and counts it
+'skipped'; verify_record raises RecordRefused (a ValueError) for one before
+it touches a file or the record.
 """
 
-VERSION = "20261109"
+VERSION = "20261109.2"
 
 import json
 import os
@@ -65,7 +73,7 @@ from vidfunnel.analyze import DEFAULT_SAMPLES, WINDOW_SECONDS, decide_decode, sa
 from vidfunnel.ffmpeg import FfmpegError, null_decode
 from vidfunnel.ffmpeg import run as run_tool
 from vidfunnel.interrupt import drain_after_item, drain_before_next
-from vidfunnel.plan import HASH_PROGRESS_BYTES, IDENTITY_KEY, video_filters
+from vidfunnel.plan import HASH_PROGRESS_BYTES, IDENTITY_KEY, record_name_problem, video_filters
 from vidfunnel.probe import count_frames, probe_file
 from vidfunnel.progress import Progress, StageSummary, ffmpeg_progress_callback, format_bytes, item_tag, say, tagged
 from vidfunnel.record import (
@@ -103,6 +111,10 @@ VERIFIABLE_STATUSES = ("converted", "verified")
 OUTCOMES = ("ok", "review", "hold", "failed", "skipped")
 
 _SSIM_LUMA = re.compile(r"SSIM Y:([0-9.]+)")
+
+
+class RecordRefused(ValueError):
+    """A record verify does not work on: a name in it is not a plain file name in its folder (the field named)."""
 
 
 # --- small helpers ---------------------------------------------------------------------
@@ -172,7 +184,8 @@ def source_inputs(folder, record):
     """The source file(s) beside the record: the VOB members in order, the file itself, or the DVD folder."""
     source = record.get("source") or {}
     members = source.get("members")
-    if members:
+    # As plan.record_inputs: the members are the inputs of a VOB group only, the kind whose names are checked.
+    if members and source.get("kind") == "vob-group":
         return [Path(folder) / member.get("name") for member in members]
     return [Path(folder) / source.get("name")]
 
@@ -544,7 +557,9 @@ def verify_record(tools, source, record, options, progress=None):
     looked up in its folder. `options` may carry ssim_check, ssim_threshold
     and samples. `progress` is None or an object with 'stream' and 'quiet'
     (the CLI args). Raises ValueError for a record whose status is not
-    'converted' or 'verified'.
+    'converted' or 'verified', and RecordRefused (a ValueError) for one whose
+    names are not plain names in its folder (plan.record_name_problem); both
+    before any file is read and with the record unchanged.
     """
     stream, quiet = _progress_options(progress)
     key = Path(os.path.abspath(os.fspath(source)))
@@ -552,6 +567,9 @@ def verify_record(tools, source, record, options, progress=None):
     if record.get("status") not in VERIFIABLE_STATUSES:
         raise ValueError("record {} of '{}' has status '{}'; verify needs 'converted' or 'verified'".format(
             record.get("id"), key.name, record.get("status")))
+    problem = record_name_problem(record)
+    if problem is not None:
+        raise RecordRefused("record of '{}' is refused: {}".format(key.name, problem))
     _archive_previous(record)
     output_path = output_path_of(folder, record)
     stage = {"output_name": output_path.name if output_path is not None else None}
@@ -727,8 +745,11 @@ def _records_under(path, stream):
     for record_folder, record in iter_records(folder, on_error=lambda entry, error: None):
         if record_folder != folder:
             continue
-        names = {(record.get("source") or {}).get("name")}
-        names.update((record.get("output") or {}).get(name) for name in ("name", "interim_name"))
+        # A list, not a set: an edited record may hold unhashable values; run() refuses those records.
+        source, output = record.get("source"), record.get("output")
+        names = [source.get("name")] if isinstance(source, dict) else []
+        if isinstance(output, dict):
+            names += [output.get(name) for name in ("name", "interim_name")]
         if path.name in names:
             found.append((record_folder, record))
     return found
@@ -760,6 +781,13 @@ def run(args):
             if identity in seen:
                 continue
             seen.add(identity)
+            if record.get("status") in VERIFIABLE_STATUSES:
+                # Before the record is keyed: a source name with a directory part would key another folder's record.
+                problem = record_name_problem(record)
+                if problem is not None:
+                    say("skipping a record in '{}': {}".format(folder, problem), stream)
+                    summary.add("skipped")
+                    continue
             if str(folder) not in by_folder:
                 by_folder[str(folder)] = []
                 order.append(str(folder))
@@ -812,6 +840,12 @@ def run(args):
                         continue
                     try:
                         result = verify_record(tools, key, record, args, progress=item)
+                    except RecordRefused as error:
+                        # Changed on disk since it was collected; left as it is.
+                        say("skipping '{}': {}".format(key.name, error), item.stream)
+                        summary.add("skipped")
+                        drain_after_item()
+                        continue
                     except (OSError, RecordError, FfmpegError) as error:
                         say("failed: '{}': {}".format(key.name, error), item.stream)
                         summary.add("failed")
