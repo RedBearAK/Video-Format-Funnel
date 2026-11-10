@@ -933,6 +933,33 @@ class RunTests(RetireCase):
         self.assertIn("1 retired", out.getvalue())
         self.assertIn("1 skipped (locked)", out.getvalue())
 
+    def test_run_skips_every_folder_when_no_heartbeat_thread_can_start(self):
+        """A pids limit: the lock cannot beat, so it is not taken; each folder is skipped, nothing is moved."""
+        import threading
+        import time
+        from vidfunnel.cli import EXIT_ERROR
+
+        class RefusedThread(threading.Thread):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        deadline = time.monotonic() + 5
+        while record_module._beat_thread is not None:
+            self.assertLess(time.monotonic(), deadline, "a heartbeat thread outlived an earlier test")
+            time.sleep(0.01)
+        refusing = mock.patch.object(record_module, "threading",
+                                     mock.Mock(Thread=RefusedThread, current_thread=threading.current_thread))
+        before = snapshot(self.root)
+        out, err = self.quietly()
+        with refusing:
+            result = run(self.namespace(str(self.root)))
+        self.assertEqual(result, EXIT_ERROR)
+        self.assertEqual(snapshot(self.root), before, "files changed although no folder was locked")
+        self.assertIn("cannot start the heartbeat thread its lock needs (can't start new thread)", err.getvalue())
+        self.assertIn("2 skipped (locked)", out.getvalue())
+        for folder in (self.holidays, self.meetings):
+            self.assertFalse((folder / ".vidfunnel" / "lock").exists())
+
     def test_run_missing_path_is_an_error(self):
         from vidfunnel.cli import EXIT_ERROR
         self.quietly()

@@ -30,6 +30,7 @@ except ImportError:  # not on Windows, which vidfunnel does not support; takeove
 import vidfunnel
 from vidfunnel.interrupt import check as check_interrupted
 from vidfunnel.interrupt import drain_for_lost_lock
+from vidfunnel.progress import _write as _write_line
 
 RECORD_DIR = ".vidfunnel"
 LOCK_NAME = "lock"
@@ -549,8 +550,16 @@ def save_folder(folder, data):
 
 
 def _warn(message):
-    sys.stderr.write(message + "\n")
-    sys.stderr.flush()
+    """Write a line to stderr; never raises, also on the heartbeat thread.
+
+    A reader that is gone (EIO, EPIPE) points stderr at /dev/null, as for
+    every other line (vidfunnel.progress._write); a closed stream (ValueError)
+    or none at all (AttributeError: sys.stderr is None) drops the line.
+    """
+    try:
+        _write_line(sys.stderr, message + "\n")
+    except (OSError, ValueError, AttributeError):
+        pass
 
 
 # Files a container runtime leaves in the container's root: podman's and Docker's.
@@ -664,6 +673,7 @@ class _Beat:
         self.handover = False                 # release() left the descriptor open for the beating thread to close
         self.lost = False                     # the lock path names another file: another run took the folder
         self.failure_reported = False
+        self.crash_reported = False
         self.count = 0                        # beats written
 
 
@@ -676,8 +686,13 @@ def _start_beating(beat):
     global _beat_thread
     _beats.append(beat)
     if _beat_thread is None:
-        thread = threading.Thread(target=_heartbeat_loop, name="vidfunnel-heartbeat", daemon=True)
-        thread.start()
+        try:
+            thread = threading.Thread(target=_heartbeat_loop, name="vidfunnel-heartbeat", daemon=True)
+            thread.start()
+        except RuntimeError as error:  # no thread can be started (a pids limit, RLIMIT_NPROC)
+            _beats.remove(beat)
+            raise LockHeld("cannot start the heartbeat thread its lock needs ({}); the folder is not locked and "
+                           "not worked on".format(error)) from error
         _beat_thread = thread
 
 
@@ -687,8 +702,21 @@ def _heartbeat_loop():
     The guard is held only to read and update the registry, never while the
     share is touched, so a stalled share cannot hold up release() or the
     start of a child (held_lock_fds). A descriptor in use by a beat is not
-    closed by release(); the beat closes it afterwards.
+    closed by release(); the beat closes it afterwards. An exception from
+    one lock's beat is reported once for that lock and the loop goes on
+    with the others; whenever the loop ends, the thread slot is cleared,
+    so the next lock taken starts a new thread.
     """
+    global _beat_thread
+    try:
+        _beat_until_none_left()
+    finally:
+        with _held_locks_guard:
+            if _beat_thread is threading.current_thread():
+                _beat_thread = None
+
+
+def _beat_until_none_left():
     global _beat_thread
     last_wall = time.time()
     last_mono = time.monotonic()
@@ -715,11 +743,19 @@ def _heartbeat_loop():
         for beat in due:
             try:
                 _beat_once(beat)
+            except Exception as error:
+                try:
+                    _beat_crashed(beat, error)
+                except Exception:  # the report itself failed: the beats go on regardless
+                    pass
             finally:
                 with _held_locks_guard:
                     beat.beating = False
                     if beat.handover:
-                        os.close(beat.handle)
+                        try:
+                            os.close(beat.handle)
+                        except OSError:
+                            pass
         if not due:
             time.sleep(max(0.0, min(pause, HEARTBEAT_POLL_SECONDS)))
 
@@ -764,9 +800,14 @@ def _lock_state(beat):
     try:
         there = os.stat(beat.path)
     except FileNotFoundError:
-        if os.path.isdir(os.path.dirname(beat.path)):
+        if not os.path.isdir(os.path.dirname(beat.path)):
+            return "failed", "cannot reach '{}'".format(os.path.dirname(beat.path))
+        try:
+            there = os.stat(beat.path)  # the folder is there: it may have come back since the first look
+        except FileNotFoundError:
             return "lost", "its lock file is gone"
-        return "failed", "cannot reach '{}'".format(os.path.dirname(beat.path))
+        except OSError as error:
+            return "failed", "cannot check the lock file: {}".format(error)
     except OSError as error:
         return "failed", "cannot check the lock file: {}".format(error)
     try:
@@ -787,6 +828,14 @@ def _beat_failed(beat, words):
     _warn("warning: lock '{}': {}; trying again every {} s".format(beat.path, words, HEARTBEAT_SECONDS))
 
 
+def _beat_crashed(beat, error):
+    if beat.crash_reported:
+        return
+    beat.crash_reported = True
+    _warn("warning: lock '{}': the heartbeat failed ({}: {}); trying again every {} s".format(
+        beat.path, type(error).__name__, error, HEARTBEAT_SECONDS))
+
+
 def _lose_lock(beat, words):
     """Stop beating a lock another run has taken, say so once and drain the run (nothing further starts).
 
@@ -800,17 +849,17 @@ def _lose_lock(beat, words):
         beat.lost = True
         if beat in _beats:
             _beats.remove(beat)
+    drain_for_lost_lock(str(beat.folder))  # first: nothing after it may keep the run from draining
     host = None
     try:
         holder = _read_json(beat.path)
-    except RecordError:
-        holder = None
-    if isinstance(holder, dict) and isinstance(holder.get("host"), str):
-        host = holder["host"]
+        if isinstance(holder, dict) and isinstance(holder.get("host"), str):
+            host = holder["host"]
+    except Exception:  # unreadable, or nested too deep for json (RecursionError): the message has no host
+        pass
     holder_words = "; host '{}' holds it now".format(host) if host is not None else ""
     _warn("vidfunnel: lost the lock of folder '{}': {}{}; finishing the items in progress, starting no "
           "more".format(beat.folder, words, holder_words))
-    drain_for_lost_lock(str(beat.folder))
 
 
 def _share_clock_ns(directory):
@@ -1242,6 +1291,13 @@ class FolderLock:
                             "the share's clock ({}), so the 24 h rule applies to its last beat".format(
                                 record_dir(self.folder), clock_error))
                 raise self._held(holder, age, why)
+            elif clock_error is not None:
+                warning = ("warning: taking over stale lock '{}' held by {} '{}' pid {} since {}: no probe file can "
+                           "be created in '{}' to read the share's clock ({}), so the 24 h rule decided on the "
+                           "younger of its start and its last beat, {:.1f} h ago on this machine's clock{}".format(
+                               self.path, holder_words, host, pid, holder.get("started"), record_dir(self.folder),
+                               clock_error, rule_age / 3600.0,
+                               "; its pid is running here, taken for a reused one" if liveness is True else ""))
             else:
                 warning = "warning: taking over stale lock '{}' held by {} '{}' pid {} since {} ({:.1f} h ago{})".format(
                     self.path, holder_words, host, pid, holder.get("started"), age / 3600.0,
@@ -1327,9 +1383,10 @@ class FolderLock:
         The heartbeat stops first. A lock the heartbeat found taken by
         another run is left alone without a look at its path; any other is
         unlinked only when the path still names our file with our entry
-        (_still_ours). A descriptor a beat is using at that moment is closed
-        by the heartbeat thread once the beat ends, so release never waits
-        for the share.
+        (_still_ours, which stats the path and reads the file through our
+        descriptor, so a stalled share does hold it up). A descriptor a beat
+        is using at that moment is closed by the heartbeat thread once the
+        beat ends, so release does not wait for a beat in flight.
         """
         if self.content is None:
             return

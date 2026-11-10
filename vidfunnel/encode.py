@@ -425,6 +425,28 @@ def _remove(path):
         return False
 
 
+def _clear_leftover(temp):
+    """Unlink a part file left by an earlier run before a new one is written: (removed, None) or (False, reason).
+
+    Unlinked, never truncated: ffmpeg's '-y' would open the existing file
+    with O_TRUNC and keep its inode, and a writer still holding it (an
+    encoder orphaned by a vidfunnel killed outright, whose folder another
+    machine has since taken over) would go on writing into the new
+    encode's file. After the unlink that writer keeps an unnamed file and
+    the new encode gets a new one. When the unlink fails for any reason
+    but a missing file, the reason names the part file and the item is
+    not started.
+    """
+    try:
+        os.unlink(str(temp))
+        return True, None
+    except FileNotFoundError:
+        return False, None
+    except OSError as error:
+        return False, "cannot remove the part file '{}' left by an earlier run ({}); not started".format(
+            Path(temp).name, error.strerror or error)
+
+
 def _stream_of(progress):
     if progress is None:
         return None, False, False
@@ -526,7 +548,11 @@ def _write_sidecars(sidecars, record_id, stream, verbose):
         say("  writing sidecar '{}' ({})".format(final.name, entry.get("kind")), stream)
         if verbose:
             say("  " + shlex.join(argv), stream)
-        _remove(temp)
+        _removed, problem = _clear_leftover(temp)
+        if problem is not None:
+            errors.append({"path": final.name, "error": problem})
+            say("  sidecar '{}' failed: {}".format(final.name, problem), stream)
+            continue
         started.append(argv)
         try:
             run_tool(argv)
@@ -616,7 +642,11 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
     if verbose:
         say(shlex.join(argv), stream)
 
-    if _remove(temp):
+    removed, problem = _clear_leftover(temp)
+    if problem is not None:
+        say("skipping '{}': {}".format(label, problem), stream)
+        return {"outcome": "skipped", "skipped": problem}
+    if removed:
         say("  removed a stale '{}' from an earlier run".format(temp.name), stream)
     started = time.monotonic()
     duration = expected_duration(record)
@@ -1042,6 +1072,14 @@ def refit_one(tools, source, record, options, progress=None, position=None, tota
     say("  {}".format(plan["denoise_reason"]), stream)
     if verbose:
         say(shlex.join(plan["argv"]), stream)
+    temp = plan["part"]
+    output_path = plan["output_path"]
+    removed, problem = _clear_leftover(temp)  # before the record is touched: a skip leaves it as it was
+    if problem is not None:
+        say("skipping '{}': {}".format(label, problem), stream)
+        return "skipped", problem
+    if removed:
+        say("  removed a stale '{}' from an earlier run".format(temp.name), stream)
 
     stages = record.setdefault("stages", {})
     if "refit" in stages:
@@ -1052,10 +1090,6 @@ def refit_one(tools, source, record, options, progress=None, position=None, tota
                "previous_output_size": plan["output_size"], "previous_ratio": round(plan["ratio"], 4),
                "source_size": plan["source_size"], "output_size": None, "ratio": None, "elapsed_s": None,
                "argv": plan["argv"], "ffmpeg": plan["ffmpeg"], "version": vidfunnel.VERSION}
-    temp = plan["part"]
-    output_path = plan["output_path"]
-    if _remove(temp):
-        say("  removed a stale '{}' from an earlier run".format(temp.name), stream)
     started = time.monotonic()
     duration = expected_duration(record)
     try:

@@ -1564,7 +1564,11 @@ class HeartbeatTests(TempDirCase):
         os.chmod(str(records), 0o755)
         self.write_other_lock(25 * 3600, started_hours_ago=30)
         with mock.patch("vidfunnel.record._share_clock_ns", side_effect=PermissionError(13, "Permission denied")):
-            self.assertIn("stale lock", self.assert_taken())
+            warning = self.assert_taken()
+        self.assertIn("stale lock", warning)
+        self.assertIn("so the 24 h rule decided on the younger of its start and its last beat, 25.0 h ago on this "
+                      "machine's clock", warning)
+        self.assertNotIn("30.0 h", warning)
 
     def test_the_probe_file_is_removed_when_the_judgement_raises(self):
         held = self.write_other_lock(600)
@@ -1635,6 +1639,7 @@ class HeartbeatTests(TempDirCase):
             write_bytes(self.lock_file(), json.dumps(winner).encode("utf-8"))
             taken = self.lock_file().read_bytes()
             self.wait_until(vidfunnel.interrupt.draining.is_set, 5, "the holder did not drain")
+            self.wait_until(lambda: lines, 5, "the lost lock was not reported")  # printed after the drain
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("lost the lock of folder '{}'".format(self.base), lines[0])
         self.assertIn("host 'winnerhost' holds it now", lines[0])
@@ -1685,6 +1690,7 @@ class HeartbeatTests(TempDirCase):
             self.assertEqual(lines, [])
             clock.wall_offset += 3600  # the wall clock counted an hour of sleep, the monotonic clock did not
             self.wait_until(vidfunnel.interrupt.draining.is_set, 2, "the wake did not check the lock")
+            self.wait_until(lambda: lines, 5, "the lost lock was not reported")  # printed after the drain
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("lost the lock of folder '{}'".format(self.base), lines[0])
         self.assertIn("host 'winnerhost' holds it now", lines[0])
@@ -1717,6 +1723,15 @@ class HeartbeatTests(TempDirCase):
                 self.assertEqual(os.stat(str(self.lock_file())).st_mtime_ns, 10 ** 9)
                 self.assertEqual(lock.beat.count, 0)
 
+    def test_a_forward_step_just_over_the_wake_gap_beats_at_once(self):
+        clock = self.stepping_clock()
+        lock = self.judge()
+        os.utime(str(self.lock_file()), ns=(10 ** 9, 10 ** 9))
+        time.sleep(0.05)
+        clock.wall_offset += vidfunnel.record.HEARTBEAT_WAKE_GAP_SECONDS + 1
+        self.wait_until(lambda: lock.beat.count == 1, 2, "a step just over the wake gap did not beat")
+        self.assertGreater(os.stat(str(self.lock_file())).st_mtime_ns, 10 ** 9)
+
     def test_a_thread_stopped_long_enough_for_a_takeover_checks_its_lock_at_once(self):
         """SIGSTOP: both clocks count the stop, so the hour-long interval itself makes the lock due."""
         clock = self.stepping_clock()
@@ -1728,8 +1743,266 @@ class HeartbeatTests(TempDirCase):
             clock.mono_offset += HEARTBEAT_STALE_SECONDS + 60
             clock.wall_offset += HEARTBEAT_STALE_SECONDS + 60
             self.wait_until(vidfunnel.interrupt.draining.is_set, 2, "the late poll did not check the lock")
+            self.wait_until(lambda: lines, 5, "the lost lock was not reported")  # printed after the drain
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("lost the lock of folder '{}'".format(self.base), lines[0])
+
+    def no_heartbeat_thread(self):
+        self.wait_until(lambda: vidfunnel.record._beat_thread is None and not heartbeat_threads(), 5,
+                        "a heartbeat thread outlived an earlier test")
+
+    def failing_writes(self, failures):
+        """os.pwrite that raises EIO for its first `failures` calls, then writes."""
+        real_pwrite = os.pwrite
+        calls = []
+
+        def pwrite(handle, data, offset):
+            calls.append(handle)
+            if len(calls) <= failures:
+                raise OSError(errno.EIO, "Input/output error")
+            return real_pwrite(handle, data, offset)
+
+        patch = mock.patch("vidfunnel.record.os.pwrite", side_effect=pwrite)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return calls
+
+    def test_a_beat_survives_a_stderr_that_cannot_be_written(self):
+        class GoneReader:
+            def write(self, text):
+                raise OSError(errno.EIO, "Input/output error")
+
+            def flush(self):
+                raise OSError(errno.EIO, "Input/output error")
+
+        for stderr in (GoneReader(), None):
+            with self.subTest(stderr=stderr):
+                self.fast_beats()
+                calls = self.failing_writes(3)
+                with mock.patch.object(sys, "stderr", stderr):
+                    lock = self.judge()
+                    self.wait_until(lambda: lock.beat.count >= 3, 5, "beats stopped after a failed warning")
+                    self.assertGreaterEqual(len(calls), 6)
+                    self.assertTrue(heartbeat_threads())
+                    lock.release()
+
+    def test_a_lost_lock_drains_when_stderr_cannot_be_written(self):
+        for stderr in (types.SimpleNamespace(write=mock.Mock(side_effect=OSError(errno.EPIPE, "Broken pipe")),
+                                             flush=mock.Mock()), None):
+            with self.subTest(stderr=stderr):
+                vidfunnel.interrupt.draining.clear()
+                vidfunnel.interrupt.drain_tally.reset()
+                self.fast_beats()
+                with mock.patch.object(sys, "stderr", stderr):
+                    lock = self.judge()
+                    lock.warn = lambda line: None
+                    self.replace_lock()
+                    self.wait_until(vidfunnel.interrupt.draining.is_set, 5, "the lost lock did not drain")
+                    lock.release()
+                self.lock_file().unlink()
+
+    def test_a_lost_lock_drains_when_its_warning_fails(self):
+        self.fast_beats()
+        with mock.patch("vidfunnel.record._warn", side_effect=RuntimeError("the warning failed")):
+            lock = self.judge()
+            lock.warn = lambda line: None
+            self.replace_lock()
+            self.wait_until(vidfunnel.interrupt.draining.is_set, 5, "a failed warning kept the run from draining")
+        self.assertEqual(vidfunnel.interrupt.drain_tally.lost_locks, [str(self.base)])
+
+    def test_a_replacing_lock_nested_too_deep_still_drains_and_says_so(self):
+        self.fast_beats()
+        lines = []
+        with mock.patch("vidfunnel.record._warn", side_effect=lines.append):
+            lock = self.judge()
+            lock.warn = lambda line: None
+            os.unlink(str(self.lock_file()))
+            write_bytes(self.lock_file(), b"[" * 200000 + b"]" * 200000)
+            self.wait_until(vidfunnel.interrupt.draining.is_set, 5, "the lost lock did not drain")
+            self.wait_until(lambda: lines, 5, "the lost lock was not reported")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("lost the lock of folder '{}'".format(self.base), lines[0])
+        self.assertNotIn("holds it now", lines[0])
+
+    def test_an_exception_in_a_beat_is_reported_once_and_the_beats_go_on(self):
+        self.fast_beats()
+        real_state = vidfunnel.record._lock_state
+        calls = []
+
+        def broken_then_real(beat):
+            calls.append(beat)
+            if len(calls) <= 3:
+                raise ValueError("an unexpected failure")
+            return real_state(beat)
+
+        lines = []
+        with mock.patch("vidfunnel.record._warn", side_effect=lines.append), \
+                mock.patch("vidfunnel.record._lock_state", side_effect=broken_then_real):
+            lock = self.judge()
+            self.wait_until(lambda: lock.beat.count >= 3, 5, "the beats did not go on after the exception")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("the heartbeat failed (ValueError: an unexpected failure)", lines[0])
+
+    def test_after_the_thread_dies_the_next_lock_starts_a_new_one(self):
+        self.no_heartbeat_thread()
+        self.fast_beats()
+        with mock.patch("vidfunnel.record._beat_until_none_left", side_effect=RuntimeError("the thread died")), \
+                mock.patch.object(threading, "excepthook", lambda arguments: None):
+            first = FolderLock(self.base / "first", warn=self.fail).acquire()
+            self.addCleanup(first.release)
+            self.wait_until(lambda: not heartbeat_threads(), 5, "the thread did not die")
+        self.assertIsNone(vidfunnel.record._beat_thread)
+        self.assertEqual(first.beat.count, 0)
+        second = FolderLock(self.base / "second", warn=self.fail).acquire()
+        self.addCleanup(second.release)
+        self.wait_until(lambda: first.beat.count >= 2 and second.beat.count >= 2, 5,
+                        "no new thread beats the locks")
+
+    def test_a_thread_that_cannot_start_refuses_the_lock_and_leaves_no_file(self):
+        class RefusedThread(threading.Thread):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        self.no_heartbeat_thread()
+        refusing = types.SimpleNamespace(Thread=RefusedThread, current_thread=threading.current_thread)
+        with mock.patch.object(vidfunnel.record, "threading", refusing):
+            with self.assertRaises(LockHeld) as caught:
+                FolderLock(self.base, warn=self.fail).acquire()
+        self.assertIn("cannot start the heartbeat thread its lock needs (can't start new thread)",
+                      str(caught.exception))
+        self.assertFalse(self.lock_file().exists())
+        with held_lock_fds() as descriptors:
+            self.assertEqual(descriptors, ())
+        with vidfunnel.record._held_locks_guard:
+            self.assertEqual(vidfunnel.record._beats, [])
+        lock = self.judge()
+        self.assertTrue(heartbeat_threads())
+        lock.release()
+
+    def test_beats_come_no_more_often_than_the_interval(self):
+        interval = 0.05
+        self.fast_beats(interval)
+        with mock.patch.object(vidfunnel.record, "HEARTBEAT_POLL_SECONDS", 0.002):
+            real_pwrite = os.pwrite
+            calls = []
+
+            def counting(handle, data, offset):
+                calls.append(time.monotonic())
+                return real_pwrite(handle, data, offset)
+
+            with mock.patch("vidfunnel.record.os.pwrite", side_effect=counting):
+                lock = self.judge()
+                started = time.monotonic()
+                time.sleep(10 * interval)
+                elapsed = time.monotonic() - started
+                lock.release()
+        self.assertGreaterEqual(len(calls), 3, "the holder hardly beat")
+        self.assertLessEqual(len(calls), elapsed / interval + 2, "beats came faster than the interval")
+
+    def test_release_during_a_beat_leaves_the_descriptor_to_the_beat(self):
+        self.fast_beats()
+        in_beat = threading.Event()
+        go_on = threading.Event()
+        real_pwrite = os.pwrite
+
+        def held_up(handle, data, offset):
+            in_beat.set()
+            go_on.wait(10)
+            return real_pwrite(handle, data, offset)
+
+        with mock.patch("vidfunnel.record.os.pwrite", side_effect=held_up):
+            lock = self.judge()
+            handle = lock.handle
+            self.assertTrue(in_beat.wait(5), "no beat began")
+            started = time.monotonic()
+            lock.release()
+            self.assertLess(time.monotonic() - started, 0.5, "release waited for the beat in flight")
+            self.assertFalse(self.lock_file().exists())
+            os.fstat(handle)  # still open: the beat in flight uses it
+            go_on.set()
+            self.wait_until(lambda: self.descriptor_closed(handle), 5, "the beat did not close the descriptor")
+
+    @staticmethod
+    def descriptor_closed(handle):
+        try:
+            os.fstat(handle)
+        except OSError:
+            return True
+        return False
+
+    def test_a_beat_seeing_our_own_release_does_not_drain(self):
+        lock = self.judge()
+        beat = lock.beat
+        lock.release()
+        vidfunnel.record._lose_lock(beat, "its lock file is gone")
+        self.assertFalse(vidfunnel.interrupt.draining.is_set())
+        self.assertFalse(beat.lost)
+
+    def test_a_released_or_lost_lock_is_neither_checked_nor_beaten(self):
+        lock = self.judge()
+        with mock.patch("vidfunnel.record._lock_state", side_effect=AssertionError("checked")) as checked, \
+                mock.patch("vidfunnel.record.os.pwrite", side_effect=AssertionError("written")) as written:
+            lock.beat.lost = True
+            vidfunnel.record._beat_once(lock.beat)
+            lock.beat.lost = False
+            beat = lock.beat
+            lock.release()
+            vidfunnel.record._beat_once(beat)
+        checked.assert_not_called()
+        written.assert_not_called()
+
+    def test_every_beat_is_fsynced(self):
+        self.fast_beats()
+        real_fsync = os.fsync
+        synced = []
+
+        def counting(handle):
+            synced.append(handle)
+            return real_fsync(handle)
+
+        with mock.patch("vidfunnel.record.os.fsync", side_effect=counting):
+            lock = self.judge()
+            self.wait_until(lambda: lock.beat.count >= 3, 5, "the holder never beat")
+            handle = lock.handle
+            count = lock.beat.count
+            lock.release()
+        self.assertGreaterEqual(synced.count(handle), count)
+
+    def test_a_stale_descriptor_means_the_lock_was_taken(self):
+        self.fast_beats()
+        lines = []
+        real_fstat = os.fstat
+        lock = self.judge()
+        lock.warn = lambda line: None
+        handle = lock.handle
+
+        def stale(descriptor):
+            if descriptor == handle:
+                raise OSError(errno.ESTALE, "Stale file handle")
+            return real_fstat(descriptor)
+
+        with mock.patch("vidfunnel.record._warn", side_effect=lines.append), \
+                mock.patch("vidfunnel.record.os.fstat", side_effect=stale):
+            self.wait_until(vidfunnel.interrupt.draining.is_set, 5, "a stale descriptor did not drain")
+            self.wait_until(lambda: lines, 5, "the lost lock was not reported")  # printed after the drain
+        self.assertIn("its lock file was removed on the server", lines[0])
+
+    def test_a_record_folder_that_is_gone_is_a_failed_beat_not_a_lost_lock(self):
+        self.fast_beats()
+        lines = []
+        with mock.patch("vidfunnel.record._warn", side_effect=lines.append):
+            lock = self.judge()
+            records = self.base / RECORD_DIR
+            away = self.base / "away"
+            os.rename(str(records), str(away))
+            self.wait_until(lambda: lines, 5, "the failed beat was not reported")
+            beats = lock.beat.count
+            time.sleep(0.1)  # five intervals
+            self.assertFalse(vidfunnel.interrupt.draining.is_set())
+            os.rename(str(away), str(records))
+            self.wait_until(lambda: lock.beat.count > beats, 5, "the beats did not resume")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("cannot reach '{}'".format(records), lines[0])
 
     def test_one_thread_beats_every_lock_and_ends_after_the_last_release(self):
         self.wait_until(lambda: not heartbeat_threads(), 5, "a heartbeat thread outlived an earlier test")

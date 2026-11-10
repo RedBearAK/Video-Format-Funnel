@@ -1250,6 +1250,70 @@ class ConvertRunTest(unittest.TestCase):
         self.assertIn("removed a stale", progress.stream.getvalue())
         self.assertEqual(other.read_bytes(), b"another record's part file")
 
+    def test_a_leftover_part_file_still_written_is_unlinked_and_never_mixed_in(self):
+        """An encoder orphaned by a killed run still holds the part file; the new encode writes a new inode."""
+        record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
+        leftover = part_path(self.root / "h264_high_mkv_aac.mp4", record["id"])
+        leftover.write_bytes(b"the orphan's first bytes")
+        leftover_inode = leftover.stat().st_ino
+        marker = b"WRITTEN BY THE ORPHANED ENCODER AFTER THE NEW ENCODE"
+        writer = subprocess.Popen(
+            [sys.executable, "-c", "import os, sys\nstream = open(sys.argv[1], 'ab')\nprint('ready', flush=True)\n"
+             "sys.stdin.readline()\nstream.write(sys.argv[2].encode())\nstream.flush()\nos.fsync(stream.fileno())\n",
+             str(leftover), marker.decode()],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True)
+        self.addCleanup(writer.stdout.close)
+        self.addCleanup(writer.stdin.close)
+        self.addCleanup(writer.wait)
+        self.addCleanup(writer.kill)
+        self.assertEqual(writer.stdout.readline(), "ready\n")
+        seen = {}
+
+        def encode_beside_the_orphan(argv, *rest, **values):
+            seen["existed"] = os.path.exists(argv[-1])
+            completed = ffmpeg_run(argv, *rest, **values)
+            seen["inode"] = os.stat(argv[-1]).st_ino
+            writer.stdin.write("go\n")
+            writer.stdin.flush()
+            writer.wait(20)
+            return completed
+
+        with unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=encode_beside_the_orphan):
+            stage = self.convert(REMUX_SOURCE, record)
+        self.assertEqual(stage["outcome"], "ok", stage)
+        self.assertEqual(writer.returncode, 0)
+        self.assertFalse(seen["existed"], "the leftover part file was still there when ffmpeg started")
+        self.assertNotEqual(seen["inode"], leftover_inode)
+        output = self.root / "h264_high_mkv_aac.mp4"
+        self.assertEqual(output.stat().st_ino, seen["inode"])
+        content = output.read_bytes()
+        self.assertNotIn(marker, content)
+        self.assertNotIn(b"the orphan's first bytes", content)
+
+    def test_a_leftover_part_file_that_cannot_be_removed_skips_the_item(self):
+        record = self.plan(REMUX_SOURCE)[REMUX_SOURCE]
+        leftover = part_path(self.root / "h264_high_mkv_aac.mp4", record["id"])
+        leftover.write_bytes(b"left by an earlier run")
+        record_bytes = record_path(self.root / REMUX_SOURCE).read_bytes()
+        real_unlink = os.unlink
+
+        def refuse(path, *rest, **values):
+            if os.fspath(path) == str(leftover):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_unlink(path, *rest, **values)
+
+        progress = quiet()
+        with unittest.mock.patch("vidfunnel.encode.os.unlink", side_effect=refuse), \
+                unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=AssertionError("ffmpeg started")):
+            stage = convert_one(TOOLS, self.root / REMUX_SOURCE, record, convert_options(), progress=progress)
+        self.assertEqual(stage["outcome"], "skipped", stage)
+        self.assertIn("cannot remove the part file '{}' left by an earlier run (Permission denied)".format(
+            leftover.name), stage["skipped"])
+        self.assertEqual(record_path(self.root / REMUX_SOURCE).read_bytes(), record_bytes)
+        self.assertEqual(leftover.read_bytes(), b"left by an earlier run")
+        self.assertFalse((self.root / "h264_high_mkv_aac.mp4").exists())
+        self.assertIn("skipping 'h264_high_mkv_aac.mkv': cannot remove the part file", progress.stream.getvalue())
+
     def test_reencode_output_decodes_as_h264(self):
         record = self.plan(REENCODE_SOURCE)[REENCODE_SOURCE]
         self.assertEqual(record["action"], "reencode")

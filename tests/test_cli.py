@@ -406,6 +406,17 @@ class SigtermTests(unittest.TestCase):
                       "took over the lock of '/share/films/Some Film'", err)
         self.assertEqual(vidfunnel.interrupt.drain_tally.lost_locks, [], "the lost lock outlived the command")
 
+    def test_a_lost_lock_with_nothing_left_to_start_still_names_the_folder(self):
+        def dispatch(args):
+            vidfunnel.interrupt.drain_for_lost_lock("/share/films/Some Film")
+            return 0
+
+        with unittest.mock.patch.object(cli, "dispatch", side_effect=dispatch):
+            code, _out, err = run_main(["convert"])
+        self.assertEqual(code, 0)
+        self.assertIn("vidfunnel: drained: 'convert': no item was left to start when the drain began; it ran to "
+                      "its end; another run took over the lock of '/share/films/Some Film'", err)
+
     def test_sigusr1_starts_a_drain_and_says_so_once(self):
         read = self.capture_fd2()
         self.assertIsNone(cli._on_sigusr1(signal.SIGUSR1, None))
