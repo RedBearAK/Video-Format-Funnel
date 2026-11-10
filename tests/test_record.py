@@ -525,14 +525,14 @@ class IterRecordsTests(TempDirCase):
         self.assertEqual(problems, ["bad.avi.json"])
 
 
-def race_for_lock(folder, barrier, results):
-    """One racer of test_racers_for_a_dead_lock_get_it_once: wait at the barrier, try the lock, hold it 0.5 s."""
-    import time
+def race_for_lock(folder, barrier, results, answered):
+    """One racer of test_racers_for_a_dead_lock_get_it_once: wait at the barrier, try the lock, and hold it
+    until every racer has answered, so a racer that is slow to try finds it held, not released again."""
     barrier.wait()
     try:
         with FolderLock(folder, warn=lambda message: None):
             results.put("ACQUIRED")
-            time.sleep(0.5)
+            answered.wait(120)
     except LockHeld:
         results.put("HELD")
     except BaseException as error:
@@ -787,13 +787,17 @@ class FolderLockTests(TempDirCase):
                 self.write_lock(socket.gethostname(), self.finished_pid(), 0.5, container=in_container())
                 barrier = context.Barrier(racers)
                 results = context.Queue()
-                processes = [context.Process(target=race_for_lock, args=(str(self.base), barrier, results))
+                answered = context.Event()
+                processes = [context.Process(target=race_for_lock, args=(str(self.base), barrier, results, answered))
                              for _number in range(racers)]
                 for process in processes:
                     process.start()
-                outcomes = sorted(results.get(timeout=60) for _number in range(racers))
+                try:
+                    outcomes = sorted(results.get(timeout=120) for _number in range(racers))
+                finally:
+                    answered.set()
                 for process in processes:
-                    process.join(60)
+                    process.join(120)
                 self.assertEqual(outcomes, ["ACQUIRED"] + ["HELD"] * (racers - 1))
                 self.assertFalse(self.lock_file().exists())
 
@@ -1426,7 +1430,14 @@ class HeartbeatTests(TempDirCase):
         return self.base / RECORD_DIR / LOCK_NAME
 
     def fast_beats(self, interval=0.02):
-        """Beat every `interval` seconds for the rest of this test (locks taken from now on)."""
+        """Beat every `interval` seconds for the rest of this test (locks taken from now on).
+
+        First waits for the heartbeat thread of an earlier lock to end: one
+        started with the default constants sleeps up to a whole default poll
+        (1 s) before it sees a new lock, so a lock taken meanwhile would not
+        beat at the patched interval.
+        """
+        self.no_heartbeat_thread()
         for name, value in (("HEARTBEAT_SECONDS", interval), ("HEARTBEAT_POLL_SECONDS", min(interval, 0.01))):
             patch = mock.patch.object(vidfunnel.record, name, value)
             patch.start()
@@ -1493,10 +1504,10 @@ class HeartbeatTests(TempDirCase):
         original = self.lock_file().read_bytes()
         before = os.stat(str(self.lock_file()))
         os.utime(str(self.lock_file()), ns=(10 ** 9, 10 ** 9))
-        self.wait_until(lambda: os.stat(str(self.lock_file())).st_mtime_ns > 10 ** 9, 5,
+        self.wait_until(lambda: os.stat(str(self.lock_file())).st_mtime_ns > 10 ** 9, 30,
                         "no beat advanced the lock file's mtime")
         first = lock.beat.count
-        self.wait_until(lambda: lock.beat.count >= first + 20, 10, "the holder stopped beating")
+        self.wait_until(lambda: lock.beat.count >= first + 20, 30, "the holder stopped beating")
         after = os.stat(str(self.lock_file()))
         self.assertEqual((after.st_dev, after.st_ino, after.st_size), (before.st_dev, before.st_ino, before.st_size))
         self.assertEqual(self.lock_file().read_bytes(), original)
@@ -1701,10 +1712,10 @@ class HeartbeatTests(TempDirCase):
         lines = []
         with mock.patch("vidfunnel.record._warn", side_effect=lines.append):
             lock = self.judge()
-            self.wait_until(lambda: lock.beat.count >= 2, 5, "the holder never beat")
+            self.wait_until(lambda: lock.beat.count >= 2, 30, "the holder never beat")
             taken = self.replace_lock()
-            self.wait_until(vidfunnel.interrupt.draining.is_set, 5, "the holder did not drain")
-            self.wait_until(lambda: lines, 5, "the lost lock was not reported")  # printed after the drain
+            self.wait_until(vidfunnel.interrupt.draining.is_set, 30, "the holder did not drain")
+            self.wait_until(lambda: lines, 30, "the lost lock was not reported")  # printed after the drain
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("lost the lock of folder '{}'".format(self.base), lines[0])
         self.assertIn("host 'winnerhost' holds it now", lines[0])
@@ -1726,11 +1737,17 @@ class HeartbeatTests(TempDirCase):
 
         Beats are made rare (an hour apart) and polls fast, so only the wake check can explain an early beat.
         """
-        clock = types.SimpleNamespace(wall_offset=0.0, mono_offset=0.0)
+        self.no_heartbeat_thread()  # a thread from an earlier lock would sleep through a whole default poll
+        clock = types.SimpleNamespace(wall_offset=0.0, mono_offset=0.0, polls=0)
         clock.time = lambda: time.time() + clock.wall_offset
         clock.time_ns = lambda: time.time_ns() + int(clock.wall_offset * 10 ** 9)
         clock.monotonic = lambda: time.monotonic() + clock.mono_offset
-        clock.sleep = time.sleep
+
+        def counted_sleep(seconds):
+            clock.polls += 1  # the loop has read both clocks for this round before it sleeps
+            time.sleep(seconds)
+
+        clock.sleep = counted_sleep
         for name, value in (("time", clock), ("HEARTBEAT_SECONDS", 3600), ("HEARTBEAT_POLL_SECONDS", 0.01)):
             patch = mock.patch.object(vidfunnel.record, name, value)
             patch.start()
@@ -1760,10 +1777,10 @@ class HeartbeatTests(TempDirCase):
         lines = []
         with mock.patch("vidfunnel.record._warn", side_effect=lines.append):
             lock = self.judge()
-            self.wait_until(lambda: lock.beat.count >= 2, 5, "the holder never beat")
+            self.wait_until(lambda: lock.beat.count >= 2, 30, "the holder never beat")
             os.unlink(str(self.lock_file()))
-            self.wait_until(vidfunnel.interrupt.draining.is_set, 5, "the holder did not drain")
-            self.wait_until(lambda: lines, 5, "the lost lock was not reported")
+            self.wait_until(vidfunnel.interrupt.draining.is_set, 30, "the holder did not drain")
+            self.wait_until(lambda: lines, 30, "the lost lock was not reported")
             write_bytes(self.lock_file(), json.dumps(self.WINNER).encode("utf-8"))
             taken = self.lock_file().read_bytes()
             self.assertIn("was taken over by another run", lock_problem(self.base))
@@ -1813,12 +1830,12 @@ class HeartbeatTests(TempDirCase):
         with mock.patch("vidfunnel.record._warn", side_effect=lines.append):
             lock = self.judge()
             taken = self.replace_lock()
-            time.sleep(0.2)  # twenty polls without a wake: the hour-long interval keeps the lock unchecked
+            self.wait_for_polls(clock, 20)  # twenty polls without a wake: the hour-long interval keeps it unchecked
             self.assertFalse(vidfunnel.interrupt.draining.is_set())
             self.assertEqual(lines, [])
             clock.wall_offset += 3600  # the wall clock counted an hour of sleep, the monotonic clock did not
-            self.wait_until(vidfunnel.interrupt.draining.is_set, 2, "the wake did not check the lock")
-            self.wait_until(lambda: lines, 5, "the lost lock was not reported")  # printed after the drain
+            self.wait_until(vidfunnel.interrupt.draining.is_set, 30, "the wake did not check the lock")
+            self.wait_until(lambda: lines, 30, "the lost lock was not reported")  # printed after the drain
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("lost the lock of folder '{}'".format(self.base), lines[0])
         self.assertIn("host 'winnerhost' holds it now", lines[0])
@@ -1832,10 +1849,11 @@ class HeartbeatTests(TempDirCase):
         with mock.patch("vidfunnel.record._warn", side_effect=lines.append):
             lock = self.judge()
             os.utime(str(self.lock_file()), ns=(10 ** 9, 10 ** 9))
+            self.wait_for_polls(clock, 1)  # the loop has read the clocks before the step, so it sees the step
             clock.wall_offset += 3600
-            self.wait_until(lambda: os.stat(str(self.lock_file())).st_mtime_ns > 10 ** 9, 2,
-                            "the wake did not beat the lock")
-            time.sleep(0.2)
+            self.wait_until(lambda: lock.beat.count >= 1, 30, "the wake did not beat the lock")
+            self.wait_for_polls(clock, 20)
+        self.assertGreater(os.stat(str(self.lock_file())).st_mtime_ns, 10 ** 9)
         self.assertEqual(lock.beat.count, 1)
         self.assertEqual(lines, [])
         self.assertFalse(vidfunnel.interrupt.draining.is_set())
@@ -1847,7 +1865,7 @@ class HeartbeatTests(TempDirCase):
         for step in (vidfunnel.record.HEARTBEAT_WAKE_GAP_SECONDS - 5, -3600):
             with self.subTest(step=step):
                 clock.wall_offset += step
-                time.sleep(0.2)  # twenty polls
+                self.wait_for_polls(clock, 20)
                 self.assertEqual(os.stat(str(self.lock_file())).st_mtime_ns, 10 ** 9)
                 self.assertEqual(lock.beat.count, 0)
 
@@ -1855,9 +1873,9 @@ class HeartbeatTests(TempDirCase):
         clock = self.stepping_clock()
         lock = self.judge()
         os.utime(str(self.lock_file()), ns=(10 ** 9, 10 ** 9))
-        time.sleep(0.05)
+        self.wait_for_polls(clock, 1)  # the loop has read the clocks before the step, so it sees the step
         clock.wall_offset += vidfunnel.record.HEARTBEAT_WAKE_GAP_SECONDS + 1
-        self.wait_until(lambda: lock.beat.count == 1, 2, "a step just over the wake gap did not beat")
+        self.wait_until(lambda: lock.beat.count == 1, 30, "a step just over the wake gap did not beat")
         self.assertGreater(os.stat(str(self.lock_file())).st_mtime_ns, 10 ** 9)
 
     def test_a_thread_stopped_long_enough_for_a_takeover_checks_its_lock_at_once(self):
@@ -1870,13 +1888,18 @@ class HeartbeatTests(TempDirCase):
             self.replace_lock()
             clock.mono_offset += HEARTBEAT_STALE_SECONDS + 60
             clock.wall_offset += HEARTBEAT_STALE_SECONDS + 60
-            self.wait_until(vidfunnel.interrupt.draining.is_set, 2, "the late poll did not check the lock")
-            self.wait_until(lambda: lines, 5, "the lost lock was not reported")  # printed after the drain
+            self.wait_until(vidfunnel.interrupt.draining.is_set, 30, "the late poll did not check the lock")
+            self.wait_until(lambda: lines, 30, "the lost lock was not reported")  # printed after the drain
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("lost the lock of folder '{}'".format(self.base), lines[0])
 
+    def wait_for_polls(self, clock, polls):
+        """Wait until the heartbeat loop of a stepping_clock() has slept `polls` more times."""
+        target = clock.polls + polls
+        self.wait_until(lambda: clock.polls >= target, 30, "the heartbeat loop did not poll {} times".format(polls))
+
     def no_heartbeat_thread(self):
-        self.wait_until(lambda: vidfunnel.record._beat_thread is None and not heartbeat_threads(), 5,
+        self.wait_until(lambda: vidfunnel.record._beat_thread is None and not heartbeat_threads(), 30,
                         "a heartbeat thread outlived an earlier test")
 
     def failing_writes(self, failures):
@@ -1909,7 +1932,7 @@ class HeartbeatTests(TempDirCase):
                 calls = self.failing_writes(3)
                 with mock.patch.object(sys, "stderr", stderr):
                     lock = self.judge()
-                    self.wait_until(lambda: lock.beat.count >= 3, 5, "beats stopped after a failed warning")
+                    self.wait_until(lambda: lock.beat.count >= 3, 30, "beats stopped after a failed warning")
                     self.assertGreaterEqual(len(calls), 6)
                     self.assertTrue(heartbeat_threads())
                     lock.release()
@@ -1925,7 +1948,7 @@ class HeartbeatTests(TempDirCase):
                     lock = self.judge()
                     lock.warn = lambda line: None
                     self.replace_lock()
-                    self.wait_until(vidfunnel.interrupt.draining.is_set, 5, "the lost lock did not drain")
+                    self.wait_until(vidfunnel.interrupt.draining.is_set, 30, "the lost lock did not drain")
                     lock.release()
                 self.lock_file().unlink()
 
@@ -1935,7 +1958,7 @@ class HeartbeatTests(TempDirCase):
             lock = self.judge()
             lock.warn = lambda line: None
             self.replace_lock()
-            self.wait_until(vidfunnel.interrupt.draining.is_set, 5, "a failed warning kept the run from draining")
+            self.wait_until(vidfunnel.interrupt.draining.is_set, 30, "a failed warning kept the run from draining")
         self.assertEqual(vidfunnel.interrupt.drain_tally.lost_locks, [str(self.base)])
 
     def test_a_replacing_lock_nested_too_deep_still_drains_and_says_so(self):
@@ -1946,8 +1969,8 @@ class HeartbeatTests(TempDirCase):
             lock.warn = lambda line: None
             os.unlink(str(self.lock_file()))
             write_bytes(self.lock_file(), b"[" * 200000 + b"]" * 200000)
-            self.wait_until(vidfunnel.interrupt.draining.is_set, 5, "the lost lock did not drain")
-            self.wait_until(lambda: lines, 5, "the lost lock was not reported")
+            self.wait_until(vidfunnel.interrupt.draining.is_set, 30, "the lost lock did not drain")
+            self.wait_until(lambda: lines, 30, "the lost lock was not reported")
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("lost the lock of folder '{}'".format(self.base), lines[0])
         self.assertNotIn("holds it now", lines[0])
@@ -1967,7 +1990,7 @@ class HeartbeatTests(TempDirCase):
         with mock.patch("vidfunnel.record._warn", side_effect=lines.append), \
                 mock.patch("vidfunnel.record._lock_state", side_effect=broken_then_real):
             lock = self.judge()
-            self.wait_until(lambda: lock.beat.count >= 3, 5, "the beats did not go on after the exception")
+            self.wait_until(lambda: lock.beat.count >= 3, 30, "the beats did not go on after the exception")
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("the heartbeat failed (ValueError: an unexpected failure)", lines[0])
 
@@ -1978,12 +2001,12 @@ class HeartbeatTests(TempDirCase):
                 mock.patch.object(threading, "excepthook", lambda arguments: None):
             first = FolderLock(self.base / "first", warn=self.fail).acquire()
             self.addCleanup(first.release)
-            self.wait_until(lambda: not heartbeat_threads(), 5, "the thread did not die")
+            self.wait_until(lambda: not heartbeat_threads(), 30, "the thread did not die")
         self.assertIsNone(vidfunnel.record._beat_thread)
         self.assertEqual(first.beat.count, 0)
         second = FolderLock(self.base / "second", warn=self.fail).acquire()
         self.addCleanup(second.release)
-        self.wait_until(lambda: first.beat.count >= 2 and second.beat.count >= 2, 5,
+        self.wait_until(lambda: first.beat.count >= 2 and second.beat.count >= 2, 30,
                         "no new thread beats the locks")
 
     def test_a_thread_that_cannot_start_refuses_the_lock_and_leaves_no_file(self):
@@ -2008,24 +2031,35 @@ class HeartbeatTests(TempDirCase):
         lock.release()
 
     def test_beats_come_no_more_often_than_the_interval(self):
+        """Each beat falls due an interval after the one before, and none is written before it is due.
+
+        Read inside the write, on the heartbeat thread, beat.due is when the
+        next beat falls due (this round's clock reading plus the interval).
+        A slow machine can only spread the beats further apart; it cannot
+        make the test fail.
+        """
         interval = 0.05
         self.fast_beats(interval)
+        observed = []  # (when a beat was written, when the next one falls due), both on the monotonic clock
         with mock.patch.object(vidfunnel.record, "HEARTBEAT_POLL_SECONDS", 0.002):
             real_pwrite = os.pwrite
-            calls = []
 
-            def counting(handle, data, offset):
-                calls.append(time.monotonic())
+            def recording(handle, data, offset):
+                with vidfunnel.record._held_locks_guard:
+                    due = [beat.due for beat in vidfunnel.record._beats if beat.handle == handle]
+                observed.append((time.monotonic(), due[0] if due else None))
                 return real_pwrite(handle, data, offset)
 
-            with mock.patch("vidfunnel.record.os.pwrite", side_effect=counting):
+            with mock.patch("vidfunnel.record.os.pwrite", side_effect=recording):
                 lock = self.judge()
-                started = time.monotonic()
-                time.sleep(10 * interval)
-                elapsed = time.monotonic() - started
+                self.wait_until(lambda: len(observed) >= 6, 30, "the holder hardly beat")
                 lock.release()
-        self.assertGreaterEqual(len(calls), 3, "the holder hardly beat")
-        self.assertLessEqual(len(calls), elapsed / interval + 2, "beats came faster than the interval")
+        beats = observed[:6]
+        self.assertNotIn(None, [due for _written, due in beats], beats)
+        for (written, due), (next_written, next_due) in zip(beats, beats[1:]):
+            self.assertGreaterEqual(next_due - due, interval, "a beat fell due less than an interval after the one "
+                                    "before: {}".format(beats))
+            self.assertGreaterEqual(next_written, due, "a beat was written before it was due: {}".format(beats))
 
     def test_release_during_a_beat_leaves_the_descriptor_to_the_beat(self):
         self.fast_beats()
@@ -2033,22 +2067,26 @@ class HeartbeatTests(TempDirCase):
         go_on = threading.Event()
         real_pwrite = os.pwrite
 
+        finished = threading.Event()
+
         def held_up(handle, data, offset):
             in_beat.set()
-            go_on.wait(10)
-            return real_pwrite(handle, data, offset)
+            go_on.wait(60)
+            try:
+                return real_pwrite(handle, data, offset)
+            finally:
+                finished.set()
 
         with mock.patch("vidfunnel.record.os.pwrite", side_effect=held_up):
             lock = self.judge()
             handle = lock.handle
-            self.assertTrue(in_beat.wait(5), "no beat began")
-            started = time.monotonic()
+            self.assertTrue(in_beat.wait(30), "no beat began")
             lock.release()
-            self.assertLess(time.monotonic() - started, 0.5, "release waited for the beat in flight")
+            self.assertFalse(finished.is_set(), "release waited for the beat in flight")
             self.assertFalse(self.lock_file().exists())
             os.fstat(handle)  # still open: the beat in flight uses it
             go_on.set()
-            self.wait_until(lambda: self.descriptor_closed(handle), 5, "the beat did not close the descriptor")
+            self.wait_until(lambda: self.descriptor_closed(handle), 30, "the beat did not close the descriptor")
 
     @staticmethod
     def descriptor_closed(handle):
@@ -2090,7 +2128,7 @@ class HeartbeatTests(TempDirCase):
 
         with mock.patch("vidfunnel.record.os.fsync", side_effect=counting):
             lock = self.judge()
-            self.wait_until(lambda: lock.beat.count >= 3, 5, "the holder never beat")
+            self.wait_until(lambda: lock.beat.count >= 3, 30, "the holder never beat")
             handle = lock.handle
             count = lock.beat.count
             lock.release()
@@ -2111,8 +2149,8 @@ class HeartbeatTests(TempDirCase):
 
         with mock.patch("vidfunnel.record._warn", side_effect=lines.append), \
                 mock.patch("vidfunnel.record.os.fstat", side_effect=stale):
-            self.wait_until(vidfunnel.interrupt.draining.is_set, 5, "a stale descriptor did not drain")
-            self.wait_until(lambda: lines, 5, "the lost lock was not reported")  # printed after the drain
+            self.wait_until(vidfunnel.interrupt.draining.is_set, 30, "a stale descriptor did not drain")
+            self.wait_until(lambda: lines, 30, "the lost lock was not reported")  # printed after the drain
         self.assertIn("its lock file was removed on the server", lines[0])
 
     def test_a_record_folder_that_is_gone_is_a_failed_beat_not_a_lost_lock(self):
@@ -2123,29 +2161,39 @@ class HeartbeatTests(TempDirCase):
             records = self.base / RECORD_DIR
             away = self.base / "away"
             os.rename(str(records), str(away))
-            self.wait_until(lambda: lines, 5, "the failed beat was not reported")
+            self.wait_until(lambda: lines, 30, "the failed beat was not reported")
             beats = lock.beat.count
             time.sleep(0.1)  # five intervals
             self.assertFalse(vidfunnel.interrupt.draining.is_set())
             os.rename(str(away), str(records))
-            self.wait_until(lambda: lock.beat.count > beats, 5, "the beats did not resume")
+            self.wait_until(lambda: lock.beat.count > beats, 30, "the beats did not resume")
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("cannot reach '{}'".format(records), lines[0])
 
     def test_one_thread_beats_every_lock_and_ends_after_the_last_release(self):
-        self.wait_until(lambda: not heartbeat_threads(), 5, "a heartbeat thread outlived an earlier test")
-        first = FolderLock(self.base / "first", warn=self.fail).acquire()
-        self.addCleanup(first.release)
-        self.assertEqual(len(heartbeat_threads()), 1)
-        second = FolderLock(self.base / "second", warn=self.fail).acquire()
-        self.addCleanup(second.release)
-        self.assertEqual(len(heartbeat_threads()), 1)
-        self.assertTrue(heartbeat_threads()[0].daemon)
-        started = time.monotonic()
-        first.release()
-        second.release()
-        self.assertLess(time.monotonic() - started, 0.5, "release waited for the heartbeat")
-        self.wait_until(lambda: not heartbeat_threads(), 5, "the heartbeat thread outlived the last lock")
+        self.no_heartbeat_thread()
+        asleep = threading.Event()
+        wake = threading.Event()
+
+        def held_sleep(seconds):  # the thread's poll lasts until the test lets it go on
+            asleep.set()
+            wake.wait(60)
+
+        held = types.SimpleNamespace(time=time.time, time_ns=time.time_ns, monotonic=time.monotonic, sleep=held_sleep)
+        with mock.patch.object(vidfunnel.record, "time", held):
+            first = FolderLock(self.base / "first", warn=self.fail).acquire()
+            self.addCleanup(first.release)
+            self.assertEqual(len(heartbeat_threads()), 1)
+            second = FolderLock(self.base / "second", warn=self.fail).acquire()
+            self.addCleanup(second.release)
+            self.assertEqual(len(heartbeat_threads()), 1)
+            self.assertTrue(heartbeat_threads()[0].daemon)
+            self.assertTrue(asleep.wait(30), "the heartbeat thread never polled")
+            first.release()
+            second.release()
+            self.assertTrue(heartbeat_threads(), "release waited for the heartbeat thread's poll to end")
+            wake.set()
+            self.wait_until(lambda: not heartbeat_threads(), 30, "the heartbeat thread outlived the last lock")
 
     def test_a_failed_beat_is_reported_once_and_the_thread_carries_on(self):
         self.fast_beats()
@@ -2154,9 +2202,9 @@ class HeartbeatTests(TempDirCase):
             failing = mock.patch("vidfunnel.record.os.pwrite", side_effect=OSError(errno.EIO, "Input/output error"))
             refused = failing.start()
             lock = self.judge()
-            self.wait_until(lambda: refused.call_count >= 5, 5, "the beat was not retried")
+            self.wait_until(lambda: refused.call_count >= 5, 30, "the beat was not retried")
             failing.stop()
-            self.wait_until(lambda: lock.beat.count >= 2, 5, "the thread did not beat again after the failures")
+            self.wait_until(lambda: lock.beat.count >= 2, 30, "the thread did not beat again after the failures")
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("lock '{}': cannot write the heartbeat".format(self.lock_file()), lines[0])
         self.assertIn("Input/output error", lines[0])
@@ -2168,7 +2216,7 @@ class HeartbeatTests(TempDirCase):
         self.fast_beats()
         lock = self.judge()
         inode = os.fstat(lock.handle).st_ino
-        self.wait_until(lambda: lock.beat.count >= 5, 5, "the holder never beat")
+        self.wait_until(lambda: lock.beat.count >= 5, 30, "the holder never beat")
         with held_lock_fds() as descriptors:
             self.assertIn(lock.handle, descriptors)
         child = ("import fcntl, os, sys\n"
