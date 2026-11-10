@@ -1,6 +1,6 @@
 """Tests for the command-line entry points: --version, dispatch, the launcher."""
 
-VERSION = "20261109"
+VERSION = "20261109.3"
 
 import contextlib
 import errno
@@ -63,16 +63,6 @@ class DispatchTests(unittest.TestCase):
         registered = parser._subparsers._group_actions[0].choices
         for entry in cli.SUBCOMMANDS:
             self.assertIn(entry[0], registered)
-
-    def test_unimplemented_subcommand_says_so(self):
-        missing = [entry[0] for entry in cli.SUBCOMMANDS if cli.load_stage(entry[1]) is None]
-        if not missing:
-            self.skipTest("every stage module exists; no stub left to test")
-        name = missing[0]
-        code, out, err = run_main([name, "/some/path"])
-        self.assertEqual(code, cli.EXIT_ERROR)
-        self.assertEqual(out, "")
-        self.assertIn("'{}' is not implemented yet".format(name), err)
 
     def test_ffmpeg_defaults_to_the_environment_variable(self):
         with unittest.mock.patch.dict(os.environ, {cli.FFMPEG_ENV: "/opt/box/ffmpeg"}):

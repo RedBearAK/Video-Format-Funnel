@@ -62,7 +62,7 @@ checks them (plan.record_value_problem), in verify_record before any file
 is read, and a record that fails is refused the same way.
 """
 
-VERSION = "20261109.2"
+VERSION = "20261109.3"
 
 import json
 import os
@@ -88,7 +88,7 @@ from vidfunnel.record import (
     add_stage,
     band,
     cheap_fingerprint,
-    fingerprint_matches,
+    fingerprint_identical,
     iter_records,
     load_record,
     save_record,
@@ -669,7 +669,9 @@ def verify_record(tools, source, record, options, progress=None):
     except OSError as error:
         after = None
         say("  cannot fingerprint '{}' again: {}".format(output_path.name, error), stream)
-    if not fingerprint_matches(fingerprint, after):
+    # Same machine, same run: the time is compared too (fingerprint_identical), since a write to
+    # the middle of the file during the checks changes only the time.
+    if not fingerprint_identical(fingerprint, after):
         stage["output_changed_during_verify"] = True
         stage["fingerprint_before"] = fingerprint
         stage["fingerprint_after"] = after

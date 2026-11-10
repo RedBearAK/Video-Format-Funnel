@@ -7,7 +7,7 @@ fixture folder itself is never planned) and skip with a message when
 ffmpeg or the fixtures are missing.
 """
 
-VERSION = "20261109"
+VERSION = "20261109.3"
 
 import contextlib
 import copy
@@ -43,7 +43,7 @@ from vidfunnel.plan import (
     plan_paths,
     video_filters,
 )
-from vidfunnel.record import iter_records, load_record, record_path, save_record, set_status
+from vidfunnel.record import add_flag, iter_records, load_record, record_path, save_record, set_status
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURE_DIR = os.path.join(REPO_ROOT, "tests", "fixtures")
@@ -51,6 +51,14 @@ PROBE_DIR = os.path.join(REPO_ROOT, "tests", "probe_json")
 ANALYSIS_DIR = os.path.join(REPO_ROOT, "tests", "analysis_json")
 
 FAKE_TOOLS = Tools("/opt/ffmpeg/bin/ffmpeg", "/opt/ffmpeg/bin/ffprobe")
+# The time a source shows on the planning host, and what other hosts' mounts report for it.
+PLANNED_MTIME_NS = 1700000001987654321
+OTHER_HOST_VIEWS = (
+    ("hundred-nanosecond steps", 1700000001987654300),
+    ("whole seconds", 1700000001000000000),
+    ("two-second steps", 1700000000000000000),
+    ("days later", PLANNED_MTIME_NS + 3 * 86400 * 1000 * 1000 * 1000),
+)
 RECORD_ID = "0f2b6c1e-4d55-4a8e-9c1d-2f3e4a5b6c7d"
 SOURCE_SHA = "0123456789abcdef" + "f" * 48
 OUTPUT_PATH = "/library/clips/output.mp4"
@@ -967,6 +975,63 @@ class PlanRunTest(unittest.TestCase):
         self.assertEqual([entry["id"] for entry in third["history"]], [first["id"], second["id"]])
         self.assertEqual(third["history"][-1]["status"], "planned")
         self.assertEqual(third["source"]["sha256"], second["source"]["sha256"])
+
+    def planned_at_a_known_time(self, name):
+        clip = self.copy_fixture(name)
+        os.utime(str(clip), ns=(PLANNED_MTIME_NS, PLANNED_MTIME_NS))
+        self.plan()
+        self.assertEqual(load_record(clip)["source"]["fingerprint"]["mtime_ns"], PLANNED_MTIME_NS)
+        return clip
+
+    def test_a_source_time_that_differs_alone_is_skipped_and_the_record_left_as_it_is(self):
+        clip = self.planned_at_a_known_time("xvid_avi_mp3.avi")
+        record_bytes = record_path(clip).read_bytes()
+        for view, seen_ns in OTHER_HOST_VIEWS:
+            with self.subTest(view=view):
+                os.utime(str(clip), ns=(seen_ns, seen_ns))
+                summary = self.plan()
+                self.assertEqual(summary.counts["skipped"], 1)
+                self.assertEqual(record_path(clip).read_bytes(), record_bytes)
+
+    def test_replan_after_a_time_change_hashes_the_source_again(self):
+        from unittest import mock
+        import vidfunnel.plan as plan_module
+        clip = self.planned_at_a_known_time("xvid_avi_mp3.avi")
+        first = load_record(clip)
+        with mock.patch.object(plan_module, "_sha256_paths", wraps=plan_module._sha256_paths) as hasher:
+            self.plan(replan=True)
+        hasher.assert_not_called()
+        second = load_record(clip)
+        self.assertEqual(second["source"]["sha256"], first["source"]["sha256"])
+        os.utime(str(clip), ns=(OTHER_HOST_VIEWS[-1][1], OTHER_HOST_VIEWS[-1][1]))
+        with mock.patch.object(plan_module, "_sha256_paths", wraps=plan_module._sha256_paths) as hasher:
+            self.plan(replan=True)
+        self.assertEqual(hasher.call_count, 1)
+        third = load_record(clip)
+        self.assertEqual(third["source"]["sha256"], first["source"]["sha256"])
+        self.assertEqual(third["source"]["fingerprint"]["mtime_ns"], OTHER_HOST_VIEWS[-1][1])
+        self.assertEqual(third["history"][-1]["id"], second["id"])
+        self.assertEqual(third["history"][-1]["status"], "planned")
+        self.assertIn("replanned_at", third["history"][-1])
+
+    def test_a_record_left_source_changed_by_an_older_convert_plans_as_before(self):
+        # Before 20261109.3 convert set this status and flag on a record whose source it saw as changed.
+        clip = self.copy_fixture("xvid_avi_mp3.avi")
+        self.plan()
+        record = load_record(clip)
+        set_status(record, "source-changed")
+        add_flag(record, "source-changed")
+        save_record(clip, record)
+        record_bytes = record_path(clip).read_bytes()
+        self.assertEqual(self.plan().counts["skipped"], 1)
+        self.assertEqual(record_path(clip).read_bytes(), record_bytes)
+        summary = self.plan(replan=True)
+        self.assertEqual(summary.counts["re-encode"], 1)
+        replanned = load_record(clip)
+        self.assertEqual(replanned["status"], "planned")
+        self.assertNotIn("source-changed", replanned["flags"])
+        self.assertEqual(replanned["history"][-1]["id"], record["id"])
+        self.assertEqual(replanned["history"][-1]["status"], "source-changed")
 
     def test_reencode_output_carries_colour_and_aspect(self):
         source = self.copy_fixture("mpeg2_ps_ntsc_dar_4x3_ac3.mpg")

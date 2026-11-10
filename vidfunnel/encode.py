@@ -48,8 +48,18 @@ What convert writes into the record:
 - output.size and output.fingerprint (the cheap fingerprint after the
   mtime is set, so a later run can skip the file without verify having
   run), status 'converted' (or 'verified' once verify has run);
-- flags 'output-larger', 'remux-larger', 'sidecar-failed', 'par2-skipped', 'par2-failed',
-  'source-changed' (status 'source-changed' too) as they apply.
+- flags 'output-larger', 'remux-larger', 'sidecar-failed', 'par2-skipped', 'par2-failed'
+  as they apply;
+- stages.convert.source_mtime_differs, [{'name', 'recorded', 'seen'}], when a
+  source file's content matches its fingerprint (size, first and last MiB)
+  and its modification time alone differs from the one recorded at plan,
+  as one file seen through another mount or after a restore does.
+
+A source whose content differs from its fingerprint is skipped (counted
+skipped) and its record left as it is, with a reason naming the file and
+what differs: plan again with --replan. Before 20261109.3 convert set the
+status and flag 'source-changed' instead; records carrying them are read
+as before.
 
 With --refit, convert revisits converted or verified re-encodes flagged
 'output-larger' instead (see refit_one): one more encode at a higher CRF,
@@ -70,10 +80,11 @@ the second kind and any collision make run() exit with EXIT_ERROR.
 The record is saved after every change of state, so an interrupted run
 leaves a record that says what happened. A record that is not 'planned' is
 refused without being touched, except that a converted or verified record
-whose output still matches its fingerprint is reported as already converted.
+whose output still matches its fingerprint (content only, the time is not
+compared) is reported as already converted.
 """
 
-VERSION = "20261109.1"
+VERSION = "20261109.3"
 
 import math
 import os
@@ -103,10 +114,12 @@ from vidfunnel.record import (
     add_flag,
     add_stage,
     cheap_fingerprint,
+    fingerprint_differences,
     fingerprint_matches,
     held_lock_fds,
     iter_records,
     load_record,
+    mtime_difference,
     record_path,
     save_record,
     set_status,
@@ -214,18 +227,32 @@ def _source_files(folder, record):
 
 
 def source_change(folder, record):
-    """None when every source file still matches its recorded fingerprint, else a reason naming the file."""
+    """(reason, mtime_notes) for the record's source files against the fingerprints taken at plan.
+
+    reason is None when every source file still has the recorded size and
+    first and last MiB (record.fingerprint_matches; the time is not compared),
+    else it names the file and what differs. mtime_notes lists {'name',
+    'recorded', 'seen'} for each file whose modification time differs from
+    the recorded one (another mount's time resolution, a restore); [] when
+    there is a reason.
+    """
     files = _source_files(folder, record)
     if not files:
-        return "the record lists no source files"
+        return "the record lists no source files", []
+    notes = []
     for path, recorded in files:
         try:
             current = cheap_fingerprint(path)
         except OSError as error:
-            return "'{}' cannot be read: {}".format(path.name, error)
-        if not fingerprint_matches(recorded, current):
-            return "'{}' no longer matches the fingerprint taken at plan".format(path.name)
-    return None
+            return "'{}' cannot be read: {}".format(path.name, error), []
+        differences = fingerprint_differences(recorded, current)
+        if differences:
+            return "'{}' differs from the fingerprint taken at plan ({})".format(
+                path.name, ", ".join(differences)), []
+        moved = mtime_difference(recorded, current)
+        if moved is not None:
+            notes.append(dict(name=path.name, **moved))
+    return None, notes
 
 
 def skip_reason(record, output_path):
@@ -547,19 +574,20 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
         say("skipping '{}': {}".format(label, reason), stream)
         return {"outcome": "skipped", "skipped": reason}
 
-    changed = source_change(folder, record)
+    # A source whose content differs is skipped and its record left as it is; the person
+    # decides with plan --replan. A time that differs alone is noted in this stage.
+    changed, mtime_notes = source_change(folder, record)
     if changed is not None:
-        add_flag(record, "source-changed")
-        set_status(record, "source-changed")
-        save_record(key, record)
-        reason = "source changed since plan: {}; plan again".format(changed)
-        say("refusing '{}': {}".format(label, reason), stream)
+        reason = "source changed since plan: {}; plan again with --replan".format(changed)
+        say("skipping '{}': {}".format(label, reason), stream)
         return {"outcome": "skipped", "skipped": reason}
+    noted = {"source_mtime_differs": mtime_notes} if mtime_notes else {}
 
     if output_path.exists() and not _ours(tools, output_path, record):
         error = "'{}' exists and is not this record's output (no matching vidfunnel tag); not overwritten".format(
             output_path.name)
         stage = {"outcome": "output-collision", "error": error}
+        stage.update(noted)
         add_stage(record, "convert", stage)
         add_flag(record, "output-collision")
         set_status(record, "failed")
@@ -573,6 +601,7 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
     argv = list(rendered["argv"])
     argv[-1] = str(temp)
     ran = {"argv": argv, "sidecar_argvs": [], "ffmpeg": rendered["ffmpeg"], "version": vidfunnel.VERSION}
+    ran.update(noted)
     say("{} '{}' -> '{}'".format(action_word, label, output_path.name), stream)
     if verbose:
         say(shlex.join(argv), stream)
@@ -806,27 +835,37 @@ def refit_argv(argv, crf, denoise, output, cadence_filter=None):
 
 
 def _refit_disk_problem(folder, record, output_path):
-    """(problem or None, output_size, source_size): the files on disk against the record's convert stage."""
+    """(problem or None, output_size, source_size, notes): the files on disk against the record's convert stage.
+
+    notes holds source_mtime_differs and output_mtime_differs ([{'name',
+    'recorded', 'seen'}]) when a file's content matches and its time alone
+    differs; refit_one writes them into stages.refit.
+    """
     convert = (record.get("stages") or {}).get("convert") or {}
     source_size = convert.get("source_size") or (record.get("source") or {}).get("size")
     recorded_size = convert.get("output_size")
     if not isinstance(source_size, int) or source_size <= 0:
-        return "the source size is unknown", None, None
+        return "the source size is unknown", None, None, {}
     try:
         current = cheap_fingerprint(output_path)
     except OSError:
-        return "output '{}' is missing".format(output_path.name), None, source_size
+        return "output '{}' is missing".format(output_path.name), None, source_size, {}
     size = current["size"]
     if recorded_size is not None and size != recorded_size:
         return ("output '{}' is {} bytes, the record says {}; it changed since convert".format(
-            output_path.name, size, recorded_size), size, source_size)
+            output_path.name, size, recorded_size), size, source_size, {})
     recorded = (record.get("output") or {}).get("fingerprint")
     if recorded and not fingerprint_matches(recorded, current):
-        return "output '{}' no longer matches its recorded fingerprint".format(output_path.name), size, source_size
-    changed = source_change(folder, record)
+        return "output '{}' no longer matches its recorded fingerprint".format(output_path.name), size, source_size, {}
+    changed, mtime_notes = source_change(folder, record)
     if changed is not None:
-        return "source changed since plan: {}".format(changed), size, source_size
-    return None, size, source_size
+        return "source changed since plan: {}; plan again with --replan".format(changed), size, source_size, {}
+    noted = {"source_mtime_differs": mtime_notes} if mtime_notes else {}
+    if recorded:
+        moved = mtime_difference(recorded, current)
+        if moved is not None:
+            noted["output_mtime_differs"] = [dict(name=output_path.name, **moved)]
+    return None, size, source_size, noted
 
 
 REFIT_CRF_HIGHEST = 51
@@ -907,7 +946,7 @@ def refit_plan(tools, record, folder):
     this ffmpeg's capability listing is checked against the result.
     The plan dict: output_path, part, argv, base_crf, base_crf_from, crf,
     cap, steps, denoise, denoise_reason, filters, ratio, output_size,
-    source_size, height, ffmpeg.
+    source_size, height, ffmpeg, mtime_notes (_refit_disk_problem).
     """
     reason = refit_selection(record)
     if reason is not None:
@@ -922,7 +961,7 @@ def refit_plan(tools, record, folder):
     base_crf, base_field, problem = refit_base_crf(record)
     if problem is not None:
         return None, problem
-    problem, output_size, source_size = _refit_disk_problem(folder, record, output_path)
+    problem, output_size, source_size, mtime_notes = _refit_disk_problem(folder, record, output_path)
     if problem is not None:
         return None, problem
     ratio = float(output_size) / source_size
@@ -947,7 +986,8 @@ def refit_plan(tools, record, folder):
     return {"output_path": output_path, "part": part, "argv": new_argv, "base_crf": base_crf,
             "base_crf_from": base_field, "crf": crf, "cap": cap, "steps": steps, "denoise": denoise,
             "denoise_reason": denoise_reason, "filters": chain, "ratio": ratio, "output_size": output_size,
-            "source_size": source_size, "height": height, "ffmpeg": rendered["ffmpeg"]}, None
+            "source_size": source_size, "height": height, "ffmpeg": rendered["ffmpeg"],
+            "mtime_notes": mtime_notes}, None
 
 
 def _refit_words(plan):
@@ -1026,8 +1066,8 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
     except (FfmpegError, ToolNotFound, OSError) as error:
         _remove(temp)
         attempt["elapsed_s"] = round(time.monotonic() - started, 3)
-        add_stage(record, "refit", {"attempt": attempt, "outcome": "failed", "error": str(error),
-                                    "stderr": _tail(getattr(error, "stderr", None))})
+        add_stage(record, "refit", dict({"attempt": attempt, "outcome": "failed", "error": str(error),
+                                         "stderr": _tail(getattr(error, "stderr", None))}, **plan["mtime_notes"]))
         save_record(key, record)
         say("failed: refit of '{}': {}; the existing output is kept".format(label, error), stream)
         return "failed", str(error)
@@ -1054,7 +1094,8 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
                                      "?" if attempt["ratio"] is None else "{:.2f}".format(attempt["ratio"]))
     if problem is not None:
         _remove(temp)
-        add_stage(record, "refit", {"attempt": attempt, "outcome": "kept-existing", "reason": problem})
+        add_stage(record, "refit", dict({"attempt": attempt, "outcome": "kept-existing", "reason": problem},
+                                        **plan["mtime_notes"]))
         add_flag(record, FIT_CAPPED_FLAG)
         save_record(key, record)
         say("  refit '{}': {}; {}; kept the existing output, flagged '{}'".format(
@@ -1065,8 +1106,9 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
         os.replace(str(temp), str(output_path))
     except OSError as error:
         _remove(temp)
-        add_stage(record, "refit", {"attempt": attempt, "outcome": "failed",
-                                    "error": "could not replace '{}': {}".format(output_path.name, error)})
+        add_stage(record, "refit", dict({"attempt": attempt, "outcome": "failed",
+                                         "error": "could not replace '{}': {}".format(output_path.name, error)},
+                                        **plan["mtime_notes"]))
         save_record(key, record)
         say("failed: refit of '{}': could not replace '{}': {}".format(label, output_path.name, error), stream)
         return "failed", str(error)
@@ -1088,7 +1130,7 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
     record.pop("score", None)
     output = record.setdefault("output", {})
     output.pop("sha256", None)
-    add_stage(record, "refit", {"attempt": attempt, "outcome": "replaced"})
+    add_stage(record, "refit", dict({"attempt": attempt, "outcome": "replaced"}, **plan["mtime_notes"]))
     refit_stage = stages["refit"]
     add_flag(record, REFIT_FLAG)
     if new_size <= plan["source_size"]:

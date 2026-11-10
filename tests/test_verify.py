@@ -10,7 +10,7 @@ streams, which is what verify checks. They skip with a message when ffmpeg
 or the fixtures are missing.
 """
 
-VERSION = "20261109.2"
+VERSION = "20261109.3"
 
 import argparse
 import contextlib
@@ -30,7 +30,7 @@ from pathlib import Path
 from vidfunnel.analyze import decide_subtitles
 from vidfunnel.ffmpeg import ToolNotFound, find_tools
 from vidfunnel.ffmpeg import run as run_tool
-from vidfunnel.record import load_record, save_record, set_status
+from vidfunnel.record import cheap_fingerprint, load_record, save_record, set_status
 from vidfunnel.verify import (
     PENALTY_IDENTITY,
     add_arguments,
@@ -53,6 +53,9 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURE_DIR = os.path.join(REPO_ROOT, "tests", "fixtures")
 PROBE_DIR = os.path.join(REPO_ROOT, "tests", "probe_json")
 ANALYSIS_DIR = os.path.join(REPO_ROOT, "tests", "analysis_json")
+
+
+DAYS_LATER_NS = 1700000001987654321 + 3 * 86400 * 1000 * 1000 * 1000
 
 
 def quiet():
@@ -484,6 +487,49 @@ class VerifyAgainTest(unittest.TestCase):
         self.assertEqual(on_disk["status"], "failed")
         self.assertNotIn("score", on_disk)
         self.assertIs(on_disk["stages"]["verify"]["output_changed_during_verify"], True)
+
+    def test_a_time_change_alone_during_verify_fails_the_record(self):
+        # Within one run on one machine the time is compared too: a write that keeps the size and
+        # the first and last MiB changes only the time.
+        import vidfunnel.verify as verify_module
+        real_probe = verify_module.probe_file
+
+        def probe_after_touch(tools, path):
+            os.utime(str(path), ns=(DAYS_LATER_NS, DAYS_LATER_NS))
+            return real_probe(tools, path)
+
+        with unittest.mock.patch.object(verify_module, "probe_file", probe_after_touch):
+            record = verify_record(TOOLS, self.key, load_record(self.key), None, quiet())
+        self.assertEqual(record["status"], "failed")
+        self.assertIs(record["stages"]["verify"]["output_changed_during_verify"], True)
+
+    def test_source_and_output_times_that_differ_alone_verify_as_before(self):
+        # Verify compares no recorded fingerprint: it reads the output as it is and records what it saw.
+        before = load_record(self.key)
+        source = self.root / REMUX_FIXTURE
+        os.utime(str(source), ns=(DAYS_LATER_NS, DAYS_LATER_NS))
+        os.utime(str(self.output), ns=(DAYS_LATER_NS + 1, DAYS_LATER_NS + 1))
+        record = verify_record(TOOLS, self.key, load_record(self.key), None, quiet())
+        self.assertEqual(record["status"], "verified")
+        self.assertEqual(record["score"], 100)
+        self.assertEqual(record["output"]["sha256"], before["output"]["sha256"])
+        self.assertEqual(record["output"]["fingerprint"]["mtime_ns"], DAYS_LATER_NS + 1)
+        self.assertEqual(record["source"]["fingerprint"], before["source"]["fingerprint"])
+
+    def test_output_content_that_differs_is_verified_as_it_is_now(self):
+        # Pinned behaviour: the recorded output hash and fingerprint are replaced by the current file's,
+        # and the checks (decode, identity, streams, duration) judge the bytes now there.
+        before = load_record(self.key)
+        size = self.output.stat().st_size
+        with open(str(self.output), "r+b") as handle:
+            handle.seek(size // 2)
+            handle.write(b"\xff" * 64)
+        record = verify_record(TOOLS, self.key, load_record(self.key), None, quiet())
+        self.assertEqual(record["status"], "verified")
+        self.assertNotEqual(record["output"]["sha256"], before["output"]["sha256"])
+        with open(str(self.output), "rb") as handle:
+            self.assertEqual(record["output"]["sha256"], hashlib.sha256(handle.read()).hexdigest())
+        self.assertEqual(record["output"]["fingerprint"], cheap_fingerprint(self.output))
 
     def test_unchanged_output_hash_matches_file(self):
         record = verify_record(TOOLS, self.key, load_record(self.key), None, quiet())

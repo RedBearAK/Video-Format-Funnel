@@ -1,6 +1,6 @@
 """Tests for vidfunnel.record: paths, atomic saves, fingerprints, hashes, stages, lock."""
 
-VERSION = "20261109"
+VERSION = "20261109.3"
 
 import datetime
 import hashlib
@@ -32,10 +32,14 @@ from vidfunnel.record import (
     add_penalty,
     add_stage,
     cheap_fingerprint,
+    fingerprint_differences,
+    fingerprint_identical,
     fingerprint_matches,
     iter_records,
     load_folder,
     load_record,
+    mtime_apart_ns,
+    mtime_difference,
     new_record,
     record_path,
     save_folder,
@@ -232,6 +236,91 @@ class FingerprintTests(TempDirCase):
         fingerprint = cheap_fingerprint(path)
         self.assertFalse(fingerprint_matches(None, fingerprint))
         self.assertFalse(fingerprint_matches(fingerprint, {}))
+
+
+# The time one file shows on the planning host, and what other hosts' mounts report for it.
+PLANNED_MTIME_NS = 1700000001987654321
+OTHER_HOST_VIEWS = (
+    ("hundred-nanosecond steps", 1700000001987654300),
+    ("whole seconds", 1700000001000000000),
+    ("two-second steps", 1700000000000000000),
+    ("days later", PLANNED_MTIME_NS + 3 * 86400 * 1000 * 1000 * 1000),
+)
+
+
+class FingerprintTimeTests(TempDirCase):
+    """The content fields decide; the time is reported apart (another mount's resolution, a restore)."""
+
+    def planned(self):
+        path = write_bytes(self.base / "large.bin", os.urandom(3 * MIB))
+        os.utime(str(path), ns=(PLANNED_MTIME_NS, PLANNED_MTIME_NS))
+        return path, cheap_fingerprint(path)
+
+    def test_a_time_that_differs_alone_still_matches_and_is_reported(self):
+        path, recorded = self.planned()
+        self.assertEqual(recorded["mtime_ns"], PLANNED_MTIME_NS)
+        for view, seen_ns in OTHER_HOST_VIEWS:
+            with self.subTest(view=view):
+                os.utime(str(path), ns=(seen_ns, seen_ns))
+                seen = cheap_fingerprint(path)
+                self.assertEqual(seen["mtime_ns"], seen_ns)
+                self.assertTrue(fingerprint_matches(recorded, seen))
+                self.assertEqual(fingerprint_differences(recorded, seen), [])
+                self.assertFalse(fingerprint_identical(recorded, seen))
+                difference = mtime_difference(recorded, seen)
+                self.assertEqual(difference, {"recorded": PLANNED_MTIME_NS, "seen": seen_ns})
+                self.assertEqual(mtime_apart_ns(difference), abs(seen_ns - PLANNED_MTIME_NS))
+
+    def test_the_same_time_is_no_difference(self):
+        path, recorded = self.planned()
+        seen = cheap_fingerprint(path)
+        self.assertTrue(fingerprint_identical(recorded, seen))
+        self.assertIsNone(mtime_difference(recorded, seen))
+        self.assertEqual(mtime_apart_ns(None), 0)
+
+    def test_each_content_field_is_named_when_it_differs(self):
+        path, recorded = self.planned()
+        flip_byte(path, 0)
+        self.assertEqual(fingerprint_differences(recorded, cheap_fingerprint(path)), ["first MiB differs"])
+        flip_byte(path, 0)
+        flip_byte(path, 3 * MIB - 1)
+        self.assertEqual(fingerprint_differences(recorded, cheap_fingerprint(path)), ["last MiB differs"])
+        flip_byte(path, 3 * MIB - 1)
+        with open(str(path), "ab") as handle:
+            handle.write(b"appended")
+        seen = cheap_fingerprint(path)
+        self.assertFalse(fingerprint_matches(recorded, seen))
+        self.assertEqual(fingerprint_differences(recorded, seen),
+                         ["size {} bytes recorded, {} now".format(3 * MIB, 3 * MIB + 8), "last MiB differs"])
+
+    def test_a_record_written_before_the_rule_reads_the_same(self):
+        # The fingerprint shape is unchanged: the four fields, mtime_ns stored as before.
+        path, recorded = self.planned()
+        self.assertEqual(sorted(recorded), ["head_sha256", "mtime_ns", "size", "tail_sha256"])
+        older = json.loads(json.dumps(recorded))
+        self.assertTrue(fingerprint_matches(older, cheap_fingerprint(path)))
+
+    def test_an_unusable_recorded_time_counts_as_different(self):
+        path, recorded = self.planned()
+        seen = cheap_fingerprint(path)
+        for value in (None, "1700000001987654321", 1.7e18, True, float("nan")):
+            with self.subTest(value=value):
+                edited = dict(recorded, mtime_ns=value)
+                if value is None:
+                    del edited["mtime_ns"]
+                self.assertTrue(fingerprint_matches(edited, seen))
+                difference = mtime_difference(edited, seen)
+                self.assertIsNotNone(difference)
+                self.assertIsNone(mtime_apart_ns(difference))
+                self.assertFalse(fingerprint_identical(edited, seen))
+
+    def test_a_missing_or_malformed_fingerprint_is_named(self):
+        path, recorded = self.planned()
+        self.assertEqual(fingerprint_differences(None, recorded), ["no fingerprint recorded"])
+        self.assertEqual(fingerprint_differences(["size"], recorded), ["no fingerprint recorded"])
+        self.assertEqual(fingerprint_differences(recorded, None), ["no fingerprint taken"])
+        self.assertFalse(fingerprint_matches(["size"], recorded))
+        self.assertFalse(fingerprint_matches(dict(recorded, head_sha256=None), recorded))
 
 
 class Sha256Tests(TempDirCase):

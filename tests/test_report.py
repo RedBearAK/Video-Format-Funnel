@@ -1,6 +1,6 @@
 """Tests for vidfunnel.report: collecting, sorting, redaction, formats, --from and run()."""
 
-VERSION = "20261108"
+VERSION = "20261109.3"
 
 import argparse
 import contextlib
@@ -381,6 +381,20 @@ class ReportTree(unittest.TestCase):
         _code, text, _errors = self.run_report(["--format", "json", "--reveal", str(self.base)])
         row = next(row for row in json.loads(text)["rows"] if row["id"] == beach["id"])
         self.assertEqual("beach_holiday.vidfunnel.mp4", row["output_name"])
+
+    def test_a_record_left_source_changed_by_an_older_convert_is_reported_as_it_is(self):
+        # Before 20261109.3 convert set this status and flag; such records are still read and shown.
+        meeting = self.records["meeting"]
+        meeting["status"] = "source-changed"
+        meeting["flags"] = ["source-changed"]
+        self.save_all()
+        _code, text, _errors = self.run_report(["--reveal", str(self.base)])
+        line = next(line for line in text.splitlines() if self.short("meeting") in line)
+        self.assertIn("source-changed", line.split())
+        _code, text, _errors = self.run_report(["--format", "json", "--reveal", str(self.base)])
+        row = next(row for row in json.loads(text)["rows"] if row["id"] == meeting["id"])
+        self.assertEqual(row["status"], "source-changed")
+        self.assertEqual(row["flags"], ["source-changed"])
 
     def test_markdown_revealed_folders_show_real_paths(self):
         _code, text, _errors = self.run_report(["--format", "md", "--reveal", str(self.base)])

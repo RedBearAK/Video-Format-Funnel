@@ -57,7 +57,7 @@ analyze_input(), which runs the same passes with an input-argument list and
 returns the same dict shape, built from analyze's own pure rules.
 """
 
-VERSION = "20261109.2"
+VERSION = "20261109.3"
 
 import hashlib
 import json
@@ -118,6 +118,7 @@ from vidfunnel.record import (
     add_penalty,
     add_stage,
     cheap_fingerprint,
+    fingerprint_identical,
     fingerprint_matches,
     load_folder,
     load_record,
@@ -1002,8 +1003,12 @@ def _member_fingerprints(paths):
     return [{"name": Path(path).name, "fingerprint": cheap_fingerprint(path)} for path in paths]
 
 
-def _unchanged(record, fingerprint, members):
-    if not fingerprint_matches((record.get("source") or {}).get("fingerprint"), fingerprint):
+def _unchanged(record, fingerprint, members, compare=fingerprint_matches):
+    """True when the source (and each VOB member) matches its recorded fingerprint by content; the time is not compared.
+
+    compare=fingerprint_identical asks for the times to agree as well.
+    """
+    if not compare((record.get("source") or {}).get("fingerprint"), fingerprint):
         return False
     recorded = (record.get("source") or {}).get("members")
     if members is None and recorded is None:
@@ -1013,7 +1018,7 @@ def _unchanged(record, fingerprint, members):
     for current, previous in zip(members, recorded):
         if current["name"] != previous.get("name"):
             return False
-        if not fingerprint_matches(previous.get("fingerprint"), current["fingerprint"]):
+        if not compare(previous.get("fingerprint"), current["fingerprint"]):
             return False
     return True
 
@@ -1118,7 +1123,9 @@ def _plan_one_locked(tools, work, options, folder_sources, capabilities, progres
             say("'{}' changed since record {} was planned; re-planning under a new record".format(
                 work.label, existing.get("id")), stream)
         old_sha = (existing.get("source") or {}).get("sha256")
-        if old_sha and _unchanged(existing, fingerprint, members):
+        # The full hash is reused only when the times agree too; a time that differs means
+        # the middle of the file is unknown, so --replan hashes it again.
+        if old_sha and _unchanged(existing, fingerprint, members, compare=fingerprint_identical):
             record["source"]["sha256"] = old_sha
     settled = []
 
@@ -1719,8 +1726,9 @@ def plan_file(tools, source, options, folder_sources, capabilities, progress=Non
     """Plan one source (a file, the first VOB of a group, or a DVD folder with dvd_title) and return its record.
 
     The record is saved under the folder's '.vidfunnel/'. A source whose
-    record's cheap fingerprint still matches is skipped (its record returned
-    unchanged) unless options.replan. The caller holds the FolderLock.
+    record's cheap fingerprint still matches (size and first and last MiB;
+    the time is not compared) is skipped (its record returned unchanged)
+    unless options.replan. The caller holds the FolderLock.
     """
     work = _Work(source, dvd_title)
     _outcome, record = _plan_one(tools, work, options, folder_sources, capabilities, progress, known_probe)

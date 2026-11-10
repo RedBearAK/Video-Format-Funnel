@@ -6,7 +6,7 @@ per source file, named after the full source file name including its extension
 Records are the authority; every write is atomic (temp file, then os.replace).
 """
 
-VERSION = "20261109"
+VERSION = "20261109.3"
 
 import contextlib
 import datetime
@@ -285,16 +285,68 @@ def cheap_fingerprint(path):
 
 
 FINGERPRINT_KEYS = ("size", "mtime_ns", "head_sha256", "tail_sha256")
+# What decides whether a file is unchanged. The mtime is stored but not compared: one file seen
+# through SMB (100 ns steps), NFS (whole seconds on some servers), FAT or exFAT (2 s) or after a
+# restore reports another time than the machine that fingerprinted it saw (mtime_difference).
+CONTENT_KEYS = ("size", "head_sha256", "tail_sha256")
+_CONTENT_WORDS = {"head_sha256": "first MiB", "tail_sha256": "last MiB"}
 
 
 def fingerprint_matches(first, second):
-    """True when both fingerprints are present and agree on every field."""
-    if not first or not second:
+    """True when both fingerprints are present and agree on size and the first and last MiB; mtime is not compared."""
+    return not fingerprint_differences(first, second)
+
+
+def fingerprint_identical(first, second):
+    """True when both fingerprints agree on every field, mtime included: one process looking at one file twice."""
+    if not fingerprint_matches(first, second):
         return False
-    for key in FINGERPRINT_KEYS:
-        if first.get(key) is None or first.get(key) != second.get(key):
-            return False
-    return True
+    return first.get("mtime_ns") is not None and first.get("mtime_ns") == second.get("mtime_ns")
+
+
+def fingerprint_differences(recorded, seen):
+    """Words naming each content field in which `seen` differs from `recorded`; [] when fingerprint_matches."""
+    if not isinstance(recorded, dict) or not recorded:
+        return ["no fingerprint recorded"]
+    if not isinstance(seen, dict) or not seen:
+        return ["no fingerprint taken"]
+    differences = []
+    for key in CONTENT_KEYS:
+        if recorded.get(key) is not None and recorded.get(key) == seen.get(key):
+            continue
+        if key == "size":
+            differences.append("size {} bytes recorded, {} now".format(recorded.get(key), seen.get(key)))
+        else:
+            differences.append("{} differs".format(_CONTENT_WORDS.get(key, key)))
+    return differences
+
+
+def mtime_difference(recorded, seen):
+    """None when both fingerprints carry the same integer mtime_ns; else {'recorded': ..., 'seen': ...}.
+
+    A recorded value that is missing or not an integer counts as different
+    (its 'recorded' is then whatever the record holds, None when absent).
+    """
+    recorded_ns = recorded.get("mtime_ns") if isinstance(recorded, dict) else None
+    seen_ns = seen.get("mtime_ns") if isinstance(seen, dict) else None
+    if _whole_number(recorded_ns) and _whole_number(seen_ns) and recorded_ns == seen_ns:
+        return None
+    return {"recorded": recorded_ns, "seen": seen_ns}
+
+
+def mtime_apart_ns(difference):
+    """|seen - recorded| in ns of an mtime_difference() result (0 for None); None when either side is not an integer."""
+    if difference is None:
+        return 0
+    recorded_ns = difference.get("recorded")
+    seen_ns = difference.get("seen")
+    if not _whole_number(recorded_ns) or not _whole_number(seen_ns):
+        return None
+    return abs(seen_ns - recorded_ns)
+
+
+def _whole_number(value):
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def sha256_file(path, progress=None):

@@ -1,9 +1,11 @@
 """Tests for vidfunnel.retire: every guard, quarantine, interim rename, destroy confirmation, run."""
 
-VERSION = "20261109"
+VERSION = "20261109.3"
 
 import argparse
+import hashlib
 import io
+import json
 import os
 import shutil
 import sys
@@ -37,6 +39,18 @@ from vidfunnel.retire import (
 
 SOURCE_BYTES = b"legacy video payload " * 200        # 4200 bytes
 OUTPUT_BYTES = b"converted mp4 payload " * 100       # 2200 bytes, smaller than the source
+MIB = 1024 * 1024
+LARGE_SOURCE = bytes(range(256)) * (3 * MIB // 256)  # 3 MiB: a middle that the first and last MiB do not cover
+SECOND_NS = 1000 * 1000 * 1000
+
+# The time a source shows on the planning host, and what other hosts' mounts report for it.
+PLANNED_MTIME_NS = 1700000001987654321
+NEAR_VIEWS = (
+    ("hundred", "hundred-nanosecond steps", 1700000001987654300),
+    ("whole", "whole seconds", 1700000001000000000),
+    ("fat", "two-second steps", 1700000000000000000),
+)
+DAYS_LATER_NS = PLANNED_MTIME_NS + 3 * 86400 * SECOND_NS
 
 
 class TerminalInput(io.StringIO):
@@ -265,7 +279,8 @@ class GuardTests(RetireCase):
         self.assertEqual(result, {"output_path": self.meeting_interim,
                                   "final_output_path": self.meeting_source,
                                   "band": "ok", "sha256_verified": True,
-                                  "members": [self.meeting_source], "larger": False, "sidecars": []})
+                                  "members": [self.meeting_source], "larger": False, "sidecars": [],
+                                  "source_mtime_differs": [], "source_sha256_checked": False})
 
     def test_large_output_hash_shows_progress(self):
         large = b"\0" * (33 * 1024 * 1024)
@@ -276,6 +291,115 @@ class GuardTests(RetireCase):
         out, _err = self.quietly()
         check_eligible(large_source, record)
         self.assertIn("hash 'harbour_night.mp4'", out.getvalue())
+
+
+class SourceTimeTests(RetireCase):
+    """The source's content decides; a time more than 2 s off has the whole source read once first."""
+
+    def setUp(self):
+        RetireCase.setUp(self)
+        self.out, _err = self.quietly()
+
+    def film(self, word, recorded_hash=True):
+        """A verified 3 MiB source '<word>_film.avi' fingerprinted at PLANNED_MTIME_NS; (source, record)."""
+        source = self.holidays / "{}_film.avi".format(word)
+        output = self.holidays / "{}_film.mp4".format(word)
+        record = make_verified(source, output, output.name, source_bytes=LARGE_SOURCE)
+        os.utime(str(source), ns=(PLANNED_MTIME_NS, PLANNED_MTIME_NS))
+        record["source"]["fingerprint"] = cheap_fingerprint(source)
+        record["source"]["sha256"] = sha256_file(source) if recorded_hash else None
+        save_record(source, record)
+        return source, record
+
+    def retire_watching_the_hash(self, source, record):
+        with mock.patch.object(retire, "_hash_source", wraps=retire._hash_source) as hasher:
+            stage = retire_one(source, record, self.root)
+        return stage, hasher
+
+    def test_a_time_within_two_seconds_retires_without_reading_the_whole_source(self):
+        for word, view, seen_ns in NEAR_VIEWS:
+            with self.subTest(view=view):
+                source, record = self.film(word)
+                os.utime(str(source), ns=(seen_ns, seen_ns))
+                stage, hasher = self.retire_watching_the_hash(source, record)
+                hasher.assert_not_called()
+                self.assertFalse(source.exists())
+                self.assertTrue((self.quarantine / "holidays" / source.name).is_file())
+                self.assertEqual(stage["source_mtime_differs"],
+                                 [{"name": source.name, "recorded": PLANNED_MTIME_NS, "seen": seen_ns}])
+                self.assertNotIn("source_sha256_checked", stage)
+                self.assertEqual(load_record(source)["status"], "retired")
+
+    def test_two_seconds_exactly_is_within_and_one_nanosecond_more_is_not(self):
+        source, record = self.film("boundary")
+        os.utime(str(source), ns=(PLANNED_MTIME_NS + 2 * SECOND_NS, PLANNED_MTIME_NS + 2 * SECOND_NS))
+        with mock.patch.object(retire, "_hash_source", wraps=retire._hash_source) as hasher:
+            check_eligible(source, record)
+        hasher.assert_not_called()
+        os.utime(str(source), ns=(PLANNED_MTIME_NS - 2 * SECOND_NS - 1, PLANNED_MTIME_NS - 2 * SECOND_NS - 1))
+        with mock.patch.object(retire, "_hash_source", wraps=retire._hash_source) as hasher:
+            eligibility = check_eligible(source, record)
+        self.assertEqual(hasher.call_count, 1)
+        self.assertTrue(eligibility["source_sha256_checked"])
+
+    def test_a_time_days_away_reads_the_source_once_and_retires(self):
+        source, record = self.film("restored")
+        os.utime(str(source), ns=(DAYS_LATER_NS, DAYS_LATER_NS))
+        stage, hasher = self.retire_watching_the_hash(source, record)
+        self.assertEqual(hasher.call_count, 1)
+        self.assertEqual(hasher.call_args[0][0], [source])
+        self.assertTrue(stage["source_sha256_checked"])
+        self.assertEqual(stage["source_mtime_differs"],
+                         [{"name": source.name, "recorded": PLANNED_MTIME_NS, "seen": DAYS_LATER_NS}])
+        self.assertTrue((self.quarantine / "holidays" / source.name).is_file())
+
+    def test_a_time_days_away_with_a_changed_middle_is_refused(self):
+        source, record = self.film("edited")
+        content = bytearray(LARGE_SOURCE)
+        content[len(content) // 2] ^= 0xFF
+        source.write_bytes(bytes(content))
+        os.utime(str(source), ns=(DAYS_LATER_NS, DAYS_LATER_NS))
+        seen = cheap_fingerprint(source)
+        for key in ("size", "head_sha256", "tail_sha256"):
+            self.assertEqual(seen[key], record["source"]["fingerprint"][key], key)
+        record_text = json.dumps(record, sort_keys=True)
+        record_bytes = (source.parent / ".vidfunnel" / (source.name + ".json")).read_bytes()
+        refusal = self.assert_refused("source-changed", source, record)
+        self.assertIn("SHA-256 of source '{}' is {}, the record says {}".format(
+            source.name, hashlib.sha256(bytes(content)).hexdigest(), record["source"]["sha256"]), refusal.detail)
+        self.assertIn("plan again with --replan", refusal.detail)
+        self.assertTrue(source.is_file())
+        self.assertEqual(json.dumps(record, sort_keys=True), record_text)
+        self.assertEqual((source.parent / ".vidfunnel" / (source.name + ".json")).read_bytes(), record_bytes)
+
+    def test_a_time_days_away_without_a_recorded_source_hash_is_refused(self):
+        source, record = self.film("unhashed", recorded_hash=False)
+        os.utime(str(source), ns=(DAYS_LATER_NS, DAYS_LATER_NS))
+        refusal = self.assert_refused("source-changed", source, record)
+        self.assertIn("no source SHA-256", refusal.detail)
+
+    def test_an_unusable_recorded_time_reads_the_whole_source(self):
+        source, record = self.film("edited_time")
+        record["source"]["fingerprint"]["mtime_ns"] = "yesterday"
+        with mock.patch.object(retire, "_hash_source", wraps=retire._hash_source) as hasher:
+            eligibility = check_eligible(source, record)
+        self.assertEqual(hasher.call_count, 1)
+        self.assertTrue(eligibility["source_sha256_checked"])
+
+    def test_the_same_time_reads_nothing_and_notes_nothing(self):
+        source, record = self.film("unmoved")
+        stage, hasher = self.retire_watching_the_hash(source, record)
+        hasher.assert_not_called()
+        self.assertNotIn("source_mtime_differs", stage)
+        self.assertNotIn("source_sha256_checked", stage)
+
+    def test_a_large_source_read_in_full_is_announced(self):
+        source, record = self.film("announced")
+        os.utime(str(source), ns=(DAYS_LATER_NS, DAYS_LATER_NS))
+        retire_one(source, record, self.root)
+        self.assertIn("'{}': its time differs from the one recorded at plan by more than 2 s; reading it in full "
+                      "({} bytes) to compare with the recorded SHA-256".format(source.name, len(LARGE_SOURCE)),
+                      self.out.getvalue())
 
 
 class QuarantineDestinationTests(RetireCase):
@@ -493,6 +617,27 @@ class VobGroupTests(RetireCase):
         self.assertFalse(self.second_member.exists())
         self.assertEqual(stage["destinations"], [None, None])
 
+    def test_a_member_time_days_away_hashes_the_members_in_order(self):
+        concatenated = self.first_member.read_bytes() + self.second_member.read_bytes()
+        self.group_record["source"]["sha256"] = hashlib.sha256(concatenated).hexdigest()
+        os.utime(str(self.second_member), ns=(DAYS_LATER_NS, DAYS_LATER_NS))
+        self.quietly()
+        with mock.patch.object(retire, "_hash_source", wraps=retire._hash_source) as hasher:
+            stage = retire_one(self.first_member, self.group_record, self.root)
+        self.assertEqual(hasher.call_count, 1)
+        self.assertEqual(hasher.call_args[0][0], [self.first_member, self.second_member])
+        self.assertTrue(stage["source_sha256_checked"])
+        self.assertEqual([entry["name"] for entry in stage["source_mtime_differs"]], ["VTS_01_2.VOB"])
+        self.assertFalse(self.second_member.exists())
+
+    def test_a_member_time_days_away_with_another_group_hash_is_refused(self):
+        reversed_order = self.second_member.read_bytes() + self.first_member.read_bytes()
+        self.group_record["source"]["sha256"] = hashlib.sha256(reversed_order).hexdigest()
+        os.utime(str(self.second_member), ns=(DAYS_LATER_NS, DAYS_LATER_NS))
+        self.quietly()
+        refusal = self.assert_refused("source-changed", self.first_member, self.group_record)
+        self.assertIn("SHA-256 of source 'VTS_01_1.VOB'", refusal.detail)
+
     def test_changed_second_member_is_refused(self):
         write_bytes(self.second_member, b"edited second vob " * 300)
         refusal = self.assert_refused("source-changed", self.first_member, self.group_record)
@@ -698,6 +843,19 @@ class RunTests(RetireCase):
         self.assertEqual(run(self.namespace("--allow-review", str(self.root))), EXIT_OK)
         self.assertFalse(self.beach_source.exists())
         self.assertEqual(load_record(self.meeting_source)["status"], "converted")
+
+    def test_a_record_left_source_changed_by_an_older_convert_is_not_retired(self):
+        # Before 20261109.3 convert set this status and flag; such records stay readable and are skipped.
+        from vidfunnel.cli import EXIT_OK
+        set_status(self.beach_record, "source-changed")
+        add_flag(self.beach_record, "source-changed")
+        save_record(self.beach_source, self.beach_record)
+        self.assert_refused("status-not-verified", self.beach_source, self.beach_record)
+        before = snapshot(self.root / "holidays")
+        out, _err = self.quietly()
+        self.assertEqual(run(self.namespace(str(self.root))), EXIT_OK)
+        self.assertIn("1 retired, 1 skipped", out.getvalue())
+        self.assertEqual(snapshot(self.root / "holidays"), before)
 
     def test_run_allow_larger_option(self):
         from vidfunnel.cli import EXIT_OK
