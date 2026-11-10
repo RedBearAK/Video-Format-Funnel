@@ -8,7 +8,7 @@ ends at 'converted' or 'verified' depends on whether vidfunnel.verify is
 present, so both are accepted.
 """
 
-VERSION = "20261109.3"
+VERSION = "20261109.4"
 
 import argparse
 import contextlib
@@ -29,6 +29,7 @@ import unittest.mock
 from pathlib import Path
 
 import vidfunnel
+import vidfunnel.record as record_module
 from vidfunnel import encode
 from vidfunnel.encode import (
     REFIT_DENOISE,
@@ -150,7 +151,8 @@ class SkipReasonTest(unittest.TestCase):
         self.temporary.cleanup()
 
     def record(self, status, fingerprint):
-        return {"status": status, "output": {"name": "movie.mp4", "fingerprint": fingerprint}}
+        return {"status": status, "source": {"name": "movie.avi"},
+                "output": {"name": "movie.mp4", "fingerprint": fingerprint}}
 
     def test_matching_fingerprint_is_already_converted(self):
         fingerprint = cheap_fingerprint(self.output)
@@ -184,8 +186,8 @@ class SkipReasonTest(unittest.TestCase):
         self.output.write_bytes(LARGE_CONTENT)
         os.utime(str(self.output), ns=(PLANNED_MTIME_NS, PLANNED_MTIME_NS))
         fingerprint = cheap_fingerprint(self.output)
-        expected = ("status is 'converted' but the output 'movie.mp4' is missing or changed since; "
-                    "plan again with --replan to convert again")
+        expected = ("status is 'converted' but the output 'movie.mp4' is missing or changed since; to convert "
+                    "again, plan it again with: vidfunnel plan --replan '{}'".format(self.output.parent / "movie.avi"))
         for change, edit, _words in CONTENT_CHANGES:
             with self.subTest(change=change):
                 edit(self.output)
@@ -205,6 +207,31 @@ OTHER_HOST_VIEWS = (
     ("days later", PLANNED_MTIME_NS + 3 * 86400 * 1000 * 1000 * 1000),
 )
 LARGE_CONTENT = bytes(range(256)) * (3 * 1024 * 1024 // 256)   # 3 MiB, so the first and last MiB differ
+SECOND_NS = 1000 * 1000 * 1000
+STEPS = (("hundred_nanoseconds", 100), ("microsecond", 1000), ("millisecond", 1000 * 1000),
+         ("ten_milliseconds", 10 * 1000 * 1000), ("second", SECOND_NS), ("two_seconds", 2 * SECOND_NS))
+
+
+def truncated(value, step):
+    return value - value % step
+
+
+# (word, recorded time, seen time) of a source: one is the other truncated to a coarser step, in both directions.
+COARSER_VIEWS = ([("seen_" + word, PLANNED_MTIME_NS, truncated(PLANNED_MTIME_NS, step)) for word, step in STEPS]
+                 + [("recorded_" + word, truncated(PLANNED_MTIME_NS, step), PLANNED_MTIME_NS) for word, step in STEPS])
+# (word, recorded time, seen time): differences that no truncation explains.
+OTHER_TIMES = (
+    ("second_later", PLANNED_MTIME_NS, PLANNED_MTIME_NS + SECOND_NS),
+    ("second_and_half_later", PLANNED_MTIME_NS, PLANNED_MTIME_NS + 3 * SECOND_NS // 2),
+    ("days_later", PLANNED_MTIME_NS, PLANNED_MTIME_NS + 3 * 86400 * SECOND_NS),
+)
+
+
+def changed_middle(path):
+    """Flip one byte in the middle of a file of LARGE_CONTENT: size and first and last MiB stay the same."""
+    content = bytearray(path.read_bytes())
+    content[len(content) // 2] ^= 0xFF
+    path.write_bytes(bytes(content))
 
 
 def _flip_byte_at(offset):
@@ -929,7 +956,8 @@ def succeeding_ffmpeg(path):
 
 
 class ConvertSourceTimeTest(unittest.TestCase):
-    """A source whose time alone differs is converted and noted; one whose content differs is skipped untouched."""
+    """The source is checked before anything is written: a coarser view of its time reads nothing, another time
+    reads it once; a source that changed is skipped with its record left as it is."""
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -945,55 +973,115 @@ class ConvertSourceTimeTest(unittest.TestCase):
         folder.mkdir()
         return folder
 
-    def planned(self, folder, fixture, record_id=FIRST_RECORD_ID):
-        """A planned record whose 3 MiB source carried PLANNED_MTIME_NS when it was fingerprinted."""
+    def planned(self, folder, fixture, record_id=FIRST_RECORD_ID, recorded_ns=PLANNED_MTIME_NS):
+        """A planned record whose 3 MiB source carried recorded_ns when it was fingerprinted."""
         key, record = captured_record(folder, fixture, "reencode")
         source = folder / fixture
         source.write_bytes(LARGE_CONTENT)
-        os.utime(str(source), ns=(PLANNED_MTIME_NS, PLANNED_MTIME_NS))
+        os.utime(str(source), ns=(recorded_ns, recorded_ns))
         record["id"] = record_id
         record["source"].update(size=len(LARGE_CONTENT), fingerprint=cheap_fingerprint(source),
                                 sha256=sha256_of(source))
         save_record(key, record)
         return key, source
 
-    def convert(self, folder):
-        progress = quiet()
+    def convert(self, folder, quiet_run=True):
+        progress = quiet() if quiet_run else types.SimpleNamespace(stream=io.StringIO(), quiet=False, verbose=False)
         with unittest.mock.patch("vidfunnel.encode.ffmpeg_capabilities", return_value=FULL_LISTING), \
-                unittest.mock.patch("vidfunnel.encode._verify", side_effect=lambda tools, key, record, *rest: record):
+                unittest.mock.patch("vidfunnel.encode._verify", side_effect=lambda tools, key, record, *rest: record), \
+                unittest.mock.patch("vidfunnel.record.full_sha256", wraps=record_module.full_sha256) as hasher:
             summary = convert_paths(self.tools, [str(folder)], convert_options(), progress)
+        self.hasher = hasher
         return summary, progress.stream.getvalue()
 
-    def test_a_source_time_that_differs_alone_is_converted_and_noted(self):
-        for view, seen_ns in OTHER_HOST_VIEWS:
-            with self.subTest(view=view):
+    def assert_converted_with_note(self, folder, key, source, recorded_ns, seen_ns, read):
+        summary, text = self.convert(folder)
+        self.assertEqual(summary.counts["converted"], 1, text)
+        self.assertEqual(summary.counts["skipped"] + summary.counts["failed"], 0, text)
+        self.assertEqual(self.hasher.call_count, 1 if read else 0)
+        saved = load_record(key)
+        self.assertEqual(saved["status"], "converted")
+        self.assertNotIn("source-changed", saved["flags"])
+        stage = saved["stages"]["convert"]
+        self.assertEqual(stage["outcome"], "ok")
+        self.assertEqual(stage["source_mtime_differs"], [{"name": source.name, "recorded": recorded_ns,
+                                                          "seen": seen_ns}])
+        self.assertIs(stage["source_sha256_checked"], read)
+        self.assertEqual(saved["source"]["fingerprint"]["mtime_ns"], recorded_ns)
+        # The output gets the source's time as this host sees it, and the record holds what was stored.
+        output = folder / (Path(source.name).stem + ".mp4")
+        self.assertEqual(output.stat().st_mtime_ns, seen_ns)
+        self.assertEqual(saved["output"]["fingerprint"], cheap_fingerprint(output))
+
+    def test_a_coarser_view_of_the_source_time_converts_without_a_read(self):
+        for word, recorded_ns, seen_ns in COARSER_VIEWS:
+            with self.subTest(case=word):
                 folder = self.folder()
-                key, source = self.planned(folder, REENCODE_SOURCE)
+                key, source = self.planned(folder, REENCODE_SOURCE, recorded_ns=recorded_ns)
                 os.utime(str(source), ns=(seen_ns, seen_ns))
+                self.assert_converted_with_note(folder, key, source, recorded_ns, seen_ns, read=False)
+
+    def test_another_source_time_with_the_same_content_is_read_once_and_converted(self):
+        for word, recorded_ns, seen_ns in OTHER_TIMES:
+            with self.subTest(case=word):
+                folder = self.folder()
+                key, source = self.planned(folder, REENCODE_SOURCE, recorded_ns=recorded_ns)
+                os.utime(str(source), ns=(seen_ns, seen_ns))
+                self.assert_converted_with_note(folder, key, source, recorded_ns, seen_ns, read=True)
+
+    def test_another_source_time_with_a_changed_middle_is_skipped_and_nothing_written(self):
+        for word, recorded_ns, seen_ns in OTHER_TIMES:
+            with self.subTest(case=word):
+                folder = self.folder()
+                key, source = self.planned(folder, REENCODE_SOURCE, recorded_ns=recorded_ns)
+                changed_middle(source)
+                os.utime(str(source), ns=(seen_ns, seen_ns))
+                record_bytes = record_path(key).read_bytes()
+                before = listing(folder)
                 summary, text = self.convert(folder)
-                self.assertEqual(summary.counts["converted"], 1, text)
-                self.assertEqual(summary.counts["skipped"] + summary.counts["failed"], 0, text)
-                saved = load_record(key)
-                self.assertEqual(saved["status"], "converted")
-                self.assertNotIn("source-changed", saved["flags"])
-                stage = saved["stages"]["convert"]
-                self.assertEqual(stage["outcome"], "ok")
-                self.assertEqual(stage["source_mtime_differs"],
-                                 [{"name": REENCODE_SOURCE, "recorded": PLANNED_MTIME_NS, "seen": seen_ns}])
-                self.assertEqual(saved["source"]["fingerprint"]["mtime_ns"], PLANNED_MTIME_NS)
-                # The output gets the source's time as this host sees it, and the record holds what was stored.
-                output = folder / "xvid_avi_mp3.mp4"
-                self.assertEqual(output.stat().st_mtime_ns, seen_ns)
-                self.assertEqual(saved["output"]["fingerprint"], cheap_fingerprint(output))
+                self.assertEqual(summary.counts["skipped"], 1, text)
+                self.assertEqual(summary.counts["converted"] + summary.counts["failed"], 0, text)
+                self.assertEqual(self.hasher.call_count, 1)
+                self.assertEqual(record_path(key).read_bytes(), record_bytes)
+                self.assertEqual(listing(folder), before)
+                self.assertIn("skipping '{}': source changed since plan: SHA-256 of '{}' is {}, the record says {}; "
+                              "plan it again with: vidfunnel plan '{}'".format(
+                                  REENCODE_SOURCE, REENCODE_SOURCE, sha256_of(source),
+                                  load_record(key)["source"]["sha256"], source), text)
+
+    def test_a_record_without_a_source_hash_is_skipped_before_any_read(self):
+        # Records always carry source.sha256; one without it fails the value check before the source is read.
+        folder = self.folder()
+        key, source = self.planned(folder, REENCODE_SOURCE)
+        record = load_record(key)
+        record["source"]["sha256"] = None
+        save_record(key, record)
+        os.utime(str(source), ns=(PLANNED_MTIME_NS + SECOND_NS, PLANNED_MTIME_NS + SECOND_NS))
+        record_bytes = record_path(key).read_bytes()
+        summary, text = self.convert(folder)
+        self.assertEqual(summary.counts["skipped"], 1, text)
+        self.hasher.assert_not_called()
+        self.assertIn("source.sha256", text)
+        self.assertEqual(record_path(key).read_bytes(), record_bytes)
 
     def test_the_same_time_writes_no_note(self):
         folder = self.folder()
         key, _source = self.planned(folder, REENCODE_SOURCE)
         summary, text = self.convert(folder)
         self.assertEqual(summary.counts["converted"], 1, text)
+        self.hasher.assert_not_called()
         self.assertNotIn("source_mtime_differs", load_record(key)["stages"]["convert"])
+        self.assertNotIn("source_sha256_checked", load_record(key)["stages"]["convert"])
 
-    def test_a_vob_member_whose_time_differs_alone_is_named_in_the_note(self):
+    def test_a_full_read_is_announced(self):
+        folder = self.folder()
+        _key, source = self.planned(folder, REENCODE_SOURCE)
+        os.utime(str(source), ns=(PLANNED_MTIME_NS + SECOND_NS, PLANNED_MTIME_NS + SECOND_NS))
+        _summary, text = self.convert(folder, quiet_run=False)
+        self.assertIn("[convert 1/1]   reading 'xvid_avi_mp3.avi' in full (3.0 MiB): its modification time is "
+                      "neither the recorded one nor a coarser view of it", text)
+
+    def test_a_vob_member_whose_time_differs_is_read_with_the_group_and_named_in_the_note(self):
         folder = self.folder()
         key, record = captured_record(folder, REENCODE_SOURCE, "reencode", kind="vob-group")
         save_record(key, record)
@@ -1002,8 +1090,26 @@ class ConvertSourceTimeTest(unittest.TestCase):
         os.utime(str(second), ns=(PLANNED_MTIME_NS, PLANNED_MTIME_NS))
         summary, text = self.convert(folder)
         self.assertEqual(summary.counts["converted"], 1, text)
-        self.assertEqual(load_record(key)["stages"]["convert"]["source_mtime_differs"],
+        self.assertEqual(self.hasher.call_args[0][0], (str(folder / "VTS_01_1.VOB"), str(second)))
+        stage = load_record(key)["stages"]["convert"]
+        self.assertEqual(stage["source_mtime_differs"],
                          [{"name": "VTS_01_2.VOB", "recorded": recorded_ns, "seen": PLANNED_MTIME_NS}])
+        self.assertIs(stage["source_sha256_checked"], True)
+
+    def test_the_output_collision_stage_carries_the_note(self):
+        folder = self.folder()
+        key, source = self.planned(folder, REENCODE_SOURCE)
+        whole_seconds = truncated(PLANNED_MTIME_NS, SECOND_NS)
+        os.utime(str(source), ns=(whole_seconds, whole_seconds))
+        write_bytes(folder / "xvid_avi_mp3.mp4", b"a file that is not ours")
+        with unittest.mock.patch("vidfunnel.encode._ours", return_value=False):
+            summary, text = self.convert(folder)
+        self.assertEqual(summary.counts["failed"], 1, text)
+        stage = load_record(key)["stages"]["convert"]
+        self.assertEqual(stage["outcome"], "output-collision")
+        self.assertEqual(stage["source_mtime_differs"],
+                         [{"name": REENCODE_SOURCE, "recorded": PLANNED_MTIME_NS, "seen": whole_seconds}])
+        self.assertIs(stage["source_sha256_checked"], False)
 
     def test_source_content_that_differs_is_skipped_and_the_record_left_as_it_is(self):
         for change, edit, words in CONTENT_CHANGES:
@@ -1023,7 +1129,7 @@ class ConvertSourceTimeTest(unittest.TestCase):
                 self.assertIn("skipping '{}': source changed since plan: '{}' differs from the fingerprint taken "
                               "at plan (".format(REENCODE_SOURCE, REENCODE_SOURCE), text)
                 self.assertIn(words, text)
-                self.assertIn("; plan again with --replan", text)
+                self.assertIn("; plan it again with: vidfunnel plan '{}'".format(source), text)
                 self.assertEqual(load_record(good_key)["status"], "converted")
                 self.assertTrue((folder / "h264_avi_mp3.mp4").is_file())
 
@@ -1184,8 +1290,9 @@ class ConvertRunTest(unittest.TestCase):
         self.assertEqual(stage["outcome"], "skipped")
         self.assertEqual(stage["skipped"],
                          "source changed since plan: '{}' differs from the fingerprint taken at plan (size {} bytes "
-                         "recorded, {} now, first MiB differs, last MiB differs); plan again with --replan".format(
-                             REMUX_SOURCE, size, size + len(b"appended after planning")))
+                         "recorded, {} now, first MiB differs, last MiB differs); plan it again with: vidfunnel plan "
+                         "'{}'".format(REMUX_SOURCE, size, size + len(b"appended after planning"),
+                                       self.root / REMUX_SOURCE))
         self.assertEqual(record_path(self.root / REMUX_SOURCE).read_bytes(), record_bytes)
         self.assertEqual(load_record(self.root / REMUX_SOURCE)["status"], "planned")
         self.assertFalse((self.root / "h264_high_mkv_aac.mp4").exists())
@@ -1203,6 +1310,7 @@ class ConvertRunTest(unittest.TestCase):
         self.assertEqual(stage["outcome"], "ok", stage)
         self.assertEqual(stage["source_mtime_differs"],
                          [{"name": REMUX_SOURCE, "recorded": PLANNED_MTIME_NS, "seen": whole_seconds}])
+        self.assertIs(stage["source_sha256_checked"], False)
         saved = load_record(source)
         self.assertIn(saved["status"], DONE)
         self.assertNotIn("source-changed", saved["flags"])
@@ -1762,6 +1870,8 @@ class RefitRuleTest(unittest.TestCase):
 # --- refit: integration --------------------------------------------------------------------
 
 OTHER_BUILD_VERSION = "0.0.0-other-build"  # the CI container's ffmpeg is 8.1.3, so no real version may be used here
+REFIT_ADVICE = ("the output 'h264_avi_mp3.mp4' was made from the earlier content; to convert the source as it is "
+                "now, move 'h264_avi_mp3.mp4' away and run: vidfunnel plan '{}'")
 REFIT_SOURCE = "h264_avi_mp3.avi"       # re-encoded with --reencode-video it comes out larger than the source
 REFIT_OUTPUT = "h264_avi_mp3.mp4"
 
@@ -2273,8 +2383,8 @@ class RefitRunTest(unittest.TestCase):
         outcome, reason = refit_one(TOOLS, source, record, convert_options(), quiet())
         self.assertEqual((outcome, reason), (
             "skipped", "source changed since plan: '{}' differs from the fingerprint taken at plan (size {} bytes "
-                       "recorded, {} now, first MiB differs, last MiB differs); plan again with --replan".format(
-                           REFIT_SOURCE, size, size + 1)))
+                       "recorded, {} now, first MiB differs, last MiB differs); {}".format(
+                           REFIT_SOURCE, size, size + 1, REFIT_ADVICE.format(source))))
         self.assertEqual(record_path(source).read_bytes(), record_bytes)
         self.assertEqual(sha256_of(self.root / REFIT_OUTPUT), output_hash)
 
@@ -2293,27 +2403,78 @@ class RefitRunTest(unittest.TestCase):
                 outcome, reason = refit_one(TOOLS, source, load_record(source), convert_options(), quiet())
                 self.assertEqual((outcome, reason), (
                     "skipped", "source changed since plan: '{}' differs from the fingerprint taken at plan "
-                               "(first MiB differs, last MiB differs); plan again with --replan".format(REFIT_SOURCE)))
+                               "(first MiB differs, last MiB differs); {}".format(REFIT_SOURCE,
+                                                                                  REFIT_ADVICE.format(source))))
                 self.assertEqual(record_path(source).read_bytes(), record_bytes)
                 self.assertEqual(sha256_of(self.root / REFIT_OUTPUT), output_hash)
                 source.write_bytes(original)
 
-    def test_times_that_differ_alone_are_refitted_and_noted(self):
+    def large_source(self):
+        """A converted re-encode whose source is then swapped for 3 MiB recorded at PLANNED_MTIME_NS; the record.
+
+        The source check reads only the record's fingerprint and hash, so the
+        swap leaves the rest of the record and the existing output valid.
+        """
+        record = self.plan_and_convert(REFIT_SOURCE, reencode_video=True)[REFIT_SOURCE]
+        source = self.root / REFIT_SOURCE
+        source.write_bytes(LARGE_CONTENT)
+        os.utime(str(source), ns=(PLANNED_MTIME_NS, PLANNED_MTIME_NS))
+        record["source"].update(fingerprint=cheap_fingerprint(source), sha256=sha256_of(source))
+        save_record(source, record)
+        return source, record
+
+    def disk_check(self, record):
+        with unittest.mock.patch("vidfunnel.record.full_sha256", wraps=record_module.full_sha256) as hasher:
+            result = encode._refit_disk_problem(self.root, record, self.root / REFIT_OUTPUT, quiet=True)
+        return result, hasher
+
+    def test_source_times_are_checked_as_convert_checks_them(self):
+        source, record = self.large_source()
+        output = self.root / REFIT_OUTPUT
+        output_ns = record["output"]["fingerprint"]["mtime_ns"]
+        for word, recorded_ns, seen_ns in COARSER_VIEWS + list(OTHER_TIMES):
+            with self.subTest(case=word):
+                record["source"]["fingerprint"]["mtime_ns"] = recorded_ns
+                os.utime(str(source), ns=(seen_ns, seen_ns))
+                os.utime(str(output), ns=(output_ns + 1, output_ns + 1))
+                (problem, _size, _source_size, notes), hasher = self.disk_check(record)
+                read = (word, recorded_ns, seen_ns) in OTHER_TIMES
+                self.assertIsNone(problem)
+                self.assertEqual(hasher.call_count, 1 if read else 0)
+                self.assertEqual(notes, {
+                    "source_mtime_differs": [{"name": REFIT_SOURCE, "recorded": recorded_ns, "seen": seen_ns}],
+                    "source_sha256_checked": read,
+                    "output_mtime_differs": [{"name": REFIT_OUTPUT, "recorded": output_ns, "seen": output_ns + 1}]})
+
+    def test_another_source_time_with_a_changed_middle_is_skipped_and_nothing_encoded(self):
+        source, record = self.large_source()
+        changed_middle(source)
+        output_hash = sha256_of(self.root / REFIT_OUTPUT)
+        record_bytes = record_path(source).read_bytes()
+        for word, recorded_ns, seen_ns in OTHER_TIMES:
+            with self.subTest(case=word):
+                os.utime(str(source), ns=(seen_ns, seen_ns))
+                with unittest.mock.patch("vidfunnel.encode.run_tool") as encoder:
+                    outcome, reason = refit_one(TOOLS, source, load_record(source), convert_options(), quiet())
+                encoder.assert_not_called()
+                self.assertEqual((outcome, reason), (
+                    "skipped", "source changed since plan: SHA-256 of '{}' is {}, the record says {}; {}".format(
+                        REFIT_SOURCE, sha256_of(source), record["source"]["sha256"],
+                        REFIT_ADVICE.format(source))))
+                self.assertEqual(record_path(source).read_bytes(), record_bytes)
+                self.assertEqual(sha256_of(self.root / REFIT_OUTPUT), output_hash)
+                self.assertEqual(self.leftover_parts(), [])
+
+    def test_times_that_differ_are_refitted_and_noted(self):
         self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
         source = self.root / REFIT_SOURCE
         output = self.root / REFIT_OUTPUT
         record = load_record(source)
         source_ns = record["source"]["fingerprint"]["mtime_ns"]
         output_ns = record["output"]["fingerprint"]["mtime_ns"]
-        for view, seen_ns in OTHER_HOST_VIEWS:
-            with self.subTest(view=view):
-                os.utime(str(source), ns=(seen_ns, seen_ns))
-                os.utime(str(output), ns=(seen_ns + 1, seen_ns + 1))
-                problem, _size, _source_size, notes = encode._refit_disk_problem(self.root, record, output)
-                self.assertIsNone(problem)
-                self.assertEqual(notes, {
-                    "source_mtime_differs": [{"name": REFIT_SOURCE, "recorded": source_ns, "seen": seen_ns}],
-                    "output_mtime_differs": [{"name": REFIT_OUTPUT, "recorded": output_ns, "seen": seen_ns + 1}]})
+        days_later = source_ns + 3 * 86400 * SECOND_NS
+        os.utime(str(source), ns=(days_later, days_later))
+        os.utime(str(output), ns=(days_later + 1, days_later + 1))
         record_bytes = record_path(source).read_bytes()
         with unittest.mock.patch("vidfunnel.encode._verify", side_effect=lambda tools, key, record, *rest: record):
             outcome, reason = refit_one(TOOLS, source, record, convert_options(), quiet())
@@ -2322,11 +2483,61 @@ class RefitRunTest(unittest.TestCase):
         saved = load_record(source)
         self.assertEqual(saved["status"], "converted")
         self.assertNotIn("source-changed", saved["flags"])
-        days_later = OTHER_HOST_VIEWS[-1][1]
         self.assertEqual(saved["stages"]["refit"]["source_mtime_differs"],
                          [{"name": REFIT_SOURCE, "recorded": source_ns, "seen": days_later}])
+        self.assertIs(saved["stages"]["refit"]["source_sha256_checked"], True)
         self.assertEqual(saved["stages"]["refit"]["output_mtime_differs"],
                          [{"name": REFIT_OUTPUT, "recorded": output_ns, "seen": days_later + 1}])
+
+    def refit_with_a_coarser_source_time(self, **patches):
+        """Refit, the source seen at whole seconds, with the given patches; (outcome, saved record, recorded, seen)."""
+        self.plan_and_convert(REFIT_SOURCE, reencode_video=True)
+        source = self.root / REFIT_SOURCE
+        record = load_record(source)
+        recorded_ns = PLANNED_MTIME_NS
+        record["source"]["fingerprint"]["mtime_ns"] = recorded_ns
+        save_record(source, record)
+        whole_seconds = truncated(recorded_ns, SECOND_NS)
+        os.utime(str(source), ns=(whole_seconds, whole_seconds))
+        with contextlib.ExitStack() as stack:
+            for target, value in patches.items():
+                stack.enter_context(unittest.mock.patch(target, **value))
+            outcome, _reason = refit_one(TOOLS, source, record, convert_options(), quiet())
+        return outcome, load_record(source), recorded_ns, whole_seconds
+
+    def assert_refit_note(self, saved, recorded_ns, seen_ns, outcome):
+        stage = saved["stages"]["refit"]
+        self.assertEqual(stage["outcome"], outcome)
+        self.assertEqual(stage["source_mtime_differs"],
+                         [{"name": REFIT_SOURCE, "recorded": recorded_ns, "seen": seen_ns}])
+        self.assertIs(stage["source_sha256_checked"], not record_module.mtime_is_coarser_view(recorded_ns, seen_ns))
+
+    def test_a_failed_refit_carries_the_note(self):
+        outcome, saved, recorded_ns, seen_ns = self.refit_with_a_coarser_source_time(**{
+            "vidfunnel.encode.run_tool": {"side_effect": FfmpegError("made-up ffmpeg failure", stderr="")}})
+        self.assertEqual(outcome, "failed")
+        self.assert_refit_note(saved, recorded_ns, seen_ns, "failed")
+
+    def test_a_kept_refit_carries_the_note(self):
+        outcome, saved, recorded_ns, seen_ns = self.refit_with_a_coarser_source_time(**{
+            "vidfunnel.encode.refit_checks": {"return_value": "made-up check problem"}})
+        self.assertEqual(outcome, "kept")
+        self.assert_refit_note(saved, recorded_ns, seen_ns, "kept-existing")
+
+    def test_a_refit_whose_replace_fails_carries_the_note(self):
+        real_replace = os.replace
+        output = str(self.root / REFIT_OUTPUT)
+
+        def refuse_the_output(source, target, *rest, **options):
+            if str(target) == output:
+                raise OSError("made-up replace failure")
+            return real_replace(source, target, *rest, **options)
+
+        outcome, saved, recorded_ns, seen_ns = self.refit_with_a_coarser_source_time(**{
+            "vidfunnel.encode.os.replace": {"side_effect": refuse_the_output}})
+        self.assertEqual(outcome, "failed")
+        self.assert_refit_note(saved, recorded_ns, seen_ns, "failed")
+        self.assertIn("made-up replace failure", saved["stages"]["refit"]["error"])
 
     def test_failed_ffmpeg_run_is_recorded_and_tried_again(self):
         self.plan_and_convert(REFIT_SOURCE, reencode_video=True)

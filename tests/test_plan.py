@@ -7,10 +7,11 @@ fixture folder itself is never planned) and skip with a message when
 ffmpeg or the fixtures are missing.
 """
 
-VERSION = "20261109.3"
+VERSION = "20261109.4"
 
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
@@ -51,14 +52,36 @@ PROBE_DIR = os.path.join(REPO_ROOT, "tests", "probe_json")
 ANALYSIS_DIR = os.path.join(REPO_ROOT, "tests", "analysis_json")
 
 FAKE_TOOLS = Tools("/opt/ffmpeg/bin/ffmpeg", "/opt/ffmpeg/bin/ffprobe")
-# The time a source shows on the planning host, and what other hosts' mounts report for it.
+# The time a source shows on the planning host, and what other mounts can show for it.
 PLANNED_MTIME_NS = 1700000001987654321
-OTHER_HOST_VIEWS = (
-    ("hundred-nanosecond steps", 1700000001987654300),
-    ("whole seconds", 1700000001000000000),
-    ("two-second steps", 1700000000000000000),
-    ("days later", PLANNED_MTIME_NS + 3 * 86400 * 1000 * 1000 * 1000),
+SECOND_NS = 1000 * 1000 * 1000
+STEPS = (("hundred_nanoseconds", 100), ("microsecond", 1000), ("millisecond", 1000 * 1000),
+         ("ten_milliseconds", 10 * 1000 * 1000), ("second", SECOND_NS), ("two_seconds", 2 * SECOND_NS))
+
+
+def truncated(value, step):
+    return value - value % step
+
+
+# (word, recorded time, seen time): one is the other truncated to a coarser step, in both directions.
+COARSER_VIEWS = ([("seen_" + word, PLANNED_MTIME_NS, truncated(PLANNED_MTIME_NS, step)) for word, step in STEPS]
+                 + [("recorded_" + word, truncated(PLANNED_MTIME_NS, step), PLANNED_MTIME_NS) for word, step in STEPS])
+# (word, recorded time, seen time): differences that no truncation explains.
+OTHER_TIMES = (
+    ("second_later", PLANNED_MTIME_NS, PLANNED_MTIME_NS + SECOND_NS),
+    ("second_and_half_later", PLANNED_MTIME_NS, PLANNED_MTIME_NS + 3 * SECOND_NS // 2),
+    ("days_later", PLANNED_MTIME_NS, PLANNED_MTIME_NS + 3 * 86400 * SECOND_NS),
 )
+LARGE_FIXTURE = "qtrle_mov_rgb24_320x240.mov"     # 3.0 MiB: a middle that the first and last MiB do not cover
+
+
+def flip_middle(path):
+    """Flip one byte at 1.5 MiB: the size and the first and last MiB stay as they were."""
+    with open(str(path), "r+b") as handle:
+        handle.seek(1536 * 1024)
+        value = handle.read(1)
+        handle.seek(1536 * 1024)
+        handle.write(bytes([value[0] ^ 0xFF]))
 RECORD_ID = "0f2b6c1e-4d55-4a8e-9c1d-2f3e4a5b6c7d"
 SOURCE_SHA = "0123456789abcdef" + "f" * 48
 OUTPUT_PATH = "/library/clips/output.mp4"
@@ -983,55 +1006,136 @@ class PlanRunTest(unittest.TestCase):
         self.assertEqual(load_record(clip)["source"]["fingerprint"]["mtime_ns"], PLANNED_MTIME_NS)
         return clip
 
-    def test_a_source_time_that_differs_alone_is_skipped_and_the_record_left_as_it_is(self):
-        clip = self.planned_at_a_known_time("xvid_avi_mp3.avi")
-        record_bytes = record_path(clip).read_bytes()
-        for view, seen_ns in OTHER_HOST_VIEWS:
-            with self.subTest(view=view):
-                os.utime(str(clip), ns=(seen_ns, seen_ns))
-                summary = self.plan()
-                self.assertEqual(summary.counts["skipped"], 1)
-                self.assertEqual(record_path(clip).read_bytes(), record_bytes)
+    def recorded_at(self, clip, recorded_ns):
+        """Edit the record's recorded time, as if another mount had planned it; the record's bytes after."""
+        record = load_record(clip)
+        record["source"]["fingerprint"]["mtime_ns"] = recorded_ns
+        save_record(clip, record)
+        return record_path(clip).read_bytes()
 
-    def test_replan_after_a_time_change_hashes_the_source_again(self):
+    def plan_watching_the_hash(self, **values):
         from unittest import mock
         import vidfunnel.plan as plan_module
+        import vidfunnel.record as record_module
+        with mock.patch("vidfunnel.record.full_sha256", wraps=record_module.full_sha256) as checker, \
+                mock.patch.object(plan_module, "_sha256_paths", wraps=plan_module._sha256_paths) as planner:
+            stream = io.StringIO()
+            summary = plan_paths(TOOLS, [str(self.root)], make_options(**values),
+                                 progress=types.SimpleNamespace(stream=stream, quiet=False))
+        return summary, checker, planner, stream.getvalue()
+
+    def test_a_coarser_view_of_the_time_is_skipped_without_a_read(self):
+        clip = self.planned_at_a_known_time(LARGE_FIXTURE)
+        for word, recorded_ns, seen_ns in COARSER_VIEWS:
+            with self.subTest(case=word):
+                record_bytes = self.recorded_at(clip, recorded_ns)
+                os.utime(str(clip), ns=(seen_ns, seen_ns))
+                summary, checker, _planner, text = self.plan_watching_the_hash()
+                self.assertEqual(summary.counts["skipped"], 1, text)
+                checker.assert_not_called()
+                self.assertEqual(record_path(clip).read_bytes(), record_bytes)
+
+    def test_another_time_with_the_same_content_is_read_once_and_skipped(self):
+        clip = self.planned_at_a_known_time(LARGE_FIXTURE)
+        for word, recorded_ns, seen_ns in OTHER_TIMES:
+            with self.subTest(case=word):
+                record_bytes = self.recorded_at(clip, recorded_ns)
+                os.utime(str(clip), ns=(seen_ns, seen_ns))
+                summary, checker, _planner, text = self.plan_watching_the_hash()
+                self.assertEqual(summary.counts["skipped"], 1, text)
+                self.assertEqual(checker.call_count, 1)
+                self.assertIn("reading '{}' in full".format(LARGE_FIXTURE), text)
+                self.assertEqual(record_path(clip).read_bytes(), record_bytes)
+
+    def test_another_time_with_a_changed_middle_is_planned_again(self):
+        clip = self.planned_at_a_known_time(LARGE_FIXTURE)
+        for word, recorded_ns, seen_ns in OTHER_TIMES:
+            with self.subTest(case=word):
+                self.recorded_at(clip, recorded_ns)
+                before = load_record(clip)
+                flip_middle(clip)
+                os.utime(str(clip), ns=(seen_ns, seen_ns))
+                summary, checker, planner, text = self.plan_watching_the_hash()
+                self.assertEqual(summary.counts["skipped"], 0, text)
+                self.assertEqual(checker.call_count, 1)
+                planner.assert_not_called()     # the hash of the check serves the new record
+                after = load_record(clip)
+                self.assertNotEqual(after["id"], before["id"])
+                with open(str(clip), "rb") as handle:
+                    self.assertEqual(after["source"]["sha256"], hashlib.sha256(handle.read()).hexdigest())
+                self.assertNotEqual(after["source"]["sha256"], before["source"]["sha256"])
+                self.assertEqual(after["history"][-1]["id"], before["id"])
+                self.assertEqual(after["history"][-1]["status"], "source-changed")
+                self.assertIn("'{}' changed since record {} was planned (SHA-256 of".format(
+                    LARGE_FIXTURE, before["id"]), text)
+
+    def test_replan_with_a_changed_middle_marks_the_history_source_changed(self):
+        clip = self.planned_at_a_known_time(LARGE_FIXTURE)
+        first = load_record(clip)
+        flip_middle(clip)
+        os.utime(str(clip), ns=(PLANNED_MTIME_NS + SECOND_NS, PLANNED_MTIME_NS + SECOND_NS))
+        summary, checker, planner, text = self.plan_watching_the_hash(replan=True)
+        checker.assert_not_called()
+        self.assertEqual(planner.call_count, 1)
+        second = load_record(clip)
+        self.assertNotEqual(second["source"]["sha256"], first["source"]["sha256"])
+        self.assertEqual(second["history"][-1]["id"], first["id"])
+        self.assertEqual(second["history"][-1]["status"], "source-changed")
+
+    def test_another_time_without_a_recorded_hash_is_planned_again(self):
+        clip = self.planned_at_a_known_time(LARGE_FIXTURE)
+        record = load_record(clip)
+        record["source"]["sha256"] = None
+        save_record(clip, record)
+        os.utime(str(clip), ns=(PLANNED_MTIME_NS + SECOND_NS, PLANNED_MTIME_NS + SECOND_NS))
+        summary, checker, planner, text = self.plan_watching_the_hash()
+        self.assertEqual(summary.counts["skipped"], 0, text)
+        checker.assert_not_called()
+        self.assertEqual(planner.call_count, 1)
+        self.assertIn("no source SHA-256", text)
+        self.assertNotEqual(load_record(clip)["id"], record["id"])
+
+    def test_replan_after_a_time_change_hashes_the_source_again(self):
         clip = self.planned_at_a_known_time("xvid_avi_mp3.avi")
         first = load_record(clip)
-        with mock.patch.object(plan_module, "_sha256_paths", wraps=plan_module._sha256_paths) as hasher:
-            self.plan(replan=True)
-        hasher.assert_not_called()
+        whole_seconds = truncated(PLANNED_MTIME_NS, SECOND_NS)
+        os.utime(str(clip), ns=(whole_seconds, whole_seconds))
+        _summary, _checker, planner, _text = self.plan_watching_the_hash(replan=True)
+        planner.assert_not_called()     # a coarser view: the recorded hash is reused
         second = load_record(clip)
         self.assertEqual(second["source"]["sha256"], first["source"]["sha256"])
-        os.utime(str(clip), ns=(OTHER_HOST_VIEWS[-1][1], OTHER_HOST_VIEWS[-1][1]))
-        with mock.patch.object(plan_module, "_sha256_paths", wraps=plan_module._sha256_paths) as hasher:
-            self.plan(replan=True)
-        self.assertEqual(hasher.call_count, 1)
+        days_later = OTHER_TIMES[-1][2]
+        os.utime(str(clip), ns=(days_later, days_later))
+        _summary, _checker, planner, _text = self.plan_watching_the_hash(replan=True)
+        self.assertEqual(planner.call_count, 1)
         third = load_record(clip)
         self.assertEqual(third["source"]["sha256"], first["source"]["sha256"])
-        self.assertEqual(third["source"]["fingerprint"]["mtime_ns"], OTHER_HOST_VIEWS[-1][1])
+        self.assertEqual(third["source"]["fingerprint"]["mtime_ns"], days_later)
         self.assertEqual(third["history"][-1]["id"], second["id"])
         self.assertEqual(third["history"][-1]["status"], "planned")
         self.assertIn("replanned_at", third["history"][-1])
 
-    def test_a_record_left_source_changed_by_an_older_convert_plans_as_before(self):
-        # Before 20261109.3 convert set this status and flag on a record whose source it saw as changed.
-        clip = self.copy_fixture("xvid_avi_mp3.avi")
-        self.plan()
+    def test_a_record_left_source_changed_by_an_older_convert_is_planned_again(self):
+        # Before 20261109.3 convert set this status and flag when the source's time alone differed, as
+        # another mount's coarser view does; plain plan plans such a record again, as it did then.
+        clip = self.planned_at_a_known_time("xvid_avi_mp3.avi")
         record = load_record(clip)
         set_status(record, "source-changed")
         add_flag(record, "source-changed")
         save_record(clip, record)
-        record_bytes = record_path(clip).read_bytes()
-        self.assertEqual(self.plan().counts["skipped"], 1)
-        self.assertEqual(record_path(clip).read_bytes(), record_bytes)
-        summary = self.plan(replan=True)
-        self.assertEqual(summary.counts["re-encode"], 1)
+        whole_seconds = truncated(PLANNED_MTIME_NS, SECOND_NS)
+        os.utime(str(clip), ns=(whole_seconds, whole_seconds))
+        summary, _checker, _planner, text = self.plan_watching_the_hash()
+        self.assertEqual(summary.counts["re-encode"], 1, text)
+        self.assertIn("record {} of 'xvid_avi_mp3.avi' has status 'source-changed'; re-planning under a new "
+                      "record".format(record["id"]), text)
         replanned = load_record(clip)
         self.assertEqual(replanned["status"], "planned")
         self.assertNotIn("source-changed", replanned["flags"])
+        self.assertEqual(replanned["source"]["sha256"], record["source"]["sha256"])
         self.assertEqual(replanned["history"][-1]["id"], record["id"])
         self.assertEqual(replanned["history"][-1]["status"], "source-changed")
+        self.assertEqual(self.plan().counts["skipped"], 1)
 
     def test_reencode_output_carries_colour_and_aspect(self):
         source = self.copy_fixture("mpeg2_ps_ntsc_dar_4x3_ac3.mpg")

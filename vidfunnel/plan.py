@@ -57,7 +57,7 @@ analyze_input(), which runs the same passes with an input-argument list and
 returns the same dict shape, built from analyze's own pure rules.
 """
 
-VERSION = "20261109.3"
+VERSION = "20261109.4"
 
 import hashlib
 import json
@@ -118,8 +118,9 @@ from vidfunnel.record import (
     add_penalty,
     add_stage,
     cheap_fingerprint,
-    fingerprint_identical,
+    check_source,
     fingerprint_matches,
+    fingerprint_same_file,
     load_folder,
     load_record,
     new_record,
@@ -1006,7 +1007,7 @@ def _member_fingerprints(paths):
 def _unchanged(record, fingerprint, members, compare=fingerprint_matches):
     """True when the source (and each VOB member) matches its recorded fingerprint by content; the time is not compared.
 
-    compare=fingerprint_identical asks for the times to agree as well.
+    compare=fingerprint_same_file asks for each time to be the recorded one or a coarser view of it as well.
     """
     if not compare((record.get("source") or {}).get("fingerprint"), fingerprint):
         return False
@@ -1071,12 +1072,28 @@ def _new_record_for(work):
     return record
 
 
+def _recorded_files(work, existing):
+    """[(path, recorded fingerprint)] of a source whose record matches it by content (_unchanged), in source order."""
+    source = existing.get("source") or {}
+    if work.members is not None:
+        return [(path, member.get("fingerprint")) for path, member in zip(work.members, source.get("members"))]
+    return [(work.hashed[0], source.get("fingerprint"))]
+
+
 def _attach_history(record, existing, fingerprint, members):
-    """Move the source's existing record into the new record's history (marked re-planned or source-changed)."""
+    """Move the source's existing record into the new record's history (marked re-planned or source-changed).
+
+    It is marked 'source-changed' when the source's size or first or last
+    MiB differs from it, or when the new record's full SHA-256 differs from
+    the one it holds (a change in the middle of the file).
+    """
     if existing is None:
         return
     history = list(existing.pop("history", None) or [])
-    if _unchanged(existing, fingerprint, members):
+    old_sha = (existing.get("source") or {}).get("sha256")
+    new_sha = (record.get("source") or {}).get("sha256")
+    hash_changed = isinstance(old_sha, str) and isinstance(new_sha, str) and old_sha.lower() != new_sha.lower()
+    if _unchanged(existing, fingerprint, members) and not hash_changed:
         existing["replanned_at"] = now_iso()
     else:
         set_status(existing, "source-changed")
@@ -1113,19 +1130,35 @@ def _plan_one_locked(tools, work, options, folder_sources, capabilities, progres
     fingerprint = cheap_fingerprint(work.hashed[0])
     members = _member_fingerprints(work.members) if work.members is not None else None
     replan = bool(getattr(options, "replan", False))
-    if existing is not None and _unchanged(existing, fingerprint, members) and not replan:
-        take_lock()
-        return "skipped", load_record(work.key) or existing
+    why = None          # why an existing record is planned again without --replan
+    known_sha = None    # the source's full SHA-256 when the check below read it
+    if existing is not None:
+        if not _unchanged(existing, fingerprint, members):
+            why = "'{}' changed since record {} was planned".format(work.label, existing.get("id"))
+        elif existing.get("status") == "source-changed":
+            why = "record {} of '{}' has status 'source-changed'".format(existing.get("id"), work.label)
+        elif not replan:
+            # Size and first and last MiB match: the time decides, or the full hash (record.check_source).
+            _stream, quiet = _progress_options(progress)
+            check = check_source(_recorded_files(work, existing), (existing.get("source") or {}).get("sha256"),
+                                 work.label, stream, quiet)
+            if check.reason is None:
+                take_lock()
+                return "skipped", load_record(work.key) or existing
+            why = "'{}' changed since record {} was planned ({})".format(work.label, existing.get("id"),
+                                                                          check.reason)
+            known_sha = check.sha256
 
     record = _new_record_for(work)
     if existing is not None:
-        if not _unchanged(existing, fingerprint, members):
-            say("'{}' changed since record {} was planned; re-planning under a new record".format(
-                work.label, existing.get("id")), stream)
+        if why is not None:
+            say("{}; re-planning under a new record".format(why), stream)
         old_sha = (existing.get("source") or {}).get("sha256")
-        # The full hash is reused only when the times agree too; a time that differs means
-        # the middle of the file is unknown, so --replan hashes it again.
-        if old_sha and _unchanged(existing, fingerprint, members, compare=fingerprint_identical):
+        # The full hash is reused only when each time is the recorded one or a coarser view of it;
+        # any other time means the middle of the file is unknown, so it is hashed again.
+        if known_sha is not None:
+            record["source"]["sha256"] = known_sha
+        elif old_sha and _unchanged(existing, fingerprint, members, compare=fingerprint_same_file):
             record["source"]["sha256"] = old_sha
     settled = []
 
@@ -1680,22 +1713,24 @@ def render_record(tools, folder, record, plan=None, sidecars=True):
     skipped = set(plan.get("sidecars_skipped") or [])
     rendered = [entry for entry in build_sidecar_argvs(tools, inputs, final_path, analysis, dvd_title)
                 if Path(entry["path"]).name not in skipped]
-    rendered = _listed_sidecars("output.sidecars", output.get("sidecars"), rendered)
+    source_path = folder / str((record.get("source") or {}).get("name"))
+    rendered = _listed_sidecars("output.sidecars", output.get("sidecars"), rendered, source_path)
     if plan.get("mark_outputs") and output.get("interim_name"):
         rendered = interim_sidecars(rendered, final_path, folder / output["interim_name"])
-        rendered = _listed_sidecars("output.interim_sidecars", output.get("interim_sidecars"), rendered)
+        rendered = _listed_sidecars("output.interim_sidecars", output.get("interim_sidecars"), rendered, source_path)
     return {"argv": argv, "sidecars": rendered, "output_path": output_path}
 
 
-def _listed_sidecars(field, recorded, sidecars):
+def _listed_sidecars(field, recorded, sidecars, source_path):
     """The sidecars whose names `recorded` lists, in their rendered order (all when None); PlanError on a stranger."""
     if recorded is None:
         return sidecars
     names = [Path(entry["path"]).name for entry in sidecars]
     if any(name not in names for name in recorded):
-        raise PlanError("{} lists {} but the record's analysis gives {}; plan again with --replan".format(
-            field, ", ".join("'{}'".format(name) for name in recorded) or "none",
-            ", ".join("'{}'".format(name) for name in names) or "none"))
+        raise PlanError("{} lists {} but the record's analysis gives {}; plan it again with: vidfunnel plan "
+                        "--replan '{}'".format(field, ", ".join("'{}'".format(name) for name in recorded) or "none",
+                                               ", ".join("'{}'".format(name) for name in names) or "none",
+                                               source_path))
     return [entry for entry in sidecars if Path(entry["path"]).name in recorded]
 
 

@@ -3,10 +3,10 @@
 The only stage that ever touches an original file. For each source it checks,
 in this order (GUARDS): a usable record exists; its status is 'verified'; the
 source still matches the record's cheap fingerprint by content (size, first
-and last MiB; the time is not compared, but a source whose time is more than
-2 s from the recorded one is read in full once and its SHA-256 compared with
-source.sha256, the retire stage then noting 'source_mtime_differs' and
-'source_sha256_checked'); the output exists; the
+and last MiB) and its time is the recorded one or a coarser view of it
+(record.check_source); any other time has the whole source read once and
+its SHA-256 compared with source.sha256, and the retire stage notes
+'source_mtime_differs' and 'source_sha256_checked'; the output exists; the
 score is not in the 'hold' band and, without --allow-review, not in the
 'review' band; without --allow-larger, a re-encode's output is not larger
 than the source and the record does not carry 'output-larger' (with it,
@@ -43,17 +43,15 @@ stop file: its folder is forgotten for vidfunnel.stopfile.check_now
 moved, is never cut off by one and the item is not left half done.
 """
 
-VERSION = "20261109.3"
+VERSION = "20261109.4"
 
 import contextlib
-import hashlib
 import os
 import shutil
 import sys
 import types
 from pathlib import Path
 
-from vidfunnel.interrupt import check as check_interrupted
 from vidfunnel.interrupt import drain_after_item, drain_before_next
 from vidfunnel.progress import Progress, StageSummary, is_tty, say
 from vidfunnel.record import (
@@ -63,13 +61,12 @@ from vidfunnel.record import (
     add_flag,
     band,
     cheap_fingerprint,
+    check_source,
     fingerprint_differences,
     fingerprint_matches,
     iter_records,
     load_record,
     add_stage,
-    mtime_apart_ns,
-    mtime_difference,
     save_record,
     set_status,
     sha256_file,
@@ -97,9 +94,6 @@ COPY_BLOCK = 1024 * 1024
 DESTROY_WORD = "destroy"
 PAR2_STALE_FLAG = "par2-stale"
 PAR2_DEFAULT_REDUNDANCY = 10
-# A source whose time is further than this from the one recorded at plan is read in full before it
-# is moved (FAT and exFAT keep 2 s steps; SMB, NFS and other mounts differ by less).
-MTIME_TOLERANCE_NS = 2 * 1000 * 1000 * 1000
 
 
 class RetireRefused(Exception):
@@ -148,55 +142,10 @@ def _hash_output(path, size, progress, quiet):
     return sha256_file(path)
 
 
-def _beyond_tolerance(moved):
-    """True when an mtime_difference() result is unusable or more than MTIME_TOLERANCE_NS apart."""
-    if moved is None:
-        return False
-    apart = mtime_apart_ns(moved)
-    return apart is None or apart > MTIME_TOLERANCE_NS
-
-
-def _hash_source(paths, total, progress, quiet):
-    """Full SHA-256 of the files concatenated in order (one file: its own SHA-256), as plan hashed the source."""
-    digest = hashlib.sha256()
-    live = progress
-    if live is None and total > PROGRESS_THRESHOLD:
-        live = Progress("hash '{}'".format(paths[0].name), total=total, unit="B", quiet=quiet)
-    done = 0
-    try:
-        for path in paths:
-            with open(str(path), "rb") as handle:
-                while True:
-                    check_interrupted()
-                    block = handle.read(COPY_BLOCK)
-                    if not block:
-                        break
-                    digest.update(block)
-                    done += len(block)
-                    if live is not None:
-                        live.update(done)
-    finally:
-        if live is not None and progress is None:
-            live.finish()
-    return digest.hexdigest()
-
-
-def _check_source_hash(source, source_section, member_paths, total, progress, quiet):
-    """RetireRefused('source-changed') unless the full SHA-256 of the source equals source.sha256."""
-    expected = source_section.get("sha256")
-    if not isinstance(expected, str) or not expected:
-        raise RetireRefused("source-changed",
-                            "the time of source '{}' differs from the one recorded at plan by more than 2 s and "
-                            "the record has no source SHA-256 to compare its content with".format(source.name))
-    if not quiet:
-        say("  '{}': its time differs from the one recorded at plan by more than 2 s; reading it in full "
-            "({} bytes) to compare with the recorded SHA-256".format(source.name, total))
-    actual = _hash_source(member_paths, total, progress, quiet)
-    if actual.lower() != expected.lower():
-        raise RetireRefused("source-changed",
-                            "SHA-256 of source '{}' is {}, the record says {}; its time differs from the one "
-                            "recorded at plan by more than 2 s and its content changed; plan again with "
-                            "--replan".format(source.name, actual, expected))
+def _changed_advice(source, output_name):
+    """What resolves a source that changed after its output was made: move the output away, then plan the source."""
+    return ("the output '{}' was made from the earlier content; to convert the source as it is now, move '{}' "
+            "away and run: vidfunnel plan '{}'".format(output_name, output_name, source))
 
 
 # ---------------------------------------------------------------- guards
@@ -219,11 +168,12 @@ def check_eligible(source, record, allow_review=False, progress=None, quiet=Fals
     member of source.members, in order, for a 'vob-group' record, each of
     which must still match its own fingerprint ('source-changed' names the
     member) and whose sizes add up to the size 'output-larger' compares with.
-    When a source file's time is more than 2 s from the recorded one (or the
-    recorded time is unusable), the source is read in full once (a VOB group's
-    members concatenated in order) and its SHA-256 compared with
-    source.sha256; a difference, or no usable source.sha256, is
-    'source-changed'.
+    When a source file's time is neither the recorded one nor that one or
+    itself truncated to a coarser step (record.MTIME_STEPS_NS), or the recorded
+    time is unusable, the source is read in full once (a VOB group's members
+    concatenated in order) and its SHA-256 compared with source.sha256; a
+    difference, or no usable source.sha256, is 'source-changed'. Within one
+    process a second check of an unchanged file reuses that read.
     """
     source = Path(source)
 
@@ -274,44 +224,38 @@ def check_eligible(source, record, allow_review=False, progress=None, quiet=Fals
         raise RetireRefused("status-not-verified",
                             "status is 'verified' but the record already has a retire stage")
 
-    # source-changed: the content fields decide (size, first and last MiB); the time is not
-    # compared, except that a time more than MTIME_TOLERANCE_NS away from the recorded one has the
+    # source-changed: the content fields decide (size, first and last MiB), then the time
+    # (record.check_source): a time that is neither the recorded one nor a coarser view of it has the
     # whole source read once and compared with source.sha256 before anything is moved.
     if not source.is_file():
         raise RetireRefused("source-changed", "source '{}' is missing or not a regular file".format(source))
     current = cheap_fingerprint(source)
     if not fingerprint_matches(current, source_section.get("fingerprint")):
         raise RetireRefused("source-changed",
-                            "source '{}' no longer matches the fingerprint taken at plan time ({})".format(
+                            "source '{}' no longer matches the fingerprint taken at plan time ({}); {}".format(
                                 source.name, ", ".join(fingerprint_differences(source_section.get("fingerprint"),
-                                                                               current))))
+                                                                               current)),
+                                _changed_advice(source, interim_name or output_name)))
     folder = source.parent
     member_paths = [source]
-    source_size = current["size"]
-    times = [(source.name, mtime_difference(source_section.get("fingerprint"), current))]
+    files = [(source, source_section.get("fingerprint"))]
     if members is not None:
         member_paths = []
-        source_size = 0
-        times = []
+        files = []
         for member in members:
             member_path = folder / member["name"]
             if not member_path.is_file():
                 raise RetireRefused("source-changed", "VOB-group member '{}' is missing or not a regular file".format(
                     member_path))
-            member_print = cheap_fingerprint(member_path)
-            if not fingerprint_matches(member_print, member.get("fingerprint")):
-                raise RetireRefused("source-changed",
-                                    "VOB-group member '{}' no longer matches the fingerprint taken at plan time "
-                                    "({})".format(member["name"], ", ".join(
-                                        fingerprint_differences(member.get("fingerprint"), member_print))))
             member_paths.append(member_path)
-            source_size += member_print["size"]
-            times.append((member["name"], mtime_difference(member.get("fingerprint"), member_print)))
-    mtime_notes = [dict(name=name, **moved) for name, moved in times if moved is not None]
-    source_sha256_checked = False
-    if any(_beyond_tolerance(moved) for _name, moved in times):
-        _check_source_hash(source, source_section, member_paths, source_size, progress, quiet)
-        source_sha256_checked = True
+            files.append((member_path, member.get("fingerprint")))
+    check = check_source(files, source_section.get("sha256"), source.name, quiet=quiet, progress=progress)
+    if check.reason is not None:
+        if check.unreadable:
+            raise RetireRefused("source-changed", check.reason)
+        raise RetireRefused("source-changed", "{}; {}".format(check.reason,
+                                                              _changed_advice(source, interim_name or output_name)))
+    source_size = sum(fingerprint["size"] for fingerprint in check.prints)
 
     # output-missing
     final_output_path = folder / output_name
@@ -395,8 +339,8 @@ def check_eligible(source, record, allow_review=False, progress=None, quiet=Fals
         "members": member_paths,
         "larger": bool(larger or flagged),
         "sidecars": sidecars,
-        "source_mtime_differs": mtime_notes,
-        "source_sha256_checked": source_sha256_checked,
+        "source_mtime_differs": check.notes,
+        "source_sha256_checked": check.sha256_checked,
     }
 
 
@@ -696,8 +640,7 @@ def retire_one(source, record, root, quarantine_dir=None, destroy=False, allow_r
         stage.update(par2_outcome)
     if eligibility["source_mtime_differs"]:
         stage["source_mtime_differs"] = eligibility["source_mtime_differs"]
-    if eligibility["source_sha256_checked"]:
-        stage["source_sha256_checked"] = True
+        stage["source_sha256_checked"] = eligibility["source_sha256_checked"]
     add_stage(record, "retire", stage)
     if eligibility["larger"]:
         add_flag(record, ALLOWED_LARGER_FLAG)

@@ -5,6 +5,7 @@ VERSION = "20261109.4"
 import datetime
 import errno
 import hashlib
+import io
 import json
 import multiprocessing
 import os
@@ -22,6 +23,7 @@ from pathlib import Path
 
 import vidfunnel.interrupt
 import vidfunnel.record
+import vidfunnel.record as record_module
 from vidfunnel.record import (
     machine_id,
     machine_identity,
@@ -46,9 +48,10 @@ from vidfunnel.record import (
     fingerprint_matches,
     iter_records,
     load_folder,
+    check_source,
     load_record,
-    mtime_apart_ns,
     mtime_difference,
+    mtime_is_coarser_view,
     new_record,
     record_path,
     save_folder,
@@ -247,48 +250,171 @@ class FingerprintTests(TempDirCase):
         self.assertFalse(fingerprint_matches(fingerprint, {}))
 
 
-# The time one file shows on the planning host, and what other hosts' mounts report for it.
+# The time one file shows on the planning host, and what other mounts can show for it.
 PLANNED_MTIME_NS = 1700000001987654321
-OTHER_HOST_VIEWS = (
-    ("hundred-nanosecond steps", 1700000001987654300),
-    ("whole seconds", 1700000001000000000),
-    ("two-second steps", 1700000000000000000),
-    ("days later", PLANNED_MTIME_NS + 3 * 86400 * 1000 * 1000 * 1000),
+SECOND_NS = 1000 * 1000 * 1000
+STEPS = (("100 ns", 100), ("1 microsecond", 1000), ("1 ms", 1000 * 1000), ("10 ms", 10 * 1000 * 1000),
+         ("1 s", SECOND_NS), ("2 s", 2 * SECOND_NS))
+
+
+def truncated(value, step):
+    return value - value % step
+
+
+# (case, recorded time, seen time): one is the other truncated to a coarser step, in both directions.
+COARSER_VIEWS = ([("seen truncated to " + name, PLANNED_MTIME_NS, truncated(PLANNED_MTIME_NS, step))
+                  for name, step in STEPS]
+                 + [("recorded truncated to " + name, truncated(PLANNED_MTIME_NS, step), PLANNED_MTIME_NS)
+                    for name, step in STEPS])
+# (case, recorded time, seen time): differences that no truncation explains.
+OTHER_TIMES = (
+    ("one second later", PLANNED_MTIME_NS, PLANNED_MTIME_NS + SECOND_NS),
+    ("one and a half seconds later", PLANNED_MTIME_NS, PLANNED_MTIME_NS + 3 * SECOND_NS // 2),
+    ("rounded up to the second", PLANNED_MTIME_NS, truncated(PLANNED_MTIME_NS, SECOND_NS) + SECOND_NS),
+    ("three days later", PLANNED_MTIME_NS, PLANNED_MTIME_NS + 3 * 86400 * SECOND_NS),
 )
 
 
 class FingerprintTimeTests(TempDirCase):
-    """The content fields decide; the time is reported apart (another mount's resolution, a restore)."""
+    """Content decides first; then the time, accepted only as a coarser view; anything else by a full read."""
 
-    def planned(self):
-        path = write_bytes(self.base / "large.bin", os.urandom(3 * MIB))
-        os.utime(str(path), ns=(PLANNED_MTIME_NS, PLANNED_MTIME_NS))
-        return path, cheap_fingerprint(path)
+    def planned(self, word, recorded_ns=PLANNED_MTIME_NS):
+        """A 3 MiB file fingerprinted at recorded_ns; (path, fingerprint, full SHA-256)."""
+        path = write_bytes(self.base / "{}.bin".format(word), os.urandom(3 * MIB))
+        os.utime(str(path), ns=(recorded_ns, recorded_ns))
+        return path, cheap_fingerprint(path), sha256_file(path)
 
-    def test_a_time_that_differs_alone_still_matches_and_is_reported(self):
-        path, recorded = self.planned()
-        self.assertEqual(recorded["mtime_ns"], PLANNED_MTIME_NS)
-        for view, seen_ns in OTHER_HOST_VIEWS:
-            with self.subTest(view=view):
+    def check(self, path, recorded, sha):
+        with mock.patch("vidfunnel.record.full_sha256", wraps=record_module.full_sha256) as hasher:
+            result = check_source([(path, recorded)], sha, path.name, quiet=True)
+        return result, hasher
+
+    def test_a_coarser_view_in_either_direction_is_the_same_time(self):
+        self.assertTrue(mtime_is_coarser_view(PLANNED_MTIME_NS, PLANNED_MTIME_NS))
+        for case, recorded_ns, seen_ns in COARSER_VIEWS:
+            with self.subTest(case=case):
+                self.assertTrue(mtime_is_coarser_view(recorded_ns, seen_ns))
+        for case, recorded_ns, seen_ns in OTHER_TIMES:
+            with self.subTest(case=case):
+                self.assertFalse(mtime_is_coarser_view(recorded_ns, seen_ns))
+        for value in (None, "1700000001987654321", 1.7e18, True, float("nan")):
+            with self.subTest(value=value):
+                self.assertFalse(mtime_is_coarser_view(value, PLANNED_MTIME_NS))
+
+    def test_a_coarser_view_is_unchanged_without_a_read(self):
+        for case, recorded_ns, seen_ns in COARSER_VIEWS:
+            with self.subTest(case=case):
+                path, recorded, sha = self.planned("view_" + case.replace(" ", "_"), recorded_ns)
                 os.utime(str(path), ns=(seen_ns, seen_ns))
-                seen = cheap_fingerprint(path)
-                self.assertEqual(seen["mtime_ns"], seen_ns)
-                self.assertTrue(fingerprint_matches(recorded, seen))
-                self.assertEqual(fingerprint_differences(recorded, seen), [])
-                self.assertFalse(fingerprint_identical(recorded, seen))
-                difference = mtime_difference(recorded, seen)
-                self.assertEqual(difference, {"recorded": PLANNED_MTIME_NS, "seen": seen_ns})
-                self.assertEqual(mtime_apart_ns(difference), abs(seen_ns - PLANNED_MTIME_NS))
+                result, hasher = self.check(path, recorded, sha)
+                hasher.assert_not_called()
+                self.assertIsNone(result.reason)
+                self.assertEqual(result.notes, [{"name": path.name, "recorded": recorded_ns, "seen": seen_ns}])
+                self.assertEqual(result.stage_notes(), {"source_mtime_differs": result.notes,
+                                                        "source_sha256_checked": False})
 
-    def test_the_same_time_is_no_difference(self):
-        path, recorded = self.planned()
-        seen = cheap_fingerprint(path)
-        self.assertTrue(fingerprint_identical(recorded, seen))
-        self.assertIsNone(mtime_difference(recorded, seen))
-        self.assertEqual(mtime_apart_ns(None), 0)
+    def test_the_same_time_reads_nothing_and_notes_nothing(self):
+        path, recorded, sha = self.planned("unmoved")
+        result, hasher = self.check(path, recorded, sha)
+        hasher.assert_not_called()
+        self.assertIsNone(result.reason)
+        self.assertEqual(result.stage_notes(), {})
+
+    def test_another_time_with_the_same_content_is_settled_by_one_read(self):
+        for case, recorded_ns, seen_ns in OTHER_TIMES:
+            with self.subTest(case=case):
+                path, recorded, sha = self.planned(case.replace(" ", "_"), recorded_ns)
+                os.utime(str(path), ns=(seen_ns, seen_ns))
+                result, hasher = self.check(path, recorded, sha)
+                self.assertEqual(hasher.call_count, 1)
+                self.assertIsNone(result.reason)
+                self.assertTrue(result.sha256_checked)
+                self.assertEqual(result.sha256, sha)
+
+    def test_another_time_with_a_changed_middle_is_changed(self):
+        for case, recorded_ns, seen_ns in OTHER_TIMES:
+            with self.subTest(case=case):
+                path, recorded, sha = self.planned("middle_" + case.replace(" ", "_"), recorded_ns)
+                flip_byte(path, int(1.5 * MIB))
+                os.utime(str(path), ns=(seen_ns, seen_ns))
+                self.assertTrue(fingerprint_matches(recorded, cheap_fingerprint(path)))
+                result, hasher = self.check(path, recorded, sha)
+                self.assertEqual(hasher.call_count, 1)
+                self.assertEqual(result.reason, "SHA-256 of '{}' is {}, the record says {}".format(
+                    path.name, sha256_file(path), sha))
+
+    def test_another_time_without_a_recorded_hash_is_changed_without_a_read(self):
+        path, recorded, _sha = self.planned("unhashed")
+        os.utime(str(path), ns=(PLANNED_MTIME_NS + SECOND_NS, PLANNED_MTIME_NS + SECOND_NS))
+        result, hasher = self.check(path, recorded, None)
+        hasher.assert_not_called()
+        self.assertIn("no source SHA-256", result.reason)
+
+    def test_an_unusable_recorded_time_is_settled_by_a_read(self):
+        path, recorded, sha = self.planned("edited_time")
+        for value in (None, "yesterday", 1.7e18, True):
+            with self.subTest(value=value):
+                edited = dict(recorded, mtime_ns=value)
+                result, hasher = self.check(path, edited, sha)
+                self.assertTrue(fingerprint_matches(edited, cheap_fingerprint(path)))
+                self.assertIsNone(result.reason)
+                self.assertTrue(result.sha256_checked)
+
+    def test_a_second_check_of_the_same_file_reuses_the_read_until_it_is_touched(self):
+        path, recorded, sha = self.planned("checked_twice")
+        os.utime(str(path), ns=(PLANNED_MTIME_NS + SECOND_NS, PLANNED_MTIME_NS + SECOND_NS))
+        self.assertEqual(self.check(path, recorded, sha)[1].call_count, 1)
+        result, hasher = self.check(path, recorded, sha)
+        hasher.assert_not_called()
+        self.assertIsNone(result.reason)
+        self.assertTrue(result.sha256_checked)
+        flip_byte(path, int(1.5 * MIB))    # same size, ends and time; the inode change time moves
+        result, hasher = self.check(path, recorded, sha)
+        self.assertEqual(hasher.call_count, 1)
+        self.assertIn("SHA-256 of", result.reason)
+
+    def test_a_file_written_while_it_is_read_is_changed(self):
+        path, recorded, sha = self.planned("written_meanwhile")
+        os.utime(str(path), ns=(PLANNED_MTIME_NS + SECOND_NS, PLANNED_MTIME_NS + SECOND_NS))
+        real = record_module.full_sha256
+
+        def read_then_touch(*arguments, **options):
+            digest = real(*arguments, **options)
+            os.utime(str(path), ns=(PLANNED_MTIME_NS + 2 * SECOND_NS, PLANNED_MTIME_NS + 2 * SECOND_NS))
+            return digest
+
+        with mock.patch("vidfunnel.record.full_sha256", side_effect=read_then_touch):
+            result = check_source([(path, recorded)], sha, path.name, quiet=True)
+        self.assertEqual(result.reason, "'{}' changed while it was being read".format(path.name))
+
+    def test_a_vob_group_is_read_as_its_members_in_order(self):
+        first, first_print, _ = self.planned("first_member")
+        second, second_print, _ = self.planned("second_member")
+        joined = hashlib.sha256(first.read_bytes() + second.read_bytes()).hexdigest()
+        os.utime(str(second), ns=(PLANNED_MTIME_NS + SECOND_NS, PLANNED_MTIME_NS + SECOND_NS))
+        with mock.patch("vidfunnel.record.full_sha256", wraps=record_module.full_sha256) as hasher:
+            result = check_source([(first, first_print), (second, second_print)], joined, "group", quiet=True)
+        self.assertIsNone(result.reason)
+        self.assertEqual(hasher.call_args[0][0], (os.path.abspath(str(first)), os.path.abspath(str(second))))
+        self.assertEqual([note["name"] for note in result.notes], [second.name])
+
+    def test_a_large_read_is_announced_with_live_progress(self):
+        path, recorded, sha = self.planned("announced")
+        os.utime(str(path), ns=(PLANNED_MTIME_NS + SECOND_NS, PLANNED_MTIME_NS + SECOND_NS))
+        stream = io.StringIO()
+        with mock.patch.object(record_module, "FULL_HASH_PROGRESS_BYTES", MIB):
+            check_source([(path, recorded)], sha, path.name, stream=stream)
+        text = stream.getvalue()
+        self.assertIn("  reading '{}' in full (3.0 MiB): its modification time is neither the recorded one nor a "
+                      "coarser view of it; comparing its SHA-256 with the record's".format(path.name), text)
+        self.assertIn("[sha256] 3.0 MiB / 3.0 MiB  100.0 %", text)
+        stream = io.StringIO()
+        os.utime(str(path), ns=(PLANNED_MTIME_NS + 2 * SECOND_NS, PLANNED_MTIME_NS + 2 * SECOND_NS))
+        check_source([(path, recorded)], sha, path.name, stream=stream)
+        self.assertNotIn("[sha256]", stream.getvalue())
 
     def test_each_content_field_is_named_when_it_differs(self):
-        path, recorded = self.planned()
+        path, recorded, _sha = self.planned("fields")
         flip_byte(path, 0)
         self.assertEqual(fingerprint_differences(recorded, cheap_fingerprint(path)), ["first MiB differs"])
         flip_byte(path, 0)
@@ -304,32 +430,20 @@ class FingerprintTimeTests(TempDirCase):
 
     def test_a_record_written_before_the_rule_reads_the_same(self):
         # The fingerprint shape is unchanged: the four fields, mtime_ns stored as before.
-        path, recorded = self.planned()
+        path, recorded, _sha = self.planned("older")
         self.assertEqual(sorted(recorded), ["head_sha256", "mtime_ns", "size", "tail_sha256"])
         older = json.loads(json.dumps(recorded))
         self.assertTrue(fingerprint_matches(older, cheap_fingerprint(path)))
 
-    def test_an_unusable_recorded_time_counts_as_different(self):
-        path, recorded = self.planned()
-        seen = cheap_fingerprint(path)
-        for value in (None, "1700000001987654321", 1.7e18, True, float("nan")):
-            with self.subTest(value=value):
-                edited = dict(recorded, mtime_ns=value)
-                if value is None:
-                    del edited["mtime_ns"]
-                self.assertTrue(fingerprint_matches(edited, seen))
-                difference = mtime_difference(edited, seen)
-                self.assertIsNotNone(difference)
-                self.assertIsNone(mtime_apart_ns(difference))
-                self.assertFalse(fingerprint_identical(edited, seen))
-
     def test_a_missing_or_malformed_fingerprint_is_named(self):
-        path, recorded = self.planned()
+        path, recorded, _sha = self.planned("malformed")
         self.assertEqual(fingerprint_differences(None, recorded), ["no fingerprint recorded"])
         self.assertEqual(fingerprint_differences(["size"], recorded), ["no fingerprint recorded"])
         self.assertEqual(fingerprint_differences(recorded, None), ["no fingerprint taken"])
         self.assertFalse(fingerprint_matches(["size"], recorded))
         self.assertFalse(fingerprint_matches(dict(recorded, head_sha256=None), recorded))
+        self.assertTrue(fingerprint_identical(recorded, cheap_fingerprint(path)))
+        self.assertIsNone(mtime_difference(recorded, cheap_fingerprint(path)))
 
 
 class Sha256Tests(TempDirCase):

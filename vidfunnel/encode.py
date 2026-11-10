@@ -50,16 +50,17 @@ What convert writes into the record:
   run), status 'converted' (or 'verified' once verify has run);
 - flags 'output-larger', 'remux-larger', 'sidecar-failed', 'par2-skipped', 'par2-failed'
   as they apply;
-- stages.convert.source_mtime_differs, [{'name', 'recorded', 'seen'}], when a
-  source file's content matches its fingerprint (size, first and last MiB)
-  and its modification time alone differs from the one recorded at plan,
-  as one file seen through another mount or after a restore does.
+- stages.convert.source_mtime_differs, [{'name', 'recorded', 'seen'}], and
+  source_sha256_checked (whether the whole source was read) when a source
+  file's modification time is not the one recorded at plan.
 
-A source whose content differs from its fingerprint is skipped (counted
-skipped) and its record left as it is, with a reason naming the file and
-what differs: plan again with --replan. Before 20261109.3 convert set the
-status and flag 'source-changed' instead; records carrying them are read
-as before.
+The source is checked by record.check_source before anything is written:
+size and first and last MiB as recorded, and each time the recorded one or
+a coarser view of it, or else the whole source read once with the recorded
+SHA-256. A source that changed is skipped (counted skipped) and its record
+left as it is, with a reason naming the file, what differs and the command
+that plans it again. Before 20261109.3 convert set the status and flag
+'source-changed' instead; records carrying them are read as before.
 
 With --refit, convert revisits converted or verified re-encodes flagged
 'output-larger' instead (see refit_one): one more encode at a higher CRF,
@@ -84,7 +85,7 @@ whose output still matches its fingerprint (content only, the time is not
 compared) is reported as already converted.
 """
 
-VERSION = "20261109.3"
+VERSION = "20261109.4"
 
 import math
 import os
@@ -114,7 +115,7 @@ from vidfunnel.record import (
     add_flag,
     add_stage,
     cheap_fingerprint,
-    fingerprint_differences,
+    check_source,
     fingerprint_matches,
     held_lock_fds,
     iter_records,
@@ -226,33 +227,42 @@ def _source_files(folder, record):
     return [(folder / source.get("name"), source.get("fingerprint"))]
 
 
-def source_change(folder, record):
-    """(reason, mtime_notes) for the record's source files against the fingerprints taken at plan.
+def _source_path(folder, record):
+    """The path 'vidfunnel plan' takes for this record's source: the file, a VOB group's first member, a DVD folder."""
+    return Path(folder) / str((record.get("source") or {}).get("name"))
 
-    reason is None when every source file still has the recorded size and
-    first and last MiB (record.fingerprint_matches; the time is not compared),
-    else it names the file and what differs. mtime_notes lists {'name',
-    'recorded', 'seen'} for each file whose modification time differs from
-    the recorded one (another mount's time resolution, a restore); [] when
-    there is a reason.
+
+def plan_again_advice(folder, record):
+    """The command that plans this record's changed source again, and only it: 'vidfunnel plan' on its path."""
+    return "plan it again with: vidfunnel plan '{}'".format(_source_path(folder, record))
+
+
+def changed_after_convert_advice(folder, record, output_name):
+    """What resolves a source that changed after its output was made: move the output away, then plan the source."""
+    return ("the output '{}' was made from the earlier content; to convert the source as it is now, move '{}' "
+            "away and run: vidfunnel plan '{}'".format(output_name, output_name, _source_path(folder, record)))
+
+
+def source_change(folder, record, advice, stream=None, quiet=False):
+    """(reason, notes) for the record's source files against the fingerprints taken at plan (record.check_source).
+
+    reason is None when the source is unchanged: size and first and last MiB
+    as recorded, and each time the recorded one or a coarser view of it, or
+    else the whole source read once with the SHA-256 the record holds. Else
+    it is 'source changed since plan: ' with what differs and `advice` (the
+    command that resolves it), or says which file cannot be read. notes is {}
+    or, when a time differs, {'source_mtime_differs': [{'name', 'recorded',
+    'seen'}], 'source_sha256_checked': bool}.
     """
     files = _source_files(folder, record)
     if not files:
-        return "the record lists no source files", []
-    notes = []
-    for path, recorded in files:
-        try:
-            current = cheap_fingerprint(path)
-        except OSError as error:
-            return "'{}' cannot be read: {}".format(path.name, error), []
-        differences = fingerprint_differences(recorded, current)
-        if differences:
-            return "'{}' differs from the fingerprint taken at plan ({})".format(
-                path.name, ", ".join(differences)), []
-        moved = mtime_difference(recorded, current)
-        if moved is not None:
-            notes.append(dict(name=path.name, **moved))
-    return None, notes
+        return "the record lists no source files", {}
+    check = check_source(files, (record.get("source") or {}).get("sha256"), _label(record), stream, quiet)
+    if check.unreadable:
+        return check.reason, {}
+    if check.reason is not None:
+        return "source changed since plan: {}; {}".format(check.reason, advice), {}
+    return None, check.stage_notes()
 
 
 def skip_reason(record, output_path):
@@ -276,14 +286,16 @@ def _refusal(record, folder, output_path):
     status = record.get("status")
     if status != "planned":
         if status in DONE_STATUSES:
-            return ("status is '{}' but the output '{}' is missing or changed since; "
-                    "plan again with --replan to convert again".format(status, output_path.name))
+            return ("status is '{}' but the output '{}' is missing or changed since; to convert again, plan it "
+                    "again with: vidfunnel plan --replan '{}'".format(status, output_path.name,
+                                                                      _source_path(folder, record)))
         return "status is '{}', not 'planned'".format(status)
     action = record.get("action")
     if not isinstance(action, str) or action not in ACTION_WORDS:
         return "action is '{}', not remux or reencode".format(action)
     if "convert" in (record.get("stages") or {}):
-        return "the record already has a convert stage; plan again with --replan"
+        return "the record already has a convert stage; plan it again with: vidfunnel plan --replan '{}'".format(
+            _source_path(folder, record))
     return None
 
 
@@ -574,14 +586,12 @@ def convert_one(tools, source, record, options, progress=None, position=None, to
         say("skipping '{}': {}".format(label, reason), stream)
         return {"outcome": "skipped", "skipped": reason}
 
-    # A source whose content differs is skipped and its record left as it is; the person
-    # decides with plan --replan. A time that differs alone is noted in this stage.
-    changed, mtime_notes = source_change(folder, record)
-    if changed is not None:
-        reason = "source changed since plan: {}; plan again with --replan".format(changed)
+    # A source that changed is skipped and its record left as it is; plan re-plans it. A time
+    # that differs is noted in this stage, with whether the whole source was read.
+    reason, noted = source_change(folder, record, plan_again_advice(folder, record), stream, quiet)
+    if reason is not None:
         say("skipping '{}': {}".format(label, reason), stream)
         return {"outcome": "skipped", "skipped": reason}
-    noted = {"source_mtime_differs": mtime_notes} if mtime_notes else {}
 
     if output_path.exists() and not _ours(tools, output_path, record):
         error = "'{}' exists and is not this record's output (no matching vidfunnel tag); not overwritten".format(
@@ -834,12 +844,13 @@ def refit_argv(argv, crf, denoise, output, cadence_filter=None):
     return argv, new_chain
 
 
-def _refit_disk_problem(folder, record, output_path):
+def _refit_disk_problem(folder, record, output_path, stream=None, quiet=False):
     """(problem or None, output_size, source_size, notes): the files on disk against the record's convert stage.
 
-    notes holds source_mtime_differs and output_mtime_differs ([{'name',
-    'recorded', 'seen'}]) when a file's content matches and its time alone
-    differs; refit_one writes them into stages.refit.
+    The source is checked as convert checks it (source_change). notes holds
+    source_mtime_differs and source_sha256_checked (source_change) and
+    output_mtime_differs ([{'name', 'recorded', 'seen'}], the output's content
+    matching) when a time differs; refit_one writes them into stages.refit.
     """
     convert = (record.get("stages") or {}).get("convert") or {}
     source_size = convert.get("source_size") or (record.get("source") or {}).get("size")
@@ -857,10 +868,11 @@ def _refit_disk_problem(folder, record, output_path):
     recorded = (record.get("output") or {}).get("fingerprint")
     if recorded and not fingerprint_matches(recorded, current):
         return "output '{}' no longer matches its recorded fingerprint".format(output_path.name), size, source_size, {}
-    changed, mtime_notes = source_change(folder, record)
+    changed, noted = source_change(folder, record, changed_after_convert_advice(folder, record, output_path.name),
+                                   stream, quiet)
     if changed is not None:
-        return "source changed since plan: {}; plan again with --replan".format(changed), size, source_size, {}
-    noted = {"source_mtime_differs": mtime_notes} if mtime_notes else {}
+        return changed, size, source_size, {}
+    noted = dict(noted)
     if recorded:
         moved = mtime_difference(recorded, current)
         if moved is not None:
@@ -938,7 +950,7 @@ def refit_checks(tools, record, path):
     return None
 
 
-def refit_plan(tools, record, folder):
+def refit_plan(tools, record, folder, stream=None, quiet=False):
     """(plan dict or None, skip reason or None) for one record; reads the files, writes nothing.
 
     The command is rendered here (as convert renders it, with the same value
@@ -961,7 +973,7 @@ def refit_plan(tools, record, folder):
     base_crf, base_field, problem = refit_base_crf(record)
     if problem is not None:
         return None, problem
-    problem, output_size, source_size, mtime_notes = _refit_disk_problem(folder, record, output_path)
+    problem, output_size, source_size, mtime_notes = _refit_disk_problem(folder, record, output_path, stream, quiet)
     if problem is not None:
         return None, problem
     ratio = float(output_size) / source_size
@@ -1022,7 +1034,7 @@ def refit_one(tools, source, record, options, progress=None, position=None, tota
     key = Path(os.path.abspath(os.fspath(source)))
     folder = key.parent
     label = _label(record)
-    plan, reason = refit_plan(tools, record, folder)
+    plan, reason = refit_plan(tools, record, folder, stream, quiet)
     if plan is None:
         say("skipping '{}': {}".format(label, reason), stream)
         return "skipped", reason
@@ -1180,7 +1192,7 @@ def _refit_dry_run(tools, entries, stream):
     total = len(entries)
     shown = 0
     for position, (key, folder, record) in enumerate(entries, 1):
-        plan, reason = refit_plan(tools, record, folder)
+        plan, reason = refit_plan(tools, record, folder, stream)
         if plan is None:
             say("[refit {}/{}] would skip '{}': {}".format(position, total, _label(record), reason), stream)
             continue

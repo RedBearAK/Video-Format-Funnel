@@ -297,12 +297,15 @@ def cheap_fingerprint(path):
     }
 
 
-FINGERPRINT_KEYS = ("size", "mtime_ns", "head_sha256", "tail_sha256")
-# What decides whether a file is unchanged. The mtime is stored but not compared: one file seen
-# through SMB (100 ns steps), NFS (whole seconds on some servers), FAT or exFAT (2 s) or after a
-# restore reports another time than the machine that fingerprinted it saw (mtime_difference).
+# What decides whether a file is unchanged: its size and the first and last MiB (CONTENT_KEYS),
+# then its modification time (check_source). The same file seen through another mount, or
+# restored, can show its time at a coarser step; such a time is accepted without a read only when
+# it is the other one truncated to one of MTIME_STEPS_NS. Any other difference is settled by
+# reading the whole file and comparing its SHA-256 with the record's.
 CONTENT_KEYS = ("size", "head_sha256", "tail_sha256")
 _CONTENT_WORDS = {"head_sha256": "first MiB", "tail_sha256": "last MiB"}
+MTIME_STEPS_NS = (100, 1000, 1000 * 1000, 10 * 1000 * 1000, 1000 * 1000 * 1000, 2 * 1000 * 1000 * 1000)
+FULL_HASH_PROGRESS_BYTES = 32 * MIB      # a full read shows live progress above this size
 
 
 def fingerprint_matches(first, second):
@@ -347,19 +350,159 @@ def mtime_difference(recorded, seen):
     return {"recorded": recorded_ns, "seen": seen_ns}
 
 
-def mtime_apart_ns(difference):
-    """|seen - recorded| in ns of an mtime_difference() result (0 for None); None when either side is not an integer."""
-    if difference is None:
-        return 0
-    recorded_ns = difference.get("recorded")
-    seen_ns = difference.get("seen")
-    if not _whole_number(recorded_ns) or not _whole_number(seen_ns):
-        return None
-    return abs(seen_ns - recorded_ns)
+def mtime_is_coarser_view(first_ns, second_ns):
+    """True when two mtimes are equal or one is the other truncated to a step of MTIME_STEPS_NS.
+
+    Truncation only (coarse == fine - fine % step), in either direction; no
+    rounding and no tolerance. False when either is not an integer.
+    """
+    if not _whole_number(first_ns) or not _whole_number(second_ns):
+        return False
+    if first_ns == second_ns:
+        return True
+    for step in MTIME_STEPS_NS:
+        if first_ns == second_ns - second_ns % step or second_ns == first_ns - first_ns % step:
+            return True
+    return False
+
+
+def fingerprint_same_file(recorded, seen):
+    """fingerprint_matches, and the mtimes are equal or one is a coarser view of the other (mtime_is_coarser_view)."""
+    return fingerprint_matches(recorded, seen) and mtime_is_coarser_view(recorded.get("mtime_ns"),
+                                                                          seen.get("mtime_ns"))
 
 
 def _whole_number(value):
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def full_sha256(paths, label, stream=None, quiet=False, progress=None):
+    """SHA-256 of the files concatenated in order (one file: its own), as plan hashes a source.
+
+    Announces the read on `stream` unless quiet, and shows a live progress
+    line above FULL_HASH_PROGRESS_BYTES; `progress`, when given, is a
+    Progress-like object that receives the byte counts instead.
+    """
+    from vidfunnel.progress import Progress, format_bytes, say
+    total = sum(os.path.getsize(str(path)) for path in paths)
+    if not quiet:
+        say("  reading '{}' in full ({}): its modification time is neither the recorded one nor a coarser view "
+            "of it; comparing its SHA-256 with the record's".format(label, format_bytes(total)), stream)
+    digest = hashlib.sha256()
+    live = progress
+    if live is None and total > FULL_HASH_PROGRESS_BYTES:
+        live = Progress("sha256", total=total, unit="B", stream=stream, quiet=quiet)
+    done = 0
+    try:
+        for path in paths:
+            with open(str(path), "rb") as handle:
+                while True:
+                    check_interrupted()
+                    block = handle.read(HASH_BLOCK)
+                    if not block:
+                        break
+                    digest.update(block)
+                    done += len(block)
+                    if live is not None:
+                        live.update(done)
+    finally:
+        if live is not None and progress is None:
+            live.finish()
+    return digest.hexdigest()
+
+
+class SourceCheck(object):
+    """What check_source found: reason (None when unchanged), notes, sha256_checked, prints, sha256, unreadable."""
+
+    def __init__(self, reason, notes, sha256_checked, prints, sha256=None, unreadable=False):
+        self.reason = reason
+        self.unreadable = unreadable
+        self.notes = notes
+        self.sha256_checked = sha256_checked
+        self.prints = prints
+        self.sha256 = sha256
+
+    def stage_notes(self):
+        """{'source_mtime_differs': [...], 'source_sha256_checked': bool} when a time differs, else {}."""
+        if not self.notes:
+            return {}
+        return {"source_mtime_differs": self.notes, "source_sha256_checked": self.sha256_checked}
+
+
+# Full hashes read in this process, so one run that checks a source twice (retire's confirmation
+# list and the retire itself) reads it once: {paths: (identities before and after the read, digest)}.
+# An identity holds the fingerprint and the inode's device, number and ctime, so a file written or
+# touched since is read again.
+_full_hash_memo = {}
+_full_hash_memo_lock = threading.Lock()
+
+
+def _identities(paths, prints):
+    found = []
+    for path, fingerprint in zip(paths, prints):
+        status = os.stat(str(path))
+        found.append((status.st_dev, status.st_ino, status.st_ctime_ns, fingerprint.get("size"),
+                      fingerprint.get("mtime_ns"), fingerprint.get("head_sha256"), fingerprint.get("tail_sha256")))
+    return tuple(found)
+
+
+def check_source(files, recorded_sha256, label, stream=None, quiet=False, progress=None):
+    """Compare a source's files with their recorded fingerprints; a SourceCheck.
+
+    files: [(path, recorded fingerprint)] in source order (a VOB group's
+    members; one entry otherwise). A file whose size or first or last MiB
+    differs is changed. When every time is the recorded one or a coarser view
+    of it (mtime_is_coarser_view), the source is unchanged without a read.
+    Otherwise the files are read once in full, concatenated in order
+    (full_sha256), and the source is unchanged only when that SHA-256 equals
+    recorded_sha256; without one it is changed. notes lists {'name',
+    'recorded', 'seen'} for each file whose time is not the recorded one.
+    """
+    prints = []
+    notes = []
+    settle = False
+    for path, recorded in files:
+        path = Path(path)
+        try:
+            current = cheap_fingerprint(path)
+        except OSError as error:
+            return SourceCheck("'{}' cannot be read: {}".format(path.name, error), [], False, prints, unreadable=True)
+        differences = fingerprint_differences(recorded, current)
+        if differences:
+            return SourceCheck("'{}' differs from the fingerprint taken at plan ({})".format(
+                path.name, ", ".join(differences)), [], False, prints)
+        prints.append(current)
+        moved = mtime_difference(recorded, current)
+        if moved is not None:
+            notes.append(dict(name=path.name, **moved))
+            if not mtime_is_coarser_view(moved["recorded"], moved["seen"]):
+                settle = True
+    if not settle:
+        return SourceCheck(None, notes, False, prints)
+    if not isinstance(recorded_sha256, str) or not recorded_sha256:
+        return SourceCheck("the modification time of '{}' is neither the recorded one nor a coarser view of it, "
+                           "and the record has no source SHA-256 to compare its content with".format(label),
+                           notes, False, prints)
+    paths = tuple(os.path.abspath(str(path)) for path, _recorded in files)
+    try:
+        before = _identities(paths, prints)
+        with _full_hash_memo_lock:
+            known = _full_hash_memo.get(paths)
+        if known is not None and known[0] == before:
+            digest = known[1]
+        else:
+            digest = full_sha256(paths, label, stream, quiet, progress)
+            after = _identities(paths, [cheap_fingerprint(path) for path in paths])
+            if after != before:
+                return SourceCheck("'{}' changed while it was being read".format(label), notes, True, prints)
+            with _full_hash_memo_lock:
+                _full_hash_memo[paths] = (before, digest)
+    except OSError as error:
+        return SourceCheck("'{}' cannot be read: {}".format(label, error), notes, False, prints, unreadable=True)
+    if digest.lower() != recorded_sha256.lower():
+        return SourceCheck("SHA-256 of '{}' is {}, the record says {}".format(label, digest, recorded_sha256),
+                           notes, True, prints, digest)
+    return SourceCheck(None, notes, True, prints, digest)
 
 
 def sha256_file(path, progress=None):
