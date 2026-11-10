@@ -7,7 +7,7 @@ fixture folder itself is never planned) and skip with a message when
 ffmpeg or the fixtures are missing.
 """
 
-VERSION = "20261110"
+VERSION = "20261110.1"
 
 import contextlib
 import copy
@@ -1065,15 +1065,25 @@ class PlanRunTest(unittest.TestCase):
         real_enter = vidfunnel.turns.FolderTurns.enter
         real_lock = vidfunnel.turns.FolderLock
         acquired = []
+        first_released = threading.Event()
 
         class LoggedLock(real_lock):
             def acquire(self):
                 acquired.append(Path(self.folder).name)
                 return super().acquire()
 
+            def release(self):
+                result = super().release()
+                if Path(self.folder).name == "first":
+                    first_released.set()  # after the first folder's last group ended and its file was updated
+                return result
+
         def enter(turns, folder):
-            # The group was handed out before the drain; the drain begins before its folder is entered.
+            # The group was handed out before the drain; the drain begins before its folder is entered, and
+            # only once the first folder is done, whichever worker reaches the second folder first.
             if Path(folder).name == "second":
+                if not first_released.wait(30):
+                    raise AssertionError("the first folder was not released within 30 s")
                 vidfunnel.interrupt.draining.set()
             return real_enter(turns, folder)
 
@@ -1100,6 +1110,7 @@ class PlanRunTest(unittest.TestCase):
                 vidfunnel.interrupt.drain_tally.reset()
                 acquired.clear()
                 planned.clear()
+                first_released.clear()
                 progress = quiet()
                 with mock.patch("vidfunnel.plan._plan_entry", side_effect=fake_entry), \
                         mock.patch.object(vidfunnel.turns.FolderTurns, "enter", enter), \
@@ -1110,6 +1121,7 @@ class PlanRunTest(unittest.TestCase):
                 self.assertTrue(vidfunnel.interrupt.draining.is_set())
                 self.assertEqual(sorted(planned), ["harbour.avi", "jetty.avi"], text)
                 self.assertEqual(acquired, ["first"], text)
+                self.assertFalse((self.root / "first" / ".vidfunnel" / "lock").exists())
                 self.assertEqual((summary.counts["failed"], summary.counts["skipped"]), (2, 0), text)
                 self.assertTrue(tally.seen)
                 self.assertEqual(tally.left, 3, "the second folder's three files are left: {}".format(text))
@@ -1118,6 +1130,68 @@ class PlanRunTest(unittest.TestCase):
                 for name in ("meadow.avi", "movie.avi", "movie.mkv"):
                     self.assertFalse(record_path(self.root / "second" / name).exists(), name)
                 self.assertNotIn("skipping folder", text)
+
+    def test_jobs_a_drain_before_the_first_folder_is_entered_starts_no_group_and_leaves_every_file_counted(self):
+        from unittest import mock
+        import vidfunnel.interrupt
+        import vidfunnel.plan
+        import vidfunnel.turns
+        self.addCleanup(vidfunnel.interrupt.drain_tally.reset)
+        self.addCleanup(vidfunnel.interrupt.draining.clear)
+        vidfunnel.interrupt.draining.clear()
+        vidfunnel.interrupt.drain_tally.reset()
+        real_enter = vidfunnel.turns.FolderTurns.enter
+        real_lock = vidfunnel.turns.FolderLock
+        acquired = []
+
+        class LoggedLock(real_lock):
+            def acquire(self):
+                acquired.append(Path(self.folder).name)
+                return super().acquire()
+
+        def enter(turns, folder):
+            # Both groups of the first folder were handed out, but neither enters it before the third worker,
+            # which took the second folder's first group, has started the drain.
+            if Path(folder).name == "first":
+                if not vidfunnel.interrupt.draining.wait(30):
+                    raise AssertionError("the drain did not begin within 30 s")
+            else:
+                vidfunnel.interrupt.draining.set()
+            return real_enter(turns, folder)
+
+        planned = []
+
+        def fake_entry(tools, work, found, options, folder_sources, capabilities, progress, stream, position, total,
+                       record_lock=None):
+            planned.append(work.source.name)
+            return "failed", None
+
+        for folder in ("first", "second"):
+            (self.root / folder).mkdir()
+        self.copy_fixture("xvid_avi_mp3.avi", "first/harbour.avi")
+        self.copy_fixture("xvid_avi_mp3.avi", "first/jetty.avi")
+        self.copy_fixture("xvid_avi_mp3.avi", "second/meadow.avi")
+        self.copy_fixture(os.path.join("collision_pair", "movie.avi"), "second/movie.avi")
+        self.copy_fixture(os.path.join("collision_pair", "movie.mkv"), "second/movie.mkv")
+        progress = quiet()
+        with mock.patch("vidfunnel.plan._plan_entry", side_effect=fake_entry), \
+                mock.patch.object(vidfunnel.turns.FolderTurns, "enter", enter), \
+                mock.patch("vidfunnel.turns.FolderLock", LoggedLock):
+            summary = plan_paths(TOOLS, [str(self.root)], make_options(jobs=3), progress=progress)
+        text = progress.stream.getvalue()
+        tally = vidfunnel.interrupt.drain_tally
+        self.assertEqual(planned, [], text)
+        self.assertEqual(acquired, [], text)
+        self.assertEqual((summary.counts["failed"], summary.counts["skipped"]), (0, 0), text)
+        self.assertTrue(tally.seen)
+        self.assertEqual((tally.finished, tally.left), (0, 5), "every file is left: {}".format(text))
+        for folder in ("first", "second"):
+            self.assertFalse((self.root / folder / ".vidfunnel" / "lock").exists(), folder)
+            self.assertFalse((self.root / folder / ".vidfunnel" / "folder.json").exists(), folder)
+        for name in ("first/harbour.avi", "first/jetty.avi", "second/meadow.avi", "second/movie.avi",
+                     "second/movie.mkv"):
+            self.assertFalse(record_path(self.root / name).exists(), name)
+        self.assertNotIn("skipping folder", text)
 
     def test_read_only_folder_is_skipped_without_a_traceback(self):
         if hasattr(os, "geteuid") and os.geteuid() == 0:
