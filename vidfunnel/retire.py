@@ -43,7 +43,7 @@ stop file: its folder is forgotten for vidfunnel.stopfile.check_now
 moved, is never cut off by one and the item is not left half done.
 """
 
-VERSION = "20261110"
+VERSION = "20261110.1"
 
 import contextlib
 import os
@@ -72,6 +72,7 @@ from vidfunnel.record import (
     set_status,
     sha256_file,
     ensure_lock,
+    take_folder_mode,
 )
 from vidfunnel.stopfile import forget_item
 
@@ -390,6 +391,28 @@ def quarantine_destination(source, root, quarantine_dir=None):
 # ---------------------------------------------------------------- moving
 
 
+def _make_quarantine_dirs(directory):
+    """Create `directory` and its missing parents, each widened to the mode of the folder it is created in.
+
+    take_folder_mode, best effort; folders that exist are left as they are.
+    """
+    directory = Path(directory)
+    missing = []
+    while not directory.is_dir():
+        missing.append(directory)
+        if directory.parent == directory:
+            break
+        directory = directory.parent
+    for made in reversed(missing):
+        try:
+            made.mkdir()
+        except FileExistsError:
+            if not made.is_dir():
+                raise
+            continue
+        take_folder_mode(made, made.parent, directory=True)
+
+
 def _copy_across(source, destination, quiet):
     """Copy source to destination on another filesystem through a temp name; verify; return nothing.
 
@@ -512,7 +535,7 @@ def _retire_member(source, destination, quiet):
     if destination is None:
         os.unlink(str(source))
         return "unlink"
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    _make_quarantine_dirs(destination.parent)
     if _same_filesystem(source, destination.parent):
         if os.path.lexists(str(destination)):
             raise RetireRefused("quarantine-exists",

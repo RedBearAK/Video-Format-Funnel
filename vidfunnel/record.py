@@ -6,7 +6,7 @@ per source file, named after the full source file name including its extension
 Records are the authority; every write is atomic (temp file, then os.replace).
 """
 
-VERSION = "20261110.2"
+VERSION = "20261110.3"
 
 import contextlib
 import datetime
@@ -151,6 +151,66 @@ def record_path(source):
     return record_dir(source.parent) / (source.name + RECORD_SUFFIX)
 
 
+# ---------------------------------------------------------------- permissions
+
+
+def take_folder_mode(target, folder, directory=False):
+    """Add to `target` the permissions the library folder `folder` grants; best effort, never raises.
+
+    `target` is a path or an open descriptor of something this run has just
+    created in the library. A file gains the bits of the folder's mode
+    without the execute, setuid, setgid and sticky bits (folder 0775 or
+    2775: rw for user, group and others' r); a directory gains the folder's
+    mode with setgid but without the sticky and setuid bits (a sticky
+    '.vidfunnel' would stop one account renaming over another account's
+    record or lock). Bits are only ever added, never
+    removed: on a network mount the folder's mode as this host sees it may
+    be the mount's (CIFS dir_mode, often 0755), not the server's, while the
+    server gives the new file its own mode (an inherited ACL), which must
+    not be narrowed. When nothing would be added no chmod is made. Hosts
+    that mount the share as another account of the same group can then
+    read and rewrite what this one writes. A folder or target that cannot
+    be stat'ed or a chmod that fails (not the owner, a file system or CIFS
+    server that decides modes itself) leaves the mode as it is, silently.
+    Never chowns.
+    """
+    try:
+        granted = stat.S_IMODE(os.stat(str(folder)).st_mode)
+        if directory:
+            granted &= ~(stat.S_ISVTX | stat.S_ISUID)  # a sticky '.vidfunnel' would stop renames over others' files
+        else:
+            granted &= 0o666
+        if isinstance(target, int):
+            current = stat.S_IMODE(os.fstat(target).st_mode)
+        else:
+            current = stat.S_IMODE(os.stat(str(target)).st_mode)
+        mode = current | granted
+        if mode == current:
+            return
+        if isinstance(target, int):
+            os.fchmod(target, mode)
+        else:
+            os.chmod(str(target), mode)
+    except OSError:
+        pass
+
+
+def make_record_dir(folder):
+    """Create '<folder>/.vidfunnel' when it is missing and widen it to the folder's mode; return its path.
+
+    The mode is widened by take_folder_mode. An existing directory is left as it is.
+    """
+    directory = record_dir(folder)
+    try:
+        directory.mkdir(parents=True)
+    except FileExistsError:
+        if not directory.is_dir():
+            raise
+        return directory
+    take_folder_mode(directory, folder, directory=True)
+    return directory
+
+
 # ---------------------------------------------------------------- JSON I/O
 
 
@@ -159,12 +219,18 @@ def _dump_json(data):
 
 
 def _write_json_atomic(path, data):
-    """Write data as JSON to path through a temp file in the same directory."""
+    """Write data as JSON to path ('<folder>/.vidfunnel/<name>') through a temp file in the same directory.
+
+    The temp file gains the mode of <folder> (take_folder_mode) before it is
+    renamed into place, and so does '.vidfunnel' when it is created here.
+    """
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    library = path.parent.parent
+    make_record_dir(library)
     text = _dump_json(data)
     handle, temp_name = tempfile.mkstemp(prefix="." + path.name + ".", suffix=".tmp", dir=str(path.parent))
     try:
+        take_folder_mode(handle, library)
         with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(text)
             stream.flush()
@@ -182,6 +248,7 @@ def _read_json(path):
     """Parsed JSON of path, None when it does not exist, RecordError when unreadable.
 
     JSON nested too deeply for the parser (RecursionError) is unreadable too.
+    A permission error adds a clause on the likely cause and its fix.
     """
     path = Path(path)
     try:
@@ -190,6 +257,10 @@ def _read_json(path):
     except FileNotFoundError:
         return None
     except (OSError, ValueError) as error:
+        if isinstance(error, OSError) and error.errno in (errno.EACCES, errno.EPERM):
+            raise RecordError("cannot read '{}': {}; it probably belongs to another account and has owner-only "
+                              "permissions, which the owner can fix with chmod on the server (chmod g+rw)".format(
+                                  path, error))
         raise RecordError("cannot read '{}': {}".format(path, error))
     except RecursionError:
         raise RecordError("cannot read '{}': its JSON is nested too deeply".format(path)) from None
@@ -961,6 +1032,7 @@ def _share_clock_ns(directory):
     name = os.path.join(str(directory), PROBE_PREFIX + uuid.uuid4().hex)
     handle = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     try:
+        take_folder_mode(handle, Path(directory).parent)  # changes the inode's ctime, not its mtime
         return os.fstat(handle).st_mtime_ns
     finally:
         try:
@@ -1284,6 +1356,8 @@ class FolderLock:
             for target, flags, kind in targets:
                 try:
                     handle = os.open(target, flags, 0o644)
+                    if kind == "file":
+                        take_folder_mode(handle, self.folder)
                     fcntl.flock(handle, fcntl.LOCK_EX)
                     held = kind
                     break
@@ -1326,6 +1400,7 @@ class FolderLock:
         renamed = False
         status = None
         try:
+            take_folder_mode(handle, self.folder)
             if takeover is not None:
                 _takeover_step("created")
             content["flock"] = _take_flock(handle)
@@ -1400,7 +1475,7 @@ class FolderLock:
         return self._held(holder, age, "it took the lock over at the same time and got it first")
 
     def acquire(self):
-        record_dir(self.folder).mkdir(parents=True, exist_ok=True)
+        make_record_dir(self.folder)
         machine, machine_source = machine_identity()
         content = {"host": socket.gethostname(), "pid": os.getpid(), "started": now_iso(),
                    "container": in_container(), "machine": machine, "machine_source": machine_source,
@@ -1662,6 +1737,7 @@ class FolderLock:
                 continue
             identity = None
             try:
+                take_folder_mode(handle, self.folder)
                 status = os.fstat(handle)
                 identity = (status.st_dev, status.st_ino)
                 data = _dump_json({"host": content["host"], "pid": content["pid"], "token": uuid.uuid4().hex,

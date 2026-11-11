@@ -102,7 +102,7 @@ whose output still matches its fingerprint (content only, the time is not
 compared) is reported as already converted.
 """
 
-VERSION = "20261110.3"
+VERSION = "20261110.4"
 
 import errno
 import hashlib
@@ -146,6 +146,7 @@ from vidfunnel.record import (
     record_path,
     save_record,
     set_status,
+    take_folder_mode,
 )
 
 PART_SUFFIX = ".part"
@@ -716,6 +717,8 @@ def write_par2(output_path, redundancy, progress=None):
             problem = name_limit_problem(final, "PAR2 file")
             if problem is not None:
                 raise OSError(problem)
+        for path, _final in renames:
+            take_folder_mode(path, output_path.parent)
         ensure_lock(output_path.parent)
         files = []
         for path, final in renames:
@@ -850,6 +853,7 @@ def _write_sidecars(sidecars, record_id, stream, verbose, folder=None):
         started.append(argv)
         try:
             run_tool(argv)
+            take_folder_mode(temp, final.parent)
             if folder is not None:
                 ensure_lock(folder)
             os.replace(str(temp), str(final))
@@ -970,6 +974,7 @@ def _convert_one(tools, key, record, options, progress, stream, quiet, verbose, 
             completed = run_tool(argv, progress=ffmpeg_progress_callback(live, duration))
         # A host that took the folder over meanwhile may be converting this record into a part file of its
         # own: nothing is renamed or saved unless the lock is still ours (this attempt's part is removed below).
+        take_folder_mode(temp, output_path.parent)
         ensure_lock(folder)
         os.replace(str(temp), str(output_path))
     except (FfmpegError, ToolNotFound, OSError) as error:
@@ -1495,6 +1500,7 @@ def _refit_attempt(tools, key, record, options, progress, plan, attempt, label, 
             label, result_words, problem, FIT_CAPPED_FLAG), stream)
         return "kept", problem
 
+    take_folder_mode(temp, output_path.parent)
     ensure_lock(folder)
     try:
         os.replace(str(temp), str(output_path))
