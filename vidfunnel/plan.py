@@ -57,7 +57,7 @@ analyze_input(), which runs the same passes with an input-argument list and
 returns the same dict shape, built from analyze's own pure rules.
 """
 
-VERSION = "20261111.1"
+VERSION = "20261111.2"
 
 import hashlib
 import json
@@ -125,6 +125,7 @@ from vidfunnel.record import (
     fingerprint_same_file,
     load_folder,
     load_record,
+    natural_key,
     new_record,
     now_iso,
     record_dir,
@@ -284,7 +285,7 @@ def _source_candidate(path, tools, seen_groups):
 
 
 def iter_sources(paths, tools=None):
-    """Yield the sources under each PATH as absolute Paths, sorted within each folder.
+    """Yield the sources under each PATH as absolute Paths, in natural order (record.natural_key) within each folder.
 
     A directory is walked: files with a SOURCE_EXTENSIONS extension
     (case-insensitive), skipping hidden files and folders (so '.vidfunnel/'
@@ -318,7 +319,7 @@ def iter_sources(paths, tools=None):
             for current, dir_names, file_names in os.walk(str(root)):
                 folder = Path(current)
                 kept = []
-                for name in sorted(dir_names):
+                for name in sorted(dir_names, key=natural_key):
                     if name.startswith(".") or name in (RECORD_DIR, RETIRED_DIR):
                         continue
                     if is_dvd_structure(folder / name) == "video_ts":
@@ -327,7 +328,7 @@ def iter_sources(paths, tools=None):
                         continue
                     kept.append(name)
                 dir_names[:] = kept
-                for name in sorted(file_names):
+                for name in sorted(file_names, key=natural_key):
                     if _skipped_name(name) or _extension(name) not in SOURCE_EXTENSIONS:
                         continue
                     candidate = _source_candidate(folder / name, tools, seen_groups)

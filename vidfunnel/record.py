@@ -6,7 +6,7 @@ per source file, named after the full source file name including its extension
 Records are the authority; every write is atomic (temp file, then os.replace).
 """
 
-VERSION = "20261111.1"
+VERSION = "20261111.2"
 
 import contextlib
 import datetime
@@ -14,6 +14,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import socket
 import stat
 import sys
@@ -307,21 +308,57 @@ def save_record(source, record):
     _write_json_atomic(record_path(source), record)
 
 
+_DIGIT_RUN = re.compile("[0-9]+")  # ASCII digits only: a str pattern's [0-9] is not \d
+_DIGIT_SLOT = ord("0")
+
+
+def natural_key(name):
+    """The sort key that orders names with numbers by number value: 'Episode 2' before 'Episode 10'.
+
+    The name is read as a sequence of items: each run of ASCII digits [0-9]+
+    is one item, every other character is an item of its own. A character
+    compares by its code point, as a plain sort of str does (no case
+    folding, no locale: 'B' still sorts before 'a'). A digit run compares
+    with another digit run by its value (its digits without leading zeros:
+    the shorter is smaller, equal lengths compare digit by digit, so no
+    int() and no limit on its length), and with a character as the
+    character '0' would, so a digit run sits where any digit sits in a plain
+    sort. Two names therefore sort as a plain sort orders them unless digit
+    runs of different value or padding meet at the same item. A shorter
+    sequence that is a prefix of a longer one comes first. Names whose items
+    are equal ('Episode 02' and 'Episode 2', which differ only in leading
+    zeros) are ordered by a plain sort of the whole names ('Episode 02'
+    first), so two different names never compare equal. Comparisons never
+    raise: every item is a tuple that starts with an int, and items with the
+    same first value are both digit runs. Non-ASCII digits are characters;
+    surrogate-escaped bytes are characters with their code points.
+    """
+    items = []
+    position = 0
+    for match in _DIGIT_RUN.finditer(name):
+        items.extend((ord(character),) for character in name[position:match.start()])
+        digits = match.group().lstrip("0")
+        items.append((_DIGIT_SLOT, len(digits), digits))
+        position = match.end()
+    items.extend((ord(character),) for character in name[position:])
+    return (tuple(items), name)
+
+
 def iter_records(root, on_error=None):
-    """Yield (folder, record) for every record under root, sorted by path.
+    """Yield (folder, record) for every record under root, folders and records in natural order (natural_key).
 
     on_error: None raises RecordError on an unreadable record; otherwise it is
     called as on_error(path, error) and the walk continues.
     """
     root = Path(root)
     for current, dir_names, _file_names in os.walk(str(root)):
-        dir_names.sort()
+        dir_names.sort(key=natural_key)
         if RECORD_DIR not in dir_names:
             continue
         dir_names.remove(RECORD_DIR)
         folder = Path(current)
         records_location = folder / RECORD_DIR
-        for entry in sorted(records_location.iterdir()):
+        for entry in sorted(records_location.iterdir(), key=lambda entry: natural_key(entry.name)):
             if entry.name == FOLDER_FILE or not entry.name.endswith(RECORD_SUFFIX):
                 continue
             if entry.name.startswith(".") or not entry.is_file():

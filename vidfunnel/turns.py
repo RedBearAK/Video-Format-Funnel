@@ -55,14 +55,14 @@ lock free or taken over, or finished by its holder), and a wait cut short by
 a drain, a stop file or an interrupt says so with the folders still held.
 """
 
-VERSION = "20261111.1"
+VERSION = "20261111.2"
 
 import threading
 import time
 
 import vidfunnel.record
 from vidfunnel.interrupt import drain_before_next, drain_tally, draining
-from vidfunnel.record import FolderLock, LockHeld, LockNotStarted
+from vidfunnel.record import FolderLock, LockHeld, LockNotStarted, natural_key
 
 HELD = "held"
 SKIPPED = "skipped"
@@ -334,13 +334,13 @@ def held_rounds(turns, held, folder_of, settle, run, say_line, size_of=None):
     and turns.leave(), and returns the ones whose folder another run still
     holds. A round in which nothing was settled and no unit ran is followed
     by a wait (wait_for_folders), announced by waiting_lines (folders in
-    sorted order) whenever the set of folders waited for, or the holder (host
-    and pid) of one of them, is not the one last announced, and by a
-    status_line every HELD_REPORT_SECONDS while it is. Returns [] when no
-    folder has work left, or the units still held when the run drains (the
-    caller counts them as skipped, and they are added to drain_tally.left,
-    as never started); Ctrl+C and a 'now' stop file raise KeyboardInterrupt,
-    after a line that says so.
+    natural order, record.natural_key) whenever the set of folders waited
+    for, or the holder (host and pid) of one of them, is not the one last
+    announced, and by a status_line every HELD_REPORT_SECONDS while it is.
+    Returns [] when no folder has work left, or the units still held when
+    the run drains (the caller counts them as skipped, and they are added to
+    drain_tally.left, as never started); Ctrl+C and a 'now' stop file raise
+    KeyboardInterrupt, after a line that says so.
     """
     size_of = size_of if size_of is not None else (lambda unit: 1)
 
@@ -395,7 +395,8 @@ def held_rounds(turns, held, folder_of, settle, run, say_line, size_of=None):
         if not held or moved:
             continue
         left = left_in(held)
-        folders = sorted(left)  # with --jobs `held` comes in completion order: the set and its holders decide
+        # With --jobs `held` comes in completion order: the set and its holders decide.
+        folders = sorted(left, key=natural_key)
         holders = {name: _holder_key(turns.holder(name)) for name in folders}
         now = _clock()
         if holders != announced:
