@@ -105,7 +105,7 @@ whose output still matches its fingerprint (content only, the time is not
 compared) is reported as already converted.
 """
 
-VERSION = "20261111"
+VERSION = "20261111.1"
 
 import errno
 import hashlib
@@ -1682,7 +1682,7 @@ def refit_paths(tools, paths, options, progress=None):
         results = []
 
         def run_items(batch):
-            """Run [(position, key, folder)]; returns those whose folder another run holds."""
+            """Run [(position, key, folder)]; returns those whose folder another run holds, in list order."""
             held = []
             if jobs == 1:
                 for number, (position, key, folder) in enumerate(batch):
@@ -1702,13 +1702,15 @@ def refit_paths(tools, paths, options, progress=None):
                     if value is None:
                         not_started()
                     elif value == HELD_ELSEWHERE:
-                        held.append(batch[index])
+                        held_at.append(index)
                     else:
                         results.append(value)
 
+                held_at = []
                 run_pool(jobs, [lambda position=position, key=key, folder=folder: item(position, key, folder)
                                 for position, key, folder in batch], refit_done,
                          folders=[folder for _position, _key, folder in batch])
+                held = [batch[index] for index in sorted(held_at)]  # in list order, not the order they ended in
             return held
 
         def settle(unit):
@@ -2050,7 +2052,7 @@ def convert_paths(tools, paths, options, progress=None):
                 turns.leave(folder)
 
         def run_items(batch):
-            """Run [(position, key, folder)]; returns those whose folder another run holds."""
+            """Run [(position, key, folder)]; returns those whose folder another run holds, in list order."""
             held = []
             if jobs == 1:
                 for number, (position, key, folder) in enumerate(batch):
@@ -2070,13 +2072,15 @@ def convert_paths(tools, paths, options, progress=None):
                     if outcome is None:
                         not_started()
                     elif outcome == HELD_ELSEWHERE:
-                        held.append(batch[index])
+                        held_at.append(index)
                     else:
                         summary.add(outcome)
 
+                held_at = []
                 run_pool(jobs, [lambda position=position, key=key, folder=folder: item(position, key, folder)
                                 for position, key, folder in batch],
                          done, folders=[folder for _position, _key, folder in batch])
+                held = [batch[index] for index in sorted(held_at)]  # in list order, not the order they ended in
             return held
 
         def settle(unit):

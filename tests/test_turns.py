@@ -1,6 +1,6 @@
 """Tests for vidfunnel.turns: a folder's lock taken at its first item, once, and released after its last."""
 
-VERSION = "20261111"
+VERSION = "20261111.1"
 
 import datetime
 import json
@@ -14,7 +14,7 @@ from unittest import mock
 import vidfunnel.interrupt
 import vidfunnel.record as record_module
 import vidfunnel.turns as turns_module
-from vidfunnel.record import FolderLock
+from vidfunnel.record import FolderLock, LockHeld
 from vidfunnel.turns import DRAINING, ERROR, HELD, SKIPPED, FolderTurns
 
 DEADLINE_SECONDS = 60.0
@@ -306,6 +306,150 @@ class NotStartedTest(unittest.TestCase):
         tally.finished = 3
         turns_module.not_started(2)
         self.assertEqual((tally.finished, tally.left, tally.seen), (1, 2, True))
+
+
+class ScriptedTurns(object):
+    """What held_rounds asks of a FolderTurns: again() (nothing to reset here) and the holder of each folder."""
+
+    def __init__(self, holders):
+        self.holders = holders  # folder name -> LockHeld, changed by the test between rounds
+        self.opened = []
+
+    def again(self, folder, count):
+        self.opened.append((str(folder), count))
+
+    def holder(self, folder):
+        return self.holders.get(str(folder))
+
+
+def beating_holder(host="elsewhere-host", pid=4242, beat=10.0):
+    return LockHeld("locked by host '{}' pid {}".format(host, pid), host=host, pid=pid, age_seconds=60.0,
+                    beat_age_seconds=beat)
+
+
+class HeldRoundsTest(unittest.TestCase):
+    """held_rounds alone, with a scripted run, settle and wait: what it announces and when it waits."""
+
+    def setUp(self):
+        vidfunnel.interrupt.draining.clear()
+        self.addCleanup(vidfunnel.interrupt.draining.clear)
+        vidfunnel.interrupt.drain_tally.reset()
+        self.addCleanup(vidfunnel.interrupt.drain_tally.reset)
+        self.lines = []
+        self.clock = [0.0]
+        self.waits = []
+        self.steps = []
+        for name, value in (("_clock", lambda: self.clock[0]), ("wait_for_folders", self.scripted_wait)):
+            patch = mock.patch.object(turns_module, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def scripted_wait(self, folders):
+        self.waits.append(list(folders))
+        self.steps.pop(0)()
+        return None
+
+    def later(self, seconds):
+        def step():
+            self.clock[0] += seconds
+        return step
+
+    def rounds(self, turns, held, run):
+        return turns_module.held_rounds(turns, held, lambda unit: unit[0], lambda unit: unit, run, self.lines.append)
+
+    def test_the_same_units_in_another_order_are_one_announcement_and_status_lines_follow(self):
+        units = [("/library/meadow", "orchard"), ("/library/harbour", "pier"), ("/library/meadow", "grove")]
+        turns = ScriptedTurns({"/library/meadow": beating_holder(), "/library/harbour": beating_holder()})
+        calls = []
+
+        def run(batch):
+            calls.append(list(batch))
+            if len(calls) > 5:
+                return []
+            return list(reversed(batch)) if len(calls) % 2 else list(batch)  # back in alternating order
+
+        self.steps.extend([self.later(300)] * 5)
+        self.assertEqual(self.rounds(turns, list(units), run), [])
+        self.assertEqual(len(self.waits), 5)
+        self.assertEqual(self.waits[0], ["/library/harbour", "/library/meadow"], "folders in sorted order")
+        announced = [line for line in self.lines if line.startswith("waiting for ")]
+        self.assertEqual(announced, ["waiting for 2 folder(s) other runs hold, trying each again every 60 s:"],
+                         self.lines)
+        folder_lines = [line for line in self.lines if line.startswith("  '")]
+        self.assertEqual([line.split("'")[1] for line in folder_lines], ["/library/harbour", "/library/meadow"])
+        self.assertIn("; 2 item(s) of this run left there", folder_lines[1])
+        status = [line for line in self.lines if line.startswith("still waiting")]
+        self.assertEqual(status, [
+            "still waiting after {} s for 2 folder(s) other runs hold: '/library/harbour' (last beat 10 s ago), "
+            "'/library/meadow' (last beat 10 s ago)".format(waited) for waited in (600, 1200)], self.lines)
+
+    def test_a_folder_whose_holder_changes_is_announced_again(self):
+        units = [("/library/meadow", "orchard")]
+        turns = ScriptedTurns({"/library/meadow": beating_holder()})
+        rounds_left = [3]
+
+        def run(batch):
+            rounds_left[0] -= 1
+            return list(batch) if rounds_left[0] >= 0 else []
+
+        def new_holder():
+            turns.holders["/library/meadow"] = beating_holder(host="faraway-host", pid=5151, beat=20.0)
+
+        self.steps.extend([self.later(60), new_holder, self.later(60)])
+        self.assertEqual(self.rounds(turns, list(units), run), [])
+        announced = [index for index, line in enumerate(self.lines) if line.startswith("waiting for ")]
+        self.assertEqual(len(announced), 2, self.lines)
+        self.assertIn("held by host 'elsewhere-host' pid 4242, last beat 10 s ago", self.lines[announced[0] + 1])
+        self.assertIn("held by host 'faraway-host' pid 5151, last beat 20 s ago", self.lines[announced[1] + 1])
+        self.assertTrue(self.lines[announced[1] + 2].startswith("the wait ends for a folder"), self.lines)
+
+
+class WaitWordsTest(unittest.TestCase):
+    """What a wait says about each folder's holder: what ends the wait for that folder."""
+
+    def setUp(self):
+        self.turns = ScriptedTurns({})
+
+    def test_a_pid_running_here_says_what_ends_its_wait(self):
+        held = LockHeld("folder '/library/meadow' is locked by host 'harbour-host' pid 777 since 2026-11-11T08:00:00Z "
+                        "(7200 s ago; its pid 777 is running here and its holder last beat 12 s ago on the share's "
+                        "clock; taken over once that process is gone, or once the lock is 24 h old and its holder has "
+                        "been silent for 3600 s); lock file '/library/meadow/.vidfunnel/lock'",
+                        host="harbour-host", pid=777, age_seconds=7200.0)
+        held.pid_running_here = True
+        self.turns.holders["/library/meadow"] = held
+        words = turns_module.holder_words(held)
+        self.assertEqual(words, "held by host 'harbour-host' pid 777, a process running on this machine (taken over "
+                                "once that process is gone; while it runs, not before the lock is 24 h old: "
+                                "{})".format(held))
+        self.assertNotIn("its heartbeat does not decide", words)
+        self.assertNotIn("stays silent", words)
+        lines = turns_module.waiting_lines(self.turns, ["/library/meadow"], {"/library/meadow": 3})
+        self.assertEqual(lines[1], "  '/library/meadow': {}; 3 item(s) of this run left there".format(words))
+        self.assertEqual(lines[2], "the wait ends for a folder when its holder finishes or releases it, or when its "
+                                   "lock is taken over as its line says; Ctrl+C, SIGUSR1 or 'vidfunnel stop-all PATH' "
+                                   "(PATH at or above these folders) ends the whole wait; --no-wait skips such folders "
+                                   "instead")
+        self.assertEqual(turns_module.status_line(self.turns, ["/library/meadow"], 600.0),
+                         "still waiting after 600 s for 1 folder(s) other runs hold: '/library/meadow' (last beat not "
+                         "judged by heartbeat)")
+
+    def test_a_lock_the_heartbeat_does_not_decide_embeds_its_reason(self):
+        held = LockHeld("folder '/library/meadow' is locked by host 'harbour-host' pid 777 since 2026-11-11T08:00:00Z "
+                        "(600 s ago; written by a run on another host, whose pid cannot be checked from here; taken "
+                        "over once 24 h old); lock file '/library/meadow/.vidfunnel/lock'",
+                        host="harbour-host", pid=777, age_seconds=600.0)
+        self.turns.holders["/library/meadow"] = held
+        self.assertEqual(turns_module.holder_words(held),
+                         "held by host 'harbour-host' pid 777 (its heartbeat does not decide here: {})".format(held))
+        self.assertEqual(turns_module.status_line(self.turns, ["/library/meadow"], 1200.0),
+                         "still waiting after 1200 s for 1 folder(s) other runs hold: '/library/meadow' (last beat "
+                         "not judged by heartbeat)")
+
+    def test_a_beating_lock_says_when_it_is_taken_over(self):
+        self.assertEqual(turns_module.holder_words(beating_holder(beat=600.0)),
+                         "held by host 'elsewhere-host' pid 4242, last beat 600 s ago (taken over if it stays silent "
+                         "for 3000 s more, at the first try after that)")
 
 
 if __name__ == "__main__":

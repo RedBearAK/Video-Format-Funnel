@@ -10,7 +10,10 @@ lock is a lock file of another machine that beat just now.
 
 The rounds are driven by replacing vidfunnel.turns.wait_for_folders with a
 script of steps (what the other run does while this one waits), so no test
-depends on the clock or on thread scheduling. The tests of the real wait set
+depends on the clock. With --jobs 2 the items run on worker threads, whose
+order the tests do not assume: they compare sets and counts, and where one
+item must come after another (a drain begun during a round), the later one
+waits for an event the earlier one logs, with a deadline. The tests of the real wait set
 HELD_RETRY_SECONDS to twice DEADLINE_SECONDS and end the wait from another
 thread once the waiting line has been written: by a drain, a stop file or an
 interrupt. Should that not end it within DEADLINE_SECONDS, the thread notes
@@ -19,7 +22,7 @@ the test fails instead of hanging; a wait that ignores the drain and ends
 only at its interval is caught the same way.
 """
 
-VERSION = "20261111"
+VERSION = "20261111.1"
 
 import _thread
 import contextlib
@@ -58,15 +61,20 @@ def lock_file_of(folder):
     return Path(folder) / ".vidfunnel" / "lock"
 
 
-def foreign_live_lock(folder):
-    """A lock of another machine whose holder beat just now (its mtime is the share's now)."""
+def foreign_live_lock(folder, host="elsewhere-host", pid=4242, heartbeat=True):
+    """A lock of another machine whose holder beat just now (its mtime is the share's now).
+
+    heartbeat=False writes a lock without the heartbeat field (an older
+    vidfunnel), which is judged by the 24 h rule, not by its beat.
+    """
     path = lock_file_of(folder)
     path.parent.mkdir(parents=True, exist_ok=True)
     started = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    path.write_text(json.dumps({"host": "elsewhere-host", "pid": 4242, "started": started, "container": False,
-                                "machine": "elsewhere-machine", "machine_source": "machine-id",
-                                "boot": "elsewhere-boot", "flock": False,
-                                "heartbeat": {"interval": record_module.HEARTBEAT_SECONDS}}), encoding="utf-8")
+    content = {"host": host, "pid": pid, "started": started, "container": False, "machine": "elsewhere-machine",
+               "machine_source": "machine-id", "boot": "elsewhere-boot", "flock": False}
+    if heartbeat:
+        content["heartbeat"] = {"interval": record_module.HEARTBEAT_SECONDS}
+    path.write_text(json.dumps(content), encoding="utf-8")
     return path
 
 
@@ -102,6 +110,7 @@ class RoundsCase(object):
         self.waits = []      # the folder names each wait was given
         self.refused = set()  # folder names whose lock file cannot be created
         self.sources = {}
+        self.on_start = None  # called with the item's key as its work starts, when set
 
     def clean_flags(self):
         for flag in (vidfunnel.interrupt.interrupted, vidfunnel.interrupt.draining,
@@ -120,6 +129,7 @@ class RoundsCase(object):
         self.clock[0] = 0.0
         self.waits.clear()
         self.refused.clear()
+        self.on_start = None
         self.sources = {}
         for folder_name, stems in LAYOUT:
             folder = self.root / folder_name
@@ -196,6 +206,8 @@ class RoundsCase(object):
         """The item's work: note whether this run holds the folder, then save the record as done."""
         key = Path(key)
         self.log("start", key.parent.name, key.stem, self.held_here(key.parent))
+        if self.on_start is not None:
+            self.on_start(key)
         if self.stage == "plan":
             record = new_record(key)
             record["action"] = "remux"
@@ -334,8 +346,8 @@ class RoundsCase(object):
                                  ["waiting for 1 folder(s) other runs hold, trying each again every 60 s:"], text)
                 self.assertRegex(text, self.holder_line("second", 2))
                 self.assertIn("the wait ends for a folder when its holder finishes or releases it, or when its "
-                              "holder's heartbeat has been silent for 3600 s and its lock is taken over; Ctrl+C, "
-                              "SIGUSR1 or 'vidfunnel stop-all PATH' ends the whole wait; --no-wait skips such folders "
+                              "lock is taken over as its line says; Ctrl+C, SIGUSR1 or 'vidfunnel stop-all PATH' "
+                              "(PATH at or above these folders) ends the whole wait; --no-wait skips such folders "
                               "instead\n", text)
                 self.assertIn(self.taken_line("second", "the run that held it has released it"), text)
                 self.assertNotIn("still waiting", text)
@@ -490,6 +502,174 @@ class RoundsCase(object):
                                                            "'{}' (last beat ".format(waited, self.folder("second")))
                                      + r"\d+ s ago\)$")
 
+    def test_no_heartbeat_thread_is_a_lock_error_and_never_waited_for(self):
+        """No thread can be started for the heartbeat (a pids limit) and no other run holds anything: each folder is
+        skipped for the run as at 20261111 and before, its items counted skipped, and the run does not wait."""
+
+        class RefusedThread(threading.Thread):
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        refusing = types.SimpleNamespace(Thread=RefusedThread, current_thread=threading.current_thread)
+        names = [name for name, _stems in LAYOUT]
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                self.fresh()
+                deadline = time.monotonic() + DEADLINE_SECONDS
+                while record_module._beat_thread is not None:
+                    self.assertLess(time.monotonic(), deadline, "a heartbeat thread outlived an earlier test")
+                    time.sleep(0.01)
+                with unittest.mock.patch.object(record_module, "threading", refusing):
+                    summary, text = self.run_stage(jobs)
+                self.assert_counted_once(summary, 0, 4, text)
+                self.assertEqual(self.waits, [])
+                self.assertEqual(self.started(), [])
+                self.assertNotIn("waiting for", text)
+                self.assertNotIn("not waiting", text)
+                for name in names:
+                    self.assertEqual(self.attempts(name), ["acquiring"], name)
+                    self.assertFalse(lock_file_of(self.folder(name)).exists(), name)
+                reason = "cannot start the heartbeat thread its lock needs (can't start new thread)"
+                if self.stage == "plan" and jobs == 1:
+                    # plan without --jobs takes its main-pass locks itself (_take_folder_lock), as at 20261111.
+                    for name in names:
+                        self.assertIn("skipping folder '{}': {}".format(self.folder(name), reason), text)
+                    self.assertEqual(summary.lock_errors, [])
+                else:
+                    for name in names:
+                        self.assertIn("skipping folder '{}': cannot take its lock: {}".format(self.folder(name),
+                                                                                             reason), text)
+                    self.assertEqual(sorted(summary.lock_errors), [str(self.folder(name)) for name in names])
+                if self.stage == "refit":
+                    self.assertEqual(summary.skip_reasons, {"folder locked": 4}, text)
+
+    def test_a_round_that_settled_or_took_a_lock_is_followed_at_once_by_another(self):
+        """No wait after a round that changed something: the next round tries the folders still held at once."""
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs, change="settled"):
+                self.fresh()
+                lock = foreign_live_lock(self.folder("second"))
+                self.steps.extend([lambda folders: self.finish_elsewhere("meadow"),
+                                   lambda folders: os.unlink(str(lock))])
+                summary, text = self.run_stage(jobs)
+                self.assert_counted_once(summary, 3, 1, text)
+                self.assertEqual(self.waits, [["second"], ["second"]])
+                # main pass, round 1, wait, round 2 (settles meadow), round 3 at once, wait, round 4 takes the lock
+                self.assertEqual(self.attempts("second"), TRIED_TWICE + ["acquiring", "acquiring", "acquiring",
+                                                                         "acquired"])
+                self.assertEqual(sorted(self.started()[:2]), ["harbour", "valley"])  # main pass, any order with --jobs
+                self.assertEqual(self.started()[2:], ["orchard"])
+            with self.subTest(jobs=jobs, change="took a lock"):
+                self.fresh()
+                second = foreign_live_lock(self.folder("second"))
+                third = foreign_live_lock(self.folder("third"))
+                self.steps.extend([lambda folders: os.unlink(str(third)),
+                                   lambda folders: os.unlink(str(second))])
+                summary, text = self.run_stage(jobs)
+                self.assert_counted_once(summary, 4, 0, text)
+                self.assertEqual(self.waits, [["second", "third"], ["second"]])
+                # main pass, round 1, wait, round 2 (takes third), round 3 at once, wait, round 4 takes second
+                self.assertEqual(self.attempts("second"), TRIED_TWICE + ["acquiring", "acquiring", "acquiring",
+                                                                         "acquired"])
+
+    def test_a_drain_begun_during_a_round_ends_the_rounds_with_its_counts(self):
+        """The check at the top of each round: valley's work in round 2 begins the drain, after the still-held
+        harbour was tried in that round; the next round gives up on harbour with the documented line."""
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                self.fresh()
+                foreign_live_lock(self.folder("first"))
+                third = foreign_live_lock(self.folder("third"))
+                self.steps.append(lambda folders: os.unlink(str(third)))
+
+                def drain_at_valley(key):
+                    if key.stem != "valley":
+                        return
+                    deadline = time.monotonic() + DEADLINE_SECONDS
+                    while self.attempts("first").count("acquiring") < 3:  # harbour tried in this round first
+                        if time.monotonic() > deadline:
+                            raise AssertionError("harbour was not tried in the round")
+                        time.sleep(0.005)
+                    vidfunnel.interrupt.draining.set()
+
+                self.on_start = drain_at_valley
+                summary, text = self.run_stage(jobs)
+                self.assert_counted_once(summary, 3, 1, text)
+                self.assertEqual(self.waits, [["first", "third"]])
+                self.assertEqual(sorted(self.started()), ["meadow", "orchard", "valley"])
+                self.assertIn("not waiting for 1 folder(s) other runs hold ('{}'): the run is draining (SIGUSR1, a "
+                              "stop file or a lost lock; said above); their 1 item(s) are counted as skipped\n".format(
+                                  self.folder("first")), text)
+                self.assertEqual(self.attempts("first"), ["acquiring"] * 3)
+                tally = vidfunnel.interrupt.drain_tally
+                self.assertTrue(tally.seen)
+                self.assertEqual(tally.left, 1, "harbour, held and never started")
+                if jobs == 1:  # with --jobs a held task that ends during the drain is counted finished as well
+                    self.assertEqual(tally.finished, 1, "valley")
+                self.assert_no_lock_of_ours()
+
+    def test_a_new_holder_of_a_folder_waited_for_is_announced(self):
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                self.fresh()
+                lock = foreign_live_lock(self.folder("second"))
+                self.steps.extend([lambda folders: foreign_live_lock(self.folder("second"), host="faraway-host",
+                                                                     pid=5151),
+                                   lambda folders: None,
+                                   lambda folders: os.unlink(str(lock))])
+                summary, text = self.run_stage(jobs)
+                self.assert_counted_once(summary, 4, 0, text)
+                self.assertEqual(self.waits, [["second"]] * 3)
+                announced = self.announcements(text)
+                self.assertEqual(announced, ["waiting for 1 folder(s) other runs hold, trying each again every 60 s:"]
+                                 * 2, text)
+                again = text.index(announced[1], text.index(announced[0]) + 1)
+                first, second_wait = text[:again], text[again:]
+                self.assertRegex(first, self.holder_line("second", 2))
+                self.assertNotIn("faraway-host", first)
+                self.assertIn("  '{}': held by host 'faraway-host' pid 5151, last beat ".format(self.folder("second")),
+                              second_wait)
+                self.assertNotIn("elsewhere-host", second_wait)
+                self.assertEqual(second_wait.count("the wait ends for a folder"), 1, text)
+
+    def test_held_units_that_come_back_in_completion_order_keep_their_list_order(self):
+        """With --jobs, run_pool hands results back as tasks end; here in reverse. The held items of a folder are
+        still tried in list order in the round that takes the lock (an odd number of reversals before it)."""
+
+        def reversed_pool(jobs, tasks, on_done, sizes=None, folders=None):
+            values = [task() for task in tasks]
+            for index in reversed(range(len(tasks))):
+                on_done(index, values[index])
+
+        self.fresh()
+        lock = foreign_live_lock(self.folder("second"))
+        self.steps.extend([lambda folders: None, lambda folders: os.unlink(str(lock))])
+        module = "vidfunnel.plan" if self.stage == "plan" else "vidfunnel.encode"
+        with unittest.mock.patch(module + ".run_pool", side_effect=reversed_pool):
+            summary, text = self.run_stage(2)
+        self.assert_counted_once(summary, 4, 0, text)
+        self.assertEqual(self.waits, [["second"], ["second"]])
+        self.assertEqual(self.started(), ["harbour", "valley", "meadow", "orchard"])
+
+    def test_a_lock_without_a_heartbeat_is_worded_by_the_rule_that_keeps_it(self):
+        """Its beat does not decide: the folder line embeds the reason, the status line says so."""
+        self.fresh()
+        lock = foreign_live_lock(self.folder("second"), heartbeat=False)
+
+        def later(folders):
+            self.clock[0] += 600
+
+        self.steps.extend([later, lambda folders: os.unlink(str(lock))])
+        summary, text = self.run_stage(1)
+        self.assert_counted_once(summary, 4, 0, text)
+        self.assertRegex(text, re.compile(
+            "^" + re.escape("  '{0}': held by host 'elsewhere-host' pid 4242 (its heartbeat does not decide here: "
+                            "folder '{0}' is locked by host 'elsewhere-host' pid 4242 since ".format(
+                                self.folder("second")))
+            + r".*taken over once 24 h old.*\); 2 item\(s\) of this run left there$", re.MULTILINE))
+        self.assertIn("still waiting after 600 s for 1 folder(s) other runs hold: '{}' (last beat not judged by "
+                      "heartbeat)\n".format(self.folder("second")), text)
+
     # -- the real wait, ended from another thread once the waiting line is out
 
     def end_the_wait(self, stream, action, lock, finished):
@@ -538,6 +718,9 @@ class RoundsCase(object):
         self.assert_counted_once(summary, 2, 2, text)
         self.assertTrue(vidfunnel.interrupt.draining.is_set())
         self.assertTrue(vidfunnel.interrupt.drain_tally.seen)
+        # The held items were never started: the drain's 'left' (its stderr line) counts them, as the summary's
+        # skipped count does.
+        self.assertEqual(vidfunnel.interrupt.drain_tally.left, 2)
         self.assertEqual(len(self.announcements(text)), 1, text)
         self.assertRegex(text, self.holder_line("second", 2))
         self.assertIn(self.ended_line(reason, "their 2 item(s) are counted as skipped"), text)
@@ -644,6 +827,39 @@ class PlanRoundsTest(RoundsCase, unittest.TestCase):
         self.assert_counted_once(summary, 4, 0, text)
         self.assertEqual(self.waits, [["second"], ["second"]])
         self.assertEqual(sorted(self.started()), ["harbour", "meadow", "orchard", "valley"])
+
+
+class CommandLineTest(unittest.TestCase):
+    """--no-wait from the real command line reaches the options convert_paths and plan_paths are given."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.library = self.temporary.name
+
+    def options_given(self, argv, module, function):
+        from vidfunnel import cli
+        args = cli.build_parser().parse_args(argv)
+        given = []
+
+        def capture(tools, paths, options, progress=None):
+            given.append(options)
+            return types.SimpleNamespace(counts={}, lock_errors=[])
+
+        with unittest.mock.patch("vidfunnel.deps.require", return_value=None), \
+                unittest.mock.patch.object(module, function, side_effect=capture):
+            self.assertEqual(module.run(args), cli.EXIT_OK)
+        self.assertEqual(len(given), 1)
+        return given[0]
+
+    def test_no_wait_is_parsed_for_convert_refit_and_plan(self):
+        for command, module, function in ((["convert"], encode, "convert_paths"),
+                                          (["convert", "--refit"], encode, "convert_paths"),
+                                          (["plan"], vidfunnel.plan, "plan_paths")):
+            for flag, expected in (([], False), (["--no-wait"], True)):
+                with self.subTest(command=command, flag=flag):
+                    options = self.options_given(command + flag + [self.library], module, function)
+                    self.assertIs(options.no_wait, expected)
 
 
 if __name__ == "__main__":

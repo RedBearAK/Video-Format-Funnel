@@ -1,6 +1,6 @@
 """Tests for vidfunnel.record: paths, atomic saves, fingerprints, hashes, stages, lock."""
 
-VERSION = "20261110.2"
+VERSION = "20261111.1"
 
 import contextlib
 import datetime
@@ -1691,6 +1691,36 @@ class HeartbeatTests(TempDirCase):
                     warning = self.assert_taken()
                     self.assertIn("more than 3600 s; its pid is running here, taken for a reused one", warning)
 
+    def test_a_live_pid_here_with_a_recent_beat_is_judged_by_its_pid_not_its_beat(self):
+        """beat_age_seconds stays None and pid_running_here is set: the beat alone never takes such a lock over, so
+        vidfunnel.turns must not say when a silent beat would; the message says what does take it over."""
+        if machine_id() is None:
+            self.skipTest("no machine identity here: the pid rule needs one")
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        started = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)
+        content = {"host": socket.gethostname(), "pid": child.pid, "container": False,
+                   "started": started.strftime("%Y-%m-%dT%H:%M:%SZ"), "machine": machine_id(),
+                   "flock": False, "heartbeat": {"interval": HEARTBEAT_SECONDS}}
+        write_bytes(self.lock_file(), json.dumps(content).encode("utf-8"))  # its last beat: now
+        with self.assertRaises(LockHeld) as caught:
+            self.judge()
+        self.assertIsNone(caught.exception.beat_age_seconds)
+        self.assertTrue(caught.exception.pid_running_here)
+        message = str(caught.exception)
+        self.assertIn("its pid {} is running here and its holder last beat".format(child.pid), message)
+        self.assertIn("taken over once that process is gone, or once the lock is 24 h old and its holder has been "
+                      "silent for 3600 s", message)
+        self.assertNotIn("taken over once it has been silent", message)
+
+    def test_another_machines_beating_lock_is_not_marked_as_running_here(self):
+        self.write_other_lock(600)
+        with self.assertRaises(LockHeld) as caught:
+            self.judge()
+        self.assertFalse(caught.exception.pid_running_here)
+        self.assertIsNotNone(caught.exception.beat_age_seconds)
+
     def test_a_holder_running_past_24_hours_with_a_recent_beat_is_held(self):
         held = self.write_other_lock(300, started_hours_ago=30)
         message = self.assert_held(held)
@@ -2033,6 +2063,7 @@ class HeartbeatTests(TempDirCase):
                 FolderLock(self.base, warn=self.fail).acquire()
         self.assertIn("cannot start the heartbeat thread its lock needs (can't start new thread)",
                       str(caught.exception))
+        self.assertIsInstance(caught.exception, vidfunnel.record.LockNotStarted)  # no holder: nothing to wait for
         self.assertFalse(self.lock_file().exists())
         with held_lock_fds() as descriptors:
             self.assertEqual(descriptors, ())

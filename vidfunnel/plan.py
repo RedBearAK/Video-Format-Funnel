@@ -57,7 +57,7 @@ analyze_input(), which runs the same passes with an input-argument list and
 returns the same dict shape, built from analyze's own pure rules.
 """
 
-VERSION = "20261111"
+VERSION = "20261111.1"
 
 import hashlib
 import json
@@ -114,6 +114,7 @@ from vidfunnel.record import (
     FolderLock,
     LockHeld,
     LockLost,
+    LockNotStarted,
     RecordError,
     add_flag,
     add_penalty,
@@ -1877,14 +1878,17 @@ def _take_folder_lock(folder, entries, summary, stream, held=None):
     """The acquired FolderLock of `folder`, or None after saying why and counting its entries as skipped.
 
     With `held` (a list), a folder another run holds is appended to it
-    instead of having its entries counted, for the later rounds.
+    instead of having its entries counted, for the later rounds; a folder
+    whose lock needs a heartbeat thread that cannot be started
+    (LockNotStarted) is not held by anyone and is counted as skipped, as
+    without `held`.
     """
     lock = FolderLock(folder, warn=lambda message: say(message, stream))
     try:
         lock.acquire()
     except LockHeld as error:
         say("skipping folder '{}': {}".format(folder, error), stream)
-        if held is None:
+        if held is None or isinstance(error, LockNotStarted):
             summary.add("skipped", len(entries))
         else:
             held.append(folder)
@@ -1992,7 +1996,9 @@ def _plan_parallel(tools, options, progress, stream, summary, capabilities, fold
     lock is taken when its first group starts (vidfunnel.turns: one
     acquisition per folder, the others wait for it), so a folder no group
     has reached yet stays free for other hosts; a folder another run holds
-    is skipped and its groups are counted skipped without running. A
+    is skipped in this pass and its groups are planned in later rounds
+    (_plan_rounds) once it is free, or counted skipped with options.no_wait
+    or when the run drains first. A
     folder's file is updated and its lock released on this thread as soon as
     its last group has returned, so a finished folder is open to convert
     while the others are still planned.
@@ -2097,14 +2103,15 @@ class _GroupRunner(object):
             if value is None:
                 not_started(len(members))
             elif value == HELD_ELSEWHERE:
-                held.append(members)
+                held_at.append(index)
             else:
                 self.results.extend(value)
             self.leave(members)
 
+        held_at = []
         run_pool(jobs, [lambda members=members: self.plan_group(members) for members in units], group_done,
                  sizes=[len(members) for members in units], folders=[members[0][0] for members in units])
-        return held
+        return [units[index] for index in sorted(held_at)]  # in list order, not the order the groups ended in
 
     def rows(self, summary):
         """Count every result and return the table rows, in list order."""

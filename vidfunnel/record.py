@@ -6,7 +6,7 @@ per source file, named after the full source file name including its extension
 Records are the authority; every write is atomic (temp file, then os.replace).
 """
 
-VERSION = "20261111"
+VERSION = "20261111.1"
 
 import contextlib
 import datetime
@@ -118,6 +118,9 @@ class LockHeld(Exception):
     beat_age_seconds is set when the lock was judged by its heartbeat: the
     seconds since its holder's last beat on the share's clock (the lock is
     taken over once that passes HEARTBEAT_STALE_SECONDS); None otherwise.
+    pid_running_here is True when its pid runs on this machine (the pid rule
+    decided): it is then taken over only once that process is gone, or by
+    the 24 h rule, never by its heartbeat alone, and beat_age_seconds is None.
     """
 
     def __init__(self, message, host=None, pid=None, age_seconds=None, beat_age_seconds=None):
@@ -126,6 +129,16 @@ class LockHeld(Exception):
         self.pid = pid
         self.age_seconds = age_seconds
         self.beat_age_seconds = beat_age_seconds
+        self.pid_running_here = False  # set when its pid runs on this machine: not taken over while it does
+
+
+class LockNotStarted(LockHeld):
+    """No other run holds the folder: this run could not start what its lock needs (the heartbeat thread).
+
+    A LockHeld, so callers that skip a held folder for the run skip this
+    one the same way; vidfunnel.turns answers ERROR for it instead of
+    waiting for a holder that does not exist.
+    """
 
 
 # ---------------------------------------------------------------- time
@@ -816,8 +829,8 @@ def _start_beating(beat):
             thread.start()
         except RuntimeError as error:  # no thread can be started (a pids limit, RLIMIT_NPROC)
             _beats.remove(beat)
-            raise LockHeld("cannot start the heartbeat thread its lock needs ({}); the folder is not locked and "
-                           "not worked on".format(error)) from error
+            raise LockNotStarted("cannot start the heartbeat thread its lock needs ({}); the folder is not locked "
+                                 "and not worked on".format(error)) from error
         _beat_thread = thread
 
 
@@ -1571,16 +1584,23 @@ class FolderLock:
                 warning = ("warning: taking over lock '{}': its holder, host '{}' pid {}, no longer runs "
                            "(lock written {} s ago)".format(self.path, host, pid, _whole_seconds(age)))
             elif beat_age is not None and beat_age <= HEARTBEAT_STALE_SECONDS:
-                held = self._held(holder, age, "{}its holder last beat {:.0f} s ago on the share's clock; taken over "
-                                  "once it has been silent for {:.0f} s".format(
-                                      "its pid {} is running here and ".format(pid) if liveness is True else "",
-                                      max(0.0, beat_age), HEARTBEAT_STALE_SECONDS))
-                if liveness is not True:  # with its pid running here the 24 h rule takes it over, not the beat
+                if liveness is True:  # with its pid running here the beat alone never takes it over
+                    held = self._held(holder, age, "its pid {} is running here and its holder last beat {:.0f} s ago "
+                                      "on the share's clock; taken over once that process is gone, or once the lock "
+                                      "is 24 h old and its holder has been silent for {:.0f} s".format(
+                                          pid, max(0.0, beat_age), HEARTBEAT_STALE_SECONDS))
+                    held.pid_running_here = True
+                else:
+                    held = self._held(holder, age, "its holder last beat {:.0f} s ago on the share's clock; taken "
+                                      "over once it has been silent for {:.0f} s".format(
+                                          max(0.0, beat_age), HEARTBEAT_STALE_SECONDS))
                     held.beat_age_seconds = max(0.0, beat_age)
                 raise held
             elif beat_age is not None and liveness is True and age < self.stale_seconds:
-                raise self._held(holder, age, "its pid {} is running here, although its holder last beat {:.0f} s "
-                                 "ago on the share's clock; taken over once 24 h old".format(pid, beat_age))
+                held = self._held(holder, age, "its pid {} is running here, although its holder last beat {:.0f} s "
+                                  "ago on the share's clock; taken over once 24 h old".format(pid, beat_age))
+                held.pid_running_here = True
+                raise held
             elif beat_age is not None:
                 warning = ("warning: taking over lock '{}' held by {} '{}' pid {} since {}: its holder last beat "
                            "{:.0f} s ago on the share's clock, more than {:.0f} s{}".format(
@@ -1598,7 +1618,9 @@ class FolderLock:
                 if clock_doubt is not None:
                     why += "; its heartbeat cannot be judged, since {}, so the 24 h rule applies to its last beat".format(
                         clock_doubt)
-                raise self._held(holder, age, why)
+                held = self._held(holder, age, why)
+                held.pid_running_here = liveness is True
+                raise held
             elif clock_doubt is not None:
                 warning = ("warning: taking over stale lock '{}' held by {} '{}' pid {} since {}: {}, so the 24 h "
                            "rule decided on the younger of its start and its last beat, {:.1f} h ago on this "

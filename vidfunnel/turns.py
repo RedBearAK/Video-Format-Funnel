@@ -9,10 +9,12 @@ and wrap each item's work in enter() and leave():
 
 - enter(folder) takes the folder's lock the first time it is called for that
   folder and remembers the answer: HELD, SKIPPED (another run holds it:
-  LockHeld) or ERROR (the lock file cannot be created: OSError, the folder
-  named in `lock_errors`). The skip line ("skipping folder '<f>': ...") is
-  printed once; the folder's later items get the remembered answer without
-  another attempt. A per-folder threading.Lock lets only one thread acquire
+  LockHeld) or ERROR (the lock file cannot be created: OSError; or no
+  heartbeat thread can be started for it: LockNotStarted, a folder no other
+  run holds and so never waited for; the folder named in `lock_errors`).
+  The skip line ("skipping folder '<f>': ...") is printed once; the
+  folder's later items get the remembered answer without another attempt.
+  A per-folder threading.Lock lets only one thread acquire
   a given folder, so two workers that start items of one folder at once do
   not meet "locked by this run itself". Once the run is draining (SIGUSR1,
   a stop file, a lost lock) no new lock is taken: a folder not yet entered
@@ -42,24 +44,25 @@ or Ctrl+C ends. Folders that answered ERROR are never tried again. convert,
 convert --refit and plan use it unless --no-wait is given.
 
 A run never waits without saying for what: when a wait starts, and whenever
-the set of folders it waits for changes, it names each folder with its
-holder (host and pid from the last LockHeld), the age of the holder's last
-beat, how long until a silent holder's lock is taken over, and how many of
-this run's items are left there, and says what ends the wait; while the set
-stays the same it repeats a short status line every HELD_REPORT_SECONDS; a
+the set of folders it waits for or the holder of one of them changes, it
+names each folder with its holder (host and pid from the last LockHeld), the
+age of the holder's last beat, how long until a silent holder's lock is
+taken over (or, where the heartbeat does not decide, what does), and how
+many of this run's items are left there, and says what ends the wait; while
+the set stays the same it repeats a short status line every HELD_REPORT_SECONDS; a
 folder that leaves the set is named with the reason (taken by this run, its
 lock free or taken over, or finished by its holder), and a wait cut short by
 a drain, a stop file or an interrupt says so with the folders still held.
 """
 
-VERSION = "20261111"
+VERSION = "20261111.1"
 
 import threading
 import time
 
 import vidfunnel.record
 from vidfunnel.interrupt import drain_before_next, drain_tally, draining
-from vidfunnel.record import FolderLock, LockHeld
+from vidfunnel.record import FolderLock, LockHeld, LockNotStarted
 
 HELD = "held"
 SKIPPED = "skipped"
@@ -130,6 +133,10 @@ class FolderTurns(object):
             lock = FolderLock(folder, warn=self._warn)
             try:
                 lock.acquire()
+            except LockNotStarted as error:  # no other run holds it: nothing to wait for
+                self._say("skipping folder '{}': cannot take its lock: {}".format(folder, error))
+                self.lock_errors.append(name)
+                answer = ERROR
             except LockHeld as error:
                 with self._guard:
                     self._holders[name] = error
@@ -234,16 +241,30 @@ def _seconds(value):
 
 
 def holder_words(error):
-    """'held by host 'H' pid P, last beat N s ago (...)' from a LockHeld, for the lines of a wait."""
+    """'held by host 'H' pid P, last beat N s ago (...)' from a LockHeld, for the lines of a wait.
+
+    Each form says what ends the wait for that folder: the heartbeat's
+    silence, its pid's end on this machine (pid_running_here) or, embedded,
+    the LockHeld message, which says which rule keeps the lock.
+    """
     if error is None:
         return "held by another run"
     words = "held by another run" if error.host is None else "held by host '{}' pid {}".format(error.host, error.pid)
+    if getattr(error, "pid_running_here", False):
+        return ("{}, a process running on this machine (taken over once that process is gone; while it runs, not "
+                "before the lock is {:g} h old: {})".format(words, vidfunnel.record.LOCK_STALE_SECONDS / 3600.0,
+                                                           error))
     beat = getattr(error, "beat_age_seconds", None)
     if beat is None:
         return "{} (its heartbeat does not decide here: {})".format(words, error)
     stale = vidfunnel.record.HEARTBEAT_STALE_SECONDS
     return "{}, last beat {} ago (taken over if it stays silent for {} more, at the first try after that)".format(
         words, _seconds(beat), _seconds(stale - beat))
+
+
+def _holder_key(error):
+    """(host, pid) of a LockHeld, or None: a change re-announces the wait."""
+    return None if error is None else (error.host, error.pid)
 
 
 def _beat_words(error):
@@ -261,10 +282,9 @@ def waiting_lines(turns, folders, left):
     for folder in folders:
         lines.append("  '{}': {}; {} item(s) of this run left there".format(folder, holder_words(turns.holder(folder)),
                                                                             left[folder]))
-    lines.append("the wait ends for a folder when its holder finishes or releases it, or when its holder's heartbeat "
-                 "has been silent for {} and its lock is taken over; Ctrl+C, SIGUSR1 or 'vidfunnel stop-all PATH' "
-                 "ends the whole wait; --no-wait skips such folders instead".format(
-                     _seconds(vidfunnel.record.HEARTBEAT_STALE_SECONDS)))
+    lines.append("the wait ends for a folder when its holder finishes or releases it, or when its lock is taken over "
+                 "as its line says; Ctrl+C, SIGUSR1 or 'vidfunnel stop-all PATH' (PATH at or above these folders) "
+                 "ends the whole wait; --no-wait skips such folders instead")
     return lines
 
 
@@ -313,12 +333,14 @@ def held_rounds(turns, held, folder_of, settle, run, say_line, size_of=None):
     those units as the caller's main pass does, each through turns.enter()
     and turns.leave(), and returns the ones whose folder another run still
     holds. A round in which nothing was settled and no unit ran is followed
-    by a wait (wait_for_folders), announced by waiting_lines whenever the set
-    of folders waited for is not the one last announced, and by a status_line
-    every HELD_REPORT_SECONDS while it is. Returns [] when no folder has work
-    left, or the units still held when the run drains (the caller counts them
-    as skipped); Ctrl+C and a 'now' stop file raise KeyboardInterrupt, after
-    a line that says so.
+    by a wait (wait_for_folders), announced by waiting_lines (folders in
+    sorted order) whenever the set of folders waited for, or the holder (host
+    and pid) of one of them, is not the one last announced, and by a
+    status_line every HELD_REPORT_SECONDS while it is. Returns [] when no
+    folder has work left, or the units still held when the run drains (the
+    caller counts them as skipped, and they are added to drain_tally.left,
+    as never started); Ctrl+C and a 'now' stop file raise KeyboardInterrupt,
+    after a line that says so.
     """
     size_of = size_of if size_of is not None else (lambda unit: 1)
 
@@ -331,6 +353,9 @@ def held_rounds(turns, held, folder_of, settle, run, say_line, size_of=None):
 
     def give_up(units, reason, counted):
         left = left_in(units)
+        if counted:  # a drain: these items were never started, as the drain's 'left' counts them
+            drain_tally.seen = True
+            drain_tally.left += sum(left.values())
         say_line("not waiting for {} folder(s) other runs hold ({}): {}; {}".format(
             len(left), ", ".join("'{}'".format(name) for name in left), reason,
             "their {} item(s) are counted as skipped".format(sum(left.values())) if counted
@@ -370,12 +395,13 @@ def held_rounds(turns, held, folder_of, settle, run, say_line, size_of=None):
         if not held or moved:
             continue
         left = left_in(held)
-        folders = list(left)
+        folders = sorted(left)  # with --jobs `held` comes in completion order: the set and its holders decide
+        holders = {name: _holder_key(turns.holder(name)) for name in folders}
         now = _clock()
-        if folders != announced:
+        if holders != announced:
             for line in waiting_lines(turns, folders, left):
                 say_line(line)
-            announced = folders
+            announced = holders
             reported = now
             since = now if since is None else since
         elif now - reported >= HELD_REPORT_SECONDS:

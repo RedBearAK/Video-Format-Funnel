@@ -44,9 +44,10 @@ What it does (HANDOFF.md section 9, "Multi-host soak"):
 Scenarios (each with N hosts, N from --hosts):
   plain      all hosts run to completion.
   kill       one host's process group gets SIGKILL while it encodes in a
-             folder it holds; the others go on; once the lock is older than
-             the stale age, the survivors run convert again and one of them
-             takes the folder over and finishes it.
+             folder it holds; the others go on, and their first run waits
+             for that folder in its later rounds until the lock is older than
+             the stale age, when one of them takes the folder over and
+             finishes it; a further pass of the survivors finds it done.
   freeze     one host's process group gets SIGSTOP while it encodes in a
              folder it holds and stays stopped until another host has taken
              the folder over; then SIGCONT. It must lose the lock and write
@@ -89,7 +90,7 @@ the part file (a probe of that window, not part of the default run);
 its own encode of the frozen host's file.
 """
 
-VERSION = "20261110.3"
+VERSION = "20261111.1"
 
 import argparse
 import contextlib
@@ -876,7 +877,8 @@ class Soak(object):
         victim.gone_ns = time.time_ns()
         self.wait_runs(scene, runs[1:], "the surviving hosts to finish their first pass")
         self._wait_stale(scene, folder, victim)
-        say("    the survivors run convert again")
+        say("    the survivors run convert again (a further pass: their first runs waited for the folder and took it "
+            "over)")
         second = self._survivors_pass(scene, survivors)
         self.wait_runs(scene, second, "the surviving hosts' second pass")
 
