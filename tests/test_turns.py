@@ -1,6 +1,6 @@
 """Tests for vidfunnel.turns: a folder's lock taken at its first item, once, and released after its last."""
 
-VERSION = "20261110"
+VERSION = "20261111"
 
 import datetime
 import json
@@ -185,6 +185,56 @@ class EnterLeaveTest(TurnsCase):
         turns.leave(self.meadow, last=last)
         self.assertEqual(seen, [("harbour", True)])
         self.assertFalse(self.lock_file(self.harbour).exists())
+
+
+class AgainTest(TurnsCase):
+    """again(): a folder another run held is tried once more in a later round, its skip line not repeated."""
+
+    def test_a_skipped_folder_is_tried_again_and_taken_once_free(self):
+        foreign = foreign_live_lock(self.meadow)
+        turns = self.turns({self.meadow: 2})
+        for _item in range(2):
+            self.assertEqual(turns.enter(self.meadow), SKIPPED)
+            turns.leave(self.meadow)
+        turns.again(self.meadow, 1)
+        self.assertEqual(turns.enter(self.meadow), SKIPPED, "still held")
+        turns.leave(self.meadow)
+        foreign.unlink()
+        turns.again(self.meadow, 1)
+        self.assertEqual(turns.enter(self.meadow), HELD)
+        self.assertTrue(self.lock_file(self.meadow).exists())
+        turns.leave(self.meadow)
+        self.assertFalse(self.lock_file(self.meadow).exists(), "not released after the round's last item")
+        self.assertEqual(len(self.lines), 2, self.lines)
+        self.assertTrue(self.lines[0].startswith("skipping folder '{}': ".format(self.meadow)), self.lines)
+        self.assertEqual(self.lines[1], "folder '{}' taken by this run in a later round: the run that held it has "
+                                        "released it".format(self.meadow))
+        self.assertIsNotNone(turns.holder(self.meadow))
+        self.assertEqual((turns.holder(self.meadow).host, turns.holder(self.meadow).pid), ("elsewhere-host", 4242))
+
+    def test_a_folder_never_entered_may_be_tried(self):
+        turns = self.turns({})
+        turns.again(self.harbour, 1)
+        self.assertEqual(turns.enter(self.harbour), HELD)
+        turns.leave(self.harbour)
+        self.assertFalse(self.lock_file(self.harbour).exists())
+
+    def test_a_held_an_errored_or_a_busy_folder_is_not_tried_again(self):
+        turns = self.turns({self.harbour: 1, self.meadow: 2})
+        self.assertEqual(turns.enter(self.harbour), HELD)
+        with self.assertRaises(ValueError):
+            turns.again(self.harbour, 1)
+        with mock.patch.object(FolderLock, "acquire", side_effect=PermissionError(13, "Permission denied")):
+            self.assertEqual(turns.enter(self.meadow), ERROR)
+        turns.leave(self.meadow)
+        turns.leave(self.meadow)
+        with self.assertRaises(ValueError):
+            turns.again(self.meadow, 1)
+        foreign_live_lock(self.folder("orchard"))
+        busy = self.turns({self.root / "orchard": 2})
+        self.assertEqual(busy.enter(self.root / "orchard"), SKIPPED)
+        with self.assertRaises(ValueError):  # one item of the folder has not left yet
+            busy.again(self.root / "orchard", 1)
 
 
 class SerialisedEnterTest(TurnsCase):

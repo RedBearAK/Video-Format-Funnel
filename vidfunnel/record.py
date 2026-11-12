@@ -6,7 +6,7 @@ per source file, named after the full source file name including its extension
 Records are the authority; every write is atomic (temp file, then os.replace).
 """
 
-VERSION = "20261110.3"
+VERSION = "20261111"
 
 import contextlib
 import datetime
@@ -113,13 +113,19 @@ class LockLost(Exception):
 
 
 class LockHeld(Exception):
-    """Another run holds the folder lock and it is not taken for dead (see FolderLock)."""
+    """Another run holds the folder lock and it is not taken for dead (see FolderLock).
 
-    def __init__(self, message, host=None, pid=None, age_seconds=None):
+    beat_age_seconds is set when the lock was judged by its heartbeat: the
+    seconds since its holder's last beat on the share's clock (the lock is
+    taken over once that passes HEARTBEAT_STALE_SECONDS); None otherwise.
+    """
+
+    def __init__(self, message, host=None, pid=None, age_seconds=None, beat_age_seconds=None):
         Exception.__init__(self, message)
         self.host = host
         self.pid = pid
         self.age_seconds = age_seconds
+        self.beat_age_seconds = beat_age_seconds
 
 
 # ---------------------------------------------------------------- time
@@ -1302,6 +1308,7 @@ class FolderLock:
         self.content = None
         self.handle = None  # the descriptor of our lock file while we hold it
         self.beat = None    # its entry in the heartbeat registry while we hold it
+        self.took_over = False  # True once acquire() replaced a lock judged dead (vidfunnel.turns reports it)
 
     def _holder(self):
         """(content dict, age in seconds) of the current lock file, or (None, None) if absent."""
@@ -1480,6 +1487,7 @@ class FolderLock:
         content = {"host": socket.gethostname(), "pid": os.getpid(), "started": now_iso(),
                    "container": in_container(), "machine": machine, "machine_source": machine_source,
                    "boot": boot_id(), HEARTBEAT_FIELD: {"interval": HEARTBEAT_SECONDS}}
+        self.took_over = False
         try:
             self._create(content)
         except FileExistsError:
@@ -1563,10 +1571,13 @@ class FolderLock:
                 warning = ("warning: taking over lock '{}': its holder, host '{}' pid {}, no longer runs "
                            "(lock written {} s ago)".format(self.path, host, pid, _whole_seconds(age)))
             elif beat_age is not None and beat_age <= HEARTBEAT_STALE_SECONDS:
-                raise self._held(holder, age, "{}its holder last beat {:.0f} s ago on the share's clock; taken over "
-                                 "once it has been silent for {:.0f} s".format(
-                                     "its pid {} is running here and ".format(pid) if liveness is True else "",
-                                     max(0.0, beat_age), HEARTBEAT_STALE_SECONDS))
+                held = self._held(holder, age, "{}its holder last beat {:.0f} s ago on the share's clock; taken over "
+                                  "once it has been silent for {:.0f} s".format(
+                                      "its pid {} is running here and ".format(pid) if liveness is True else "",
+                                      max(0.0, beat_age), HEARTBEAT_STALE_SECONDS))
+                if liveness is not True:  # with its pid running here the 24 h rule takes it over, not the beat
+                    held.beat_age_seconds = max(0.0, beat_age)
+                raise held
             elif beat_age is not None and liveness is True and age < self.stale_seconds:
                 raise self._held(holder, age, "its pid {} is running here, although its holder last beat {:.0f} s "
                                  "ago on the share's clock; taken over once 24 h old".format(pid, beat_age))
@@ -1600,6 +1611,7 @@ class FolderLock:
                     self.path, holder_words, host, pid, holder.get("started"), age / 3600.0,
                     "; its pid is running here, taken for a reused one" if liveness is True else "")
             self._replace(content, judged, holder, age, guard)
+            self.took_over = True
             self._warn_quietly(warning)  # the lock is ours: a warning that cannot be written does not undo that
             return
 

@@ -7,7 +7,7 @@ fixture folder itself is never planned) and skip with a message when
 ffmpeg or the fixtures are missing.
 """
 
-VERSION = "20261110.1"
+VERSION = "20261111"
 
 import contextlib
 import copy
@@ -1039,7 +1039,7 @@ class PlanRunTest(unittest.TestCase):
                 mock.patch.object(vidfunnel.turns.FolderTurns, "enter", enter):
             sampler.start()
             try:
-                summary = plan_paths(TOOLS, [str(self.root)], make_options(jobs=2), progress=progress)
+                summary = plan_paths(TOOLS, [str(self.root)], make_options(jobs=2, no_wait=True), progress=progress)
             finally:
                 stop.set()
                 sampler.join(60)

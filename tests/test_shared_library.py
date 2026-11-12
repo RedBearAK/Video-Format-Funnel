@@ -4,10 +4,12 @@ Each child runs vidfunnel.encode.convert_paths through a small driver that
 replaces the encode with a stand-in: it writes a marker file naming the
 folder, the record and its pid, waits for a gate file the test controls,
 checks its folder lock (vidfunnel.record.ensure_lock), writes a stand-in
-output and saves a convert stage. No ffmpeg runs.
+output and saves a convert stage. No ffmpeg runs. The runs use --no-wait
+(options.no_wait): this test is about the single pass, in which a folder the
+other run holds is skipped; the later rounds are tested in test_convert_wait.
 """
 
-VERSION = "20261110.1"
+VERSION = "20261111"
 
 import os
 import subprocess
@@ -68,7 +70,7 @@ with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch("vidfunnel.record.boot_id", return_value=pose + "-boot"))
         stack.enter_context(mock.patch("socket.gethostname", return_value=pose + "-host"))
     stack.enter_context(mock.patch.object(encode, "convert_one", stand_in))
-    options = types.SimpleNamespace(par2=None, jobs=1, dry_run=False, verbose=False, refit=False)
+    options = types.SimpleNamespace(par2=None, jobs=1, dry_run=False, verbose=False, refit=False, no_wait=True)
     progress = types.SimpleNamespace(stream=None, quiet=True, verbose=False)
     summary = encode.convert_paths(None, [library], options, progress)
 failed = summary.counts.get("failed", 0) + summary.counts.get("collision", 0)

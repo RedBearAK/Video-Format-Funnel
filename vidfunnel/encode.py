@@ -91,9 +91,12 @@ records collected at the scan are read as they are on disk at that moment
 planned records whose output names meet in it (output.name or
 output.interim_name, compared case-insensitively) are all refused: both
 source names are printed, neither record is touched, and they are counted
-as 'collision' in the summary. A folder whose lock is
-held, or cannot be created (a read-only folder), is skipped for the run;
-the second kind and any collision make run() exit with EXIT_ERROR.
+as 'collision' in the summary. A folder whose lock cannot be created (a
+read-only folder) is skipped for the run; that and any collision make run()
+exit with EXIT_ERROR. A folder another run holds is visited again after the
+main pass, round after round (vidfunnel.turns.held_rounds), until the other
+run has finished its items or this run has taken the lock and converted
+them, or the run drains; --no-wait skips such folders for the run instead.
 
 The record is saved after every change of state, so an interrupted run
 leaves a record that says what happened. A record that is not 'planned' is
@@ -102,7 +105,7 @@ whose output still matches its fingerprint (content only, the time is not
 compared) is reported as already converted.
 """
 
-VERSION = "20261110.4"
+VERSION = "20261111"
 
 import errno
 import hashlib
@@ -128,7 +131,7 @@ from vidfunnel.interrupt import Interrupted, child_interrupted, drain_after_item
 from vidfunnel.interrupt import check as check_interrupted
 from vidfunnel.progress import Progress, StageSummary, ffmpeg_progress_callback, item_tag, say, tagged
 from vidfunnel.stopfile import forget_item, raise_if_stopped_now, remember_item
-from vidfunnel.turns import DRAINING, HELD, FolderTurns, not_started
+from vidfunnel.turns import DRAINING, HELD, HELD_ELSEWHERE, SKIPPED, FolderTurns, held_rounds, not_started
 from vidfunnel.record import (
     RECORD_DIR,
     LockLost,
@@ -1662,11 +1665,14 @@ def refit_paths(tools, paths, options, progress=None):
             return refit_one(tools, key, record, options, shared, position, total)
 
         def item(position, key, folder):
-            """(outcome, reason), or None when the run drained before the folder was entered (not started)."""
+            """(outcome, reason), HELD_ELSEWHERE when another run holds the folder, or None when the run drained
+            before the folder was entered (not started)."""
             try:
                 turn = turns.enter(folder)
                 if turn == DRAINING:
                     return None
+                if turn == SKIPPED:
+                    return HELD_ELSEWHERE
                 if turn != HELD:
                     return "skipped", "folder locked"
                 return work(position, key)
@@ -1674,28 +1680,58 @@ def refit_paths(tools, paths, options, progress=None):
                 turns.leave(folder)
 
         results = []
-        if jobs == 1:
-            for position, (key, folder) in enumerate(runnable, 1):
-                if drain_before_next(len(runnable) - position + 1, folder):
-                    break
-                result = item(position, key, folder)
-                if result is None:
-                    drain_before_next(len(runnable) - position + 1)  # draining: counts this item and the rest left
-                    break
-                results.append(result)
-                drain_after_item()
-        else:
-            results = [None] * len(runnable)
 
-            def refit_done(index, value):
-                if value is None:
-                    not_started()
-                results[index] = value
+        def run_items(batch):
+            """Run [(position, key, folder)]; returns those whose folder another run holds."""
+            held = []
+            if jobs == 1:
+                for number, (position, key, folder) in enumerate(batch):
+                    if drain_before_next(len(batch) - number, folder):
+                        break
+                    result = item(position, key, folder)
+                    if result is None:
+                        drain_before_next(len(batch) - number)  # draining: counts this item and the rest left
+                        break
+                    if result == HELD_ELSEWHERE:
+                        held.append((position, key, folder))
+                    else:
+                        results.append(result)
+                    drain_after_item()
+            else:
+                def refit_done(index, value):
+                    if value is None:
+                        not_started()
+                    elif value == HELD_ELSEWHERE:
+                        held.append(batch[index])
+                    else:
+                        results.append(value)
 
-            run_pool(jobs, [lambda position=position, key=key, folder=folder: item(position, key, folder)
-                            for position, (key, folder) in enumerate(runnable, 1)], refit_done,
-                     folders=[folder for _key, folder in runnable])
-        for outcome, reason in [result for result in results if result is not None]:  # None: not started (drain)
+                run_pool(jobs, [lambda position=position, key=key, folder=folder: item(position, key, folder)
+                                for position, key, folder in batch], refit_done,
+                         folders=[folder for _position, _key, folder in batch])
+            return held
+
+        def settle(unit):
+            """None when the record, read again without a lock, is no longer one to refit (said and counted)."""
+            position, key, _folder = unit
+            try:
+                record = load_record(key)
+            except RecordError:
+                return unit  # reported by the item under the lock
+            if record is None:
+                return unit
+            reason = refit_selection(record)
+            if reason is None:
+                return unit
+            say("skipping '{}': {}".format(_label(record), reason), tagged(out, item_tag("refit", position, total)))
+            results.append(("skipped", reason))
+            return None
+
+        held = run_items([(position, key, folder) for position, (key, folder) in enumerate(runnable, 1)])
+        if held and not getattr(options, "no_wait", False):
+            held = held_rounds(turns, held, lambda unit: unit[2], settle, run_items, lambda message: say(message, out))
+        results.extend(("skipped", "folder locked") for _unit in held)
+        for outcome, reason in results:
             if outcome == "skipped":
                 skipped(reason)
             else:
@@ -1841,6 +1877,32 @@ def _finished_record(key, folder):
     return None
 
 
+def _settled_elsewhere(key, folder):
+    """(record, reason) when the item, read again without a lock, needs no conversion any more; else None.
+
+    For the later rounds over a folder another run held: the record is
+    already converted with its output unchanged (_finished_record: 'already
+    converted'), or its status is no longer 'planned' (the other run
+    converted it, or it failed or was quarantined there), with the reason
+    convert would give for it under the lock (_refusal). Writes nothing; a
+    record that cannot be read or judged here is None, and the item then
+    runs under the folder's lock, where it is reported.
+    """
+    finished = _finished_record(key, folder)
+    if finished is not None:
+        return finished, "already converted"
+    try:
+        record = load_record(key)
+        if record is None or record_name_problem(record) is not None or record.get("status") == "planned":
+            return None
+        reason = _refusal(record, folder, output_path_for(record, folder))
+    except (RecordError, ValueError, TypeError, AttributeError, KeyError):
+        return None
+    if reason is None:
+        return None
+    return record, reason
+
+
 def _shared_outputs(runnable, stream):
     """(kept, refused): runnable [(key, folder)] without the planned records whose output names meet.
 
@@ -1965,7 +2027,8 @@ def convert_paths(tools, paths, options, progress=None):
             return "failed"
 
         def item(position, key, folder):
-            """The item's outcome, or None when the run drained before the folder was entered (not started)."""
+            """The item's outcome, HELD_ELSEWHERE when another run holds the folder, or None when the run drained
+            before the folder was entered (not started)."""
             try:
                 finished = _finished_record(key, folder)
                 if finished is not None:
@@ -1976,6 +2039,8 @@ def convert_paths(tools, paths, options, progress=None):
                 turn = turns.enter(folder)
                 if turn == DRAINING:
                     return None
+                if turn == SKIPPED:
+                    return HELD_ELSEWHERE
                 if turn != HELD:
                     return "skipped"
                 if str(key) in collided:
@@ -1984,26 +2049,51 @@ def convert_paths(tools, paths, options, progress=None):
             finally:
                 turns.leave(folder)
 
-        def done(_index, outcome):
-            if outcome is None:
-                not_started()
+        def run_items(batch):
+            """Run [(position, key, folder)]; returns those whose folder another run holds."""
+            held = []
+            if jobs == 1:
+                for number, (position, key, folder) in enumerate(batch):
+                    if drain_before_next(len(batch) - number, folder):
+                        break
+                    outcome = item(position, key, folder)
+                    if outcome is None:
+                        drain_before_next(len(batch) - number)  # draining: counts this item and the rest left
+                        break
+                    if outcome == HELD_ELSEWHERE:
+                        held.append((position, key, folder))
+                    else:
+                        summary.add(outcome)
+                    drain_after_item()
             else:
-                summary.add(outcome)
+                def done(index, outcome):
+                    if outcome is None:
+                        not_started()
+                    elif outcome == HELD_ELSEWHERE:
+                        held.append(batch[index])
+                    else:
+                        summary.add(outcome)
 
-        if jobs == 1:
-            for position, (key, folder) in enumerate(runnable, 1):
-                if drain_before_next(len(runnable) - position + 1, folder):
-                    break
-                outcome = item(position, key, folder)
-                if outcome is None:
-                    drain_before_next(len(runnable) - position + 1)  # draining: counts this item and the rest left
-                    break
-                summary.add(outcome)
-                drain_after_item()
-        else:
-            run_pool(jobs, [lambda position=position, key=key, folder=folder: item(position, key, folder)
-                            for position, (key, folder) in enumerate(runnable, 1)],
-                     done, folders=[folder for _key, folder in runnable])
+                run_pool(jobs, [lambda position=position, key=key, folder=folder: item(position, key, folder)
+                                for position, key, folder in batch],
+                         done, folders=[folder for _position, _key, folder in batch])
+            return held
+
+        def settle(unit):
+            """None when the record, read again without a lock, needs nothing more of this run (said and counted)."""
+            position, key, folder = unit
+            settled = _settled_elsewhere(key, folder)
+            if settled is None:
+                return unit
+            record, reason = settled
+            say("skipping '{}': {}".format(_label(record), reason), tagged(out, item_tag("convert", position, total)))
+            summary.add("skipped")
+            return None
+
+        held = run_items([(position, key, folder) for position, (key, folder) in enumerate(runnable, 1)])
+        if held and not getattr(options, "no_wait", False):
+            held = held_rounds(turns, held, lambda unit: unit[2], settle, run_items, lambda message: say(message, out))
+        summary.add("skipped", len(held))  # still held when the run ended (--no-wait, or a drain)
     finally:
         turns.close()
     say(summary.format("'{}/' under each folder".format(RECORD_DIR)), out)
@@ -2036,6 +2126,9 @@ def add_arguments(parser):
     parser.add_argument("--refit", action="store_true",
                         help="re-encode converted outputs flagged 'output-larger' once more at a higher CRF "
                         "(capped at 23 for SD, 24 above), keeping the smaller result")
+    parser.add_argument("--no-wait", action="store_true",
+                        help="do not wait for folders another run holds; skip them and end (default: try them "
+                        "again every minute until nothing is left to do there)")
     return parser
 
 
@@ -2058,7 +2151,8 @@ def run(args):
     options = types.SimpleNamespace(par2=getattr(args, "par2", None), jobs=getattr(args, "jobs", 1),
                                     dry_run=bool(getattr(args, "dry_run", False)),
                                     verbose=bool(getattr(args, "verbose", False)),
-                                    refit=bool(getattr(args, "refit", False)))
+                                    refit=bool(getattr(args, "refit", False)),
+                                    no_wait=bool(getattr(args, "no_wait", False)))
     progress = types.SimpleNamespace(stream=None, quiet=bool(getattr(args, "quiet", False)),
                                      verbose=options.verbose)
     summary = convert_paths(tools, args.paths, options, progress)

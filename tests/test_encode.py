@@ -8,7 +8,7 @@ ends at 'converted' or 'verified' depends on whether vidfunnel.verify is
 present, so both are accepted.
 """
 
-VERSION = "20261110.4"
+VERSION = "20261111"
 
 import argparse
 import contextlib
@@ -4319,12 +4319,13 @@ class OnDemandLockCase(unittest.TestCase):
                 unittest.mock.patch("vidfunnel.encode.run_tool", side_effect=AssertionError("ffmpeg started")),
                 unittest.mock.patch("vidfunnel.record._warn")]
 
-    def run_convert(self, jobs=1, refit=False):
+    def run_convert(self, jobs=1, refit=False, **values):
         progress = quiet()
         with contextlib.ExitStack() as stack:
             for patch in self.patches(refit):
                 stack.enter_context(patch)
-            summary = convert_paths(None, [str(self.root)], convert_options(jobs=jobs, refit=refit), progress)
+            summary = convert_paths(None, [str(self.root)], convert_options(jobs=jobs, refit=refit, **values),
+                                    progress)
         return summary, progress.stream.getvalue()
 
     def acquired(self):
@@ -4433,7 +4434,7 @@ class OnDemandConvertTest(OnDemandLockCase):
                 foreign = foreign_live_lock(self.root / "second")
                 foreign_bytes = foreign.read_bytes()
                 held_records = self.record_bytes({stem: sources[stem] for stem in ("meadow", "orchard")})
-                summary, text = self.run_convert(jobs=jobs, refit=refit)
+                summary, text = self.run_convert(jobs=jobs, refit=refit, no_wait=True)  # one pass, as before
                 self.assertEqual(text.count("skipping folder '{}': ".format(self.root / "second")), 1, text)
                 self.assertIn("elsewhere-host", text)
                 self.assertEqual(self.record_bytes({stem: sources[stem] for stem in ("meadow", "orchard")}),

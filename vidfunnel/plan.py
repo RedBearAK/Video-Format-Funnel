@@ -57,7 +57,7 @@ analyze_input(), which runs the same passes with an input-argument list and
 returns the same dict shape, built from analyze's own pure rules.
 """
 
-VERSION = "20261110"
+VERSION = "20261111"
 
 import hashlib
 import json
@@ -131,7 +131,7 @@ from vidfunnel.record import (
     save_record,
     set_status,
 )
-from vidfunnel.turns import DRAINING, HELD, FolderTurns, not_started
+from vidfunnel.turns import DRAINING, HELD, HELD_ELSEWHERE, SKIPPED, FolderTurns, held_rounds, not_started
 
 SOURCE_EXTENSIONS = {
     "avi", "flv", "swf", "wmv", "asf", "mpg", "mpeg", "mpe", "m2v", "vob", "mov", "qt", "mkv", "webm", "mp4",
@@ -191,15 +191,17 @@ def make_options(**values):
     """The plan options as a namespace, defaults filled in (what run() builds from the CLI args)."""
     defaults = dict(samples=None, full_analysis=False, assume_dar=None, audio_offset=None, audio_strict_aac=False,
                     reencode_video=False, max_level="4.2", plain_mp4=False, par2=None, replan=False, jobs=1,
-                    mark_outputs=False)
+                    mark_outputs=False, no_wait=False)
     defaults.update(values)
     return types.SimpleNamespace(**defaults)
 
 
 def options_from_args(args):
-    """make_options from the CLI args; 'jobs' is how the run is done, not a decision, so it is not recorded."""
+    """make_options from the CLI args; 'jobs' and 'no_wait' are how the run is done, not decisions, so they are not
+    recorded."""
     values = {name: getattr(args, name) for name in PLAN_OPTION_NAMES if hasattr(args, name)}
     values["jobs"] = getattr(args, "jobs", 1) or 1
+    values["no_wait"] = bool(getattr(args, "no_wait", False))
     return make_options(**values)
 
 
@@ -1811,10 +1813,14 @@ def _table_row(outcome, record):
 def plan_paths(tools, paths, options, progress=None):
     """Plan every source under `paths`; print per-file lines, a table and the summary; return the StageSummary.
 
-    A folder whose lock is held by another run, or whose lock cannot be
-    created (a read-only folder), is skipped and counted as 'skipped'; the
-    second kind is also listed in the summary's `lock_errors` (folder names),
-    which makes run() exit with EXIT_ERROR.
+    A folder whose lock cannot be created (a read-only folder) is skipped
+    and counted as 'skipped', and listed in the summary's `lock_errors`
+    (folder names), which makes run() exit with EXIT_ERROR. A folder another
+    run holds is visited again after the main pass, round after round
+    (vidfunnel.turns.held_rounds, _plan_rounds), until the other run has
+    planned its sources or this run has taken the lock and planned them, or
+    the run drains; with options.no_wait it is skipped for the run and its
+    items counted as 'skipped'.
 
     options.jobs above 1 plans that many items at once, also within one
     folder, through a thread pool; counts, rows and the folder file are
@@ -1867,14 +1873,21 @@ def plan_paths(tools, paths, options, progress=None):
     return summary
 
 
-def _take_folder_lock(folder, entries, summary, stream):
-    """The acquired FolderLock of `folder`, or None after saying why and counting its entries as skipped."""
+def _take_folder_lock(folder, entries, summary, stream, held=None):
+    """The acquired FolderLock of `folder`, or None after saying why and counting its entries as skipped.
+
+    With `held` (a list), a folder another run holds is appended to it
+    instead of having its entries counted, for the later rounds.
+    """
     lock = FolderLock(folder, warn=lambda message: say(message, stream))
     try:
         lock.acquire()
     except LockHeld as error:
         say("skipping folder '{}': {}".format(folder, error), stream)
-        summary.add("skipped", len(entries))
+        if held is None:
+            summary.add("skipped", len(entries))
+        else:
+            held.append(folder)
         return None
     except OSError as error:
         say("skipping folder '{}': cannot take its lock: {}".format(folder, error), stream)
@@ -1911,15 +1924,25 @@ def _plan_entry(tools, work, found, options, folder_sources, capabilities, progr
 
 
 def _plan_sequential(tools, options, progress, stream, summary, capabilities, folders, by_folder, siblings, total):
-    """One folder after another, one item after another; returns the table rows."""
+    """One folder after another, one item after another; returns the table rows.
+
+    The folders another run held are planned in later rounds (_plan_rounds),
+    one item at a time in list order, unless options.no_wait.
+    """
     position = 0
     rows = []
+    wait = not getattr(options, "no_wait", False)
+    held_folders = []
+    held = []
     for folder_number, folder in enumerate(folders):
         entries = by_folder[folder]
         if drain_before_next(sum(len(by_folder[later]) for later in folders[folder_number:]), folder):
             break
-        lock = _take_folder_lock(folder, entries, summary, stream)
+        lock = _take_folder_lock(folder, entries, summary, stream, held_folders if wait else None)
         if lock is None:
+            if held_folders and held_folders[-1] == folder:
+                held.extend([(folder, work, found, position + number)]
+                            for number, (work, found) in enumerate(entries, 1))
             position += len(entries)
             continue
         drained = False
@@ -1942,6 +1965,15 @@ def _plan_sequential(tools, options, progress, stream, summary, capabilities, fo
             lock.release()
         if drained:
             break
+    if held:
+        turns = FolderTurns({}, lambda message: say(message, stream), lock_errors=summary.lock_errors)
+        try:
+            runner = _GroupRunner(tools, options, progress, stream, capabilities, by_folder, siblings, total, turns,
+                                  {})
+            _plan_rounds(runner, held, 1, summary)
+        finally:
+            turns.close()
+        rows.extend(runner.rows(summary))
     return rows
 
 
@@ -1991,45 +2023,159 @@ def _plan_parallel(tools, options, progress, stream, summary, capabilities, fold
         outstanding[folder] = outstanding.get(folder, 0) + 1
     turns = FolderTurns(outstanding, lambda message: say(message, stream), lock_errors=summary.lock_errors)
     try:
-        def plan_group(members):
-            """[(number, (outcome, record))], or None when the run drained before the folder was entered."""
-            folder = members[0][0]
-            turn = turns.enter(folder)
-            if turn == DRAINING:
-                return None
-            if turn != HELD:  # held by another run, or no lock file can be created: said once by turns.enter
-                return [(number, ("skipped", None)) for _folder, _work, _found, number in members]
-            results = []
-            for folder, work, found, number in members:
-                results.append((number, _plan_entry(tools, work, found, options, siblings.get(folder, []),
-                                                    capabilities, progress, stream, number, total,
-                                                    record_locks[folder])))
-            return results
+        runner = _GroupRunner(tools, options, progress, stream, capabilities, by_folder, siblings, total, turns,
+                              record_locks)
+        held = runner.run([groups[key] for key in order], jobs)
+        _plan_rounds(runner, held, jobs, summary)
+        return runner.rows(summary)
+    finally:
+        turns.close()
 
+
+class _GroupRunner(object):
+    """Plans groups [(folder, work, found, number)] through a FolderTurns: plan --jobs, and the later rounds.
+
+    A group's members run one after another on one thread, in list order.
+    run() hands the groups to a pool of `jobs` threads, or with jobs 1 runs
+    them on this thread one after another, and returns the groups whose
+    folder another run holds; results collects [(number, (outcome, record))]
+    of everything planned, skipped or settled.
+    """
+
+    def __init__(self, tools, options, progress, stream, capabilities, by_folder, siblings, total, turns,
+                 record_locks):
+        self.tools, self.options, self.progress, self.stream = tools, options, progress, stream
+        self.capabilities, self.by_folder, self.siblings, self.total = capabilities, by_folder, siblings, total
+        self.turns, self.record_locks = turns, record_locks
+        self.results = []
+
+    def plan_group(self, members):
+        """[(number, (outcome, record))], HELD_ELSEWHERE when another run holds the folder, or None when the run
+        drained before the folder was entered."""
+        folder = members[0][0]
+        turn = self.turns.enter(folder)
+        if turn == DRAINING:
+            return None
+        if turn == SKIPPED:
+            return HELD_ELSEWHERE
+        if turn != HELD:  # no lock file can be created: said once by turns.enter
+            return [(number, ("skipped", None)) for _folder, _work, _found, number in members]
         results = []
+        for folder, work, found, number in members:
+            results.append((number, _plan_entry(self.tools, work, found, self.options, self.siblings.get(folder, []),
+                                                self.capabilities, self.progress, self.stream, number, self.total,
+                                                self.record_locks.get(folder))))
+        return results
 
-        def group_done(index, group_results):
-            members = groups[order[index]]
-            if group_results is None:
+    def leave(self, members):
+        folder = members[0][0]
+        # After the folder's last group, its file is updated under its lock (only a folder this run
+        # held), then the lock is released.
+        self.turns.leave(folder, last=lambda held: _update_folder_file(held, [work for work, _found
+                                                                              in self.by_folder[folder]]))
+
+    def run(self, units, jobs):
+        held = []
+        if jobs == 1:
+            for index, members in enumerate(units):
+                if drain_before_next(sum(len(group) for group in units[index:]), members[0][0]):
+                    break
+                value = self.plan_group(members)
+                self.leave(members)
+                if value is None:
+                    drain_before_next(sum(len(group) for group in units[index:]))  # counts these as left
+                    break
+                if value == HELD_ELSEWHERE:
+                    held.append(members)
+                else:
+                    self.results.extend(value)
+                drain_after_item(len(members))
+            return held
+
+        def group_done(index, value):
+            members = units[index]
+            if value is None:
                 not_started(len(members))
+            elif value == HELD_ELSEWHERE:
+                held.append(members)
             else:
-                results.extend(group_results)
-            folder = members[0][0]
-            # After the folder's last group, its file is updated under its lock (only a folder this run
-            # held), then the lock is released.
-            turns.leave(folder, last=lambda held: _update_folder_file(held, [work for work, _found
-                                                                             in by_folder[folder]]))
+                self.results.extend(value)
+            self.leave(members)
 
-        run_pool(jobs, [lambda members=groups[key]: plan_group(members) for key in order], group_done,
-                 sizes=[len(groups[key]) for key in order], folders=[groups[key][0][0] for key in order])
+        run_pool(jobs, [lambda members=members: self.plan_group(members) for members in units], group_done,
+                 sizes=[len(members) for members in units], folders=[members[0][0] for members in units])
+        return held
+
+    def rows(self, summary):
+        """Count every result and return the table rows, in list order."""
         rows = []
-        for _number, (outcome, record) in sorted(results, key=lambda entry: entry[0]):
+        for _number, (outcome, record) in sorted(self.results, key=lambda entry: entry[0]):
             summary.add(outcome)
             if record is not None:
                 rows.append(_table_row(outcome, record))
         return rows
-    finally:
-        turns.close()
+
+
+def _settled_plan(work, options, stream, quiet):
+    """The record when plan would only report `work` as unchanged, read without a lock and writing nothing; else None.
+
+    The test of _plan_one: a record whose source still matches it by content
+    (the time decides, or the full hash), whose status is not
+    'source-changed', and no --replan. A record that cannot be read or judged
+    here is None, and the item is then planned under the folder's lock.
+    """
+    if getattr(options, "replan", False):
+        return None
+    try:
+        existing = load_record(work.key)
+        if existing is None or existing.get("status") == "source-changed":
+            return None
+        fingerprint = cheap_fingerprint(work.hashed[0])
+        members = _member_fingerprints(work.members) if work.members is not None else None
+        if not _unchanged(existing, fingerprint, members):
+            return None
+        check = check_source(_recorded_files(work, existing), (existing.get("source") or {}).get("sha256"),
+                             work.label, stream, quiet)
+    except (RecordError, OSError, ValueError, TypeError, AttributeError, KeyError):
+        return None
+    if check.reason is not None:
+        return None
+    return existing
+
+
+def _plan_rounds(runner, held, jobs, summary):
+    """The later rounds over the groups whose folder another run held (vidfunnel.turns.held_rounds).
+
+    A member whose record now matches its source (_settled_plan) is reported
+    as skipped without a lock; the rest are planned as in the main pass,
+    under the folder's lock, with its folder file updated after its last
+    group. With options.no_wait, or for what is still held at a drain, each
+    member is counted as skipped, without a row.
+    """
+    _stream, quiet = _progress_options(runner.progress)
+
+    def settle(members):
+        left = []
+        for member in members:
+            _folder, work, _found, number = member
+            stream = tagged(runner.stream, item_tag("plan", number, runner.total))
+            record = _settled_plan(work, runner.options, stream, quiet)
+            if record is None:
+                left.append(member)
+                continue
+            say("skipping '{}': record {} is '{}' and the source is unchanged (--replan to plan again)".format(
+                work.label, record.get("id"), record.get("status")), stream)
+            runner.results.append((number, ("skipped", record)))
+        if len(left) == len(members):
+            return members
+        return left or None
+
+    if held and not getattr(runner.options, "no_wait", False):
+        held = held_rounds(runner.turns, held, lambda members: members[0][0], settle,
+                           lambda units: runner.run(units, jobs), lambda message: say(message, runner.stream),
+                           size_of=len)
+    for members in held:
+        runner.results.extend((number, ("skipped", None)) for _folder, _work, _found, number in members)
 
 
 def _update_folder_file(folder, works):
@@ -2080,6 +2226,9 @@ def add_arguments(parser):
                         "renames it to '<stem>.mp4', so converted files are recognisable while the originals remain")
     parser.add_argument("--jobs", type=_positive_int, default=1, metavar="N",
                         help="files planned at once, also within one folder (default 1)")
+    parser.add_argument("--no-wait", action="store_true",
+                        help="do not wait for folders another run holds; skip them and end (default: try them "
+                        "again every minute until nothing is left to do there)")
     return parser
 
 

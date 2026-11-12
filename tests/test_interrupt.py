@@ -8,7 +8,7 @@ check what is left on disk. Tests that need ffmpeg or the fixtures skip
 with a message when they are missing.
 """
 
-VERSION = "20261109"
+VERSION = "20261111"
 
 import _thread
 import glob
@@ -555,7 +555,7 @@ class SequentialDrainTests(unittest.TestCase):
         locked = []
         planned = []
 
-        def take_lock(folder, entries, summary, stream):
+        def take_lock(folder, entries, summary, stream, held=None):  # held: the later rounds' list
             locked.append(os.path.basename(folder))
             return unittest.mock.Mock()
 
